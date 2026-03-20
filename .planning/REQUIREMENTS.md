@@ -27,11 +27,11 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 ### Experiment Infrastructure
 
 - [x] **INFRA-01**: Sacred experiment entry point for running single (algorithm, game, seed) combination
-- [ ] **INFRA-02**: GPU orchestrator assigns experiments to 4 GPUs and launches via tmux
+- [x] **INFRA-02**: GPU orchestrator assigns experiments to 4 GPUs and launches via tmux
 - [x] **INFRA-03**: Each experiment logs per-round metrics: reward, loss, eta_t, norm(g_t), round number
 - [x] **INFRA-04**: Separate Sacred FileStorageObserver directories per experiment (no run ID collisions)
 - [x] **INFRA-05**: Quick smoke-test config: 1-2 games, 1 seed, 3-5 DAgger rounds
-- [ ] **INFRA-06**: Full benchmark config: 7 games, 3+ seeds, 20+ DAgger rounds
+- [x] **INFRA-06**: Full benchmark config: 7 games, 3+ seeds, 20+ DAgger rounds
 - [x] **INFRA-07**: Server setup script: create isolated Python env (venv or conda), install dependencies, clone repo
 
 ### Evaluation & Visualization
@@ -93,11 +93,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ENV-04 | Phase 2 | Complete |
 | ENV-05 | Phase 2 | Complete |
 | INFRA-01 | Phase 3 | Complete |
-| INFRA-02 | Phase 3 | Pending |
+| INFRA-02 | Phase 3 | Complete |
 | INFRA-03 | Phase 3 | Complete |
 | INFRA-04 | Phase 3 | Complete |
 | INFRA-05 | Phase 2 | Complete |
-| INFRA-06 | Phase 3 | Pending |
+| INFRA-06 | Phase 3 | Complete |
 | INFRA-07 | Phase 2 | Complete |
 | EVAL-01 | Phase 4 | Pending |
 | EVAL-02 | Phase 4 | Pending |

@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 03-experiment-infrastructure/03-01-PLAN.md
-last_updated: "2026-03-20T12:40:27.189Z"
+stopped_at: Completed 03-experiment-infrastructure/03-02-PLAN.md
+last_updated: "2026-03-20T12:43:52.670Z"
 progress:
   total_phases: 4
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 6
-  completed_plans: 5
+  completed_plans: 6
 ---
 
 # Project State
@@ -51,6 +51,7 @@ Plan: 1 of 2
 | Phase 02-atari-setup-and-smoke-test P01 | 10 | 2 tasks | 5 files |
 | Phase 02 P02 | 353 | 2 tasks | 4 files |
 | Phase 03 P01 | 6 | 2 tasks | 2 files |
+| Phase 03-experiment-infrastructure P02 | 2 | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -75,6 +76,7 @@ Recent decisions affecting current work:
 - [Phase 03-01]: Log ftrl/round before round_num increment so round number reflects current round (0-indexed, consistent with dagger/round_num)
 - [Phase 03-01]: Pre-parser defaults must match Sacred config defaults to prevent silent observer path mismatch when only Sacred with syntax is used
 - [Phase 03-01]: BC logs normalized_score with step=0 as round-0 entry so Phase 4 analysis finds a metric entry for every run regardless of algorithm
+- [Phase 03-02]: --jobs N_GPUS limits concurrency to 1 job/GPU; {%} maps 1-indexed slot to 0-indexed GPU via (({%}-1)); tmux auto-relaunch via --_in-tmux flag pattern; --halt soon,fail=1 lets in-flight jobs complete before stopping
 
 ### Pending Todos
 
@@ -88,6 +90,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-20T12:40:27.187Z
-Stopped at: Completed 03-experiment-infrastructure/03-01-PLAN.md
+Last session: 2026-03-20T12:43:52.668Z
+Stopped at: Completed 03-experiment-infrastructure/03-02-PLAN.md
 Resume file: None
