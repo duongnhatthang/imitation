@@ -285,6 +285,7 @@ class BC(algo_base.DemonstrationAlgorithm):
         optimizer_kwargs: Optional[Mapping[str, Any]] = None,
         ent_weight: float = 1e-3,
         l2_weight: float = 0.0,
+        loss_calculator: Optional[Callable[..., "BCTrainingMetrics"]] = None,
         device: Union[str, th.device] = "auto",
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ):
@@ -314,6 +315,9 @@ class BC(algo_base.DemonstrationAlgorithm):
                 weight decay, for optimiser construction.
             ent_weight: scaling applied to the policy's entropy regularization.
             l2_weight: scaling applied to the policy's L2 regularization.
+            loss_calculator: An optional callable that computes training loss.
+                If provided, it replaces the default BehaviorCloningLossCalculator.
+                Must have signature (policy, obs, acts) -> BCTrainingMetrics.
             device: name/identity of device to place policy on.
             custom_logger: Where to log to; if None (default), creates a new logger.
 
@@ -366,7 +370,7 @@ class BC(algo_base.DemonstrationAlgorithm):
             **optimizer_kwargs,
         )
 
-        self.loss_calculator = BehaviorCloningLossCalculator(ent_weight, l2_weight)
+        self.loss_calculator = loss_calculator or BehaviorCloningLossCalculator(ent_weight, l2_weight)
 
     @property
     def policy(self) -> policies.ActorCriticPolicy:
