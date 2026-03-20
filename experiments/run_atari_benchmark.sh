@@ -76,9 +76,14 @@ BENCH_START=$(date +%s)
 # CUDA_VISIBLE_DEVICES      : {%} is 1-indexed slot → subtract 1 for 0-indexed GPU
 # ::: ALGOS ::: GAMES ::: SEEDS : cartesian product of all three arrays
 # ---------------------------------------------------------------------------
+# Resolve the active Python so GNU parallel sub-shells use the right interpreter
+# (conda activate does not propagate into parallel's shells).
+PYTHON_BIN="$(which python)"
+echo "  Python bin : ${PYTHON_BIN}"
+
 parallel --jobs "${N_GPUS}" --eta --halt soon,fail=1 \
   --joblog "${OUTPUT_DIR}/joblog.txt" \
-  "CUDA_VISIBLE_DEVICES=\$(( {%} - 1 )) python experiments/run_atari_experiment.py \
+  "CUDA_VISIBLE_DEVICES=\$(( {%} - 1 )) ${PYTHON_BIN} experiments/run_atari_experiment.py \
     --algo {1} --game {2} --seed {3} --output-dir ${OUTPUT_DIR} \
     with algo={1} game={2} seed={3} \
     n_rounds=${N_ROUNDS} total_timesteps=${TOTAL_TIMESTEPS} \
