@@ -5,7 +5,7 @@ for the 7-game Atari benchmark suite.
 """
 
 from stable_baselines3.common.env_util import make_atari_env
-from stable_baselines3.common.vec_env import VecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import VecEnv, VecFrameStack, VecTransposeImage
 
 from imitation.policies.serialize import load_policy
 
@@ -27,7 +27,9 @@ def make_atari_training_venv(game_id: str, n_envs: int = 8, seed: int = 0) -> Ve
     """Create a vectorised Atari training environment.
 
     Applies SB3's AtariWrapper (grayscale, 84x84 resize, reward clipping,
-    noop_max=30, frame_skip=4) then stacks 4 frames via VecFrameStack.
+    noop_max=30, frame_skip=4) then stacks 4 frames via VecFrameStack and
+    transposes to channels-first via VecTransposeImage to match the SB3
+    expert's observation space.
     Resulting observation space: Box(0, 255, (4, 84, 84), uint8).
 
     Args:
@@ -39,7 +41,8 @@ def make_atari_training_venv(game_id: str, n_envs: int = 8, seed: int = 0) -> Ve
         A VecEnv with obs space Box(0, 255, (4, 84, 84), uint8).
     """
     venv = make_atari_env(game_id, n_envs=n_envs, seed=seed)
-    return VecFrameStack(venv, n_stack=4)
+    venv = VecFrameStack(venv, n_stack=4)
+    return VecTransposeImage(venv)
 
 
 def make_atari_eval_venv(game_id: str, n_envs: int = 8, seed: int = 0) -> VecEnv:
@@ -47,7 +50,8 @@ def make_atari_eval_venv(game_id: str, n_envs: int = 8, seed: int = 0) -> VecEnv
 
     Same as make_atari_training_venv but passes clip_reward=False so that
     episode returns reflect true game scores rather than clipped {-1, 0, +1}.
-    Use this venv for score normalisation.
+    Includes VecTransposeImage to produce channels-first obs matching the
+    SB3 expert. Use this venv for score normalisation.
 
     Args:
         game_id: Raw ALE env ID, e.g. "PongNoFrameskip-v4".
@@ -64,7 +68,8 @@ def make_atari_eval_venv(game_id: str, n_envs: int = 8, seed: int = 0) -> VecEnv
         seed=seed,
         wrapper_kwargs={"clip_reward": False},
     )
-    return VecFrameStack(venv, n_stack=4)
+    venv = VecFrameStack(venv, n_stack=4)
+    return VecTransposeImage(venv)
 
 
 def load_atari_expert(venv: VecEnv, game_id: str):
