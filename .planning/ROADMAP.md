@@ -89,4 +89,4 @@ Phases execute in order: 1 → 2 → 3 → 4
 | 1. FTRL Algorithm | 2/2 | Complete   | 2026-03-20 |
 | 2. Atari Setup and Smoke Test | 2/2 | Complete   | 2026-03-20 |
 | 3. Experiment Infrastructure | 2/2 | Complete   | 2026-03-20 |
-| 4. Full Run and Analysis | 0/2 | Not started | - |
+| 4. Full Run and Analysis | 1/2 | In Progress|  |

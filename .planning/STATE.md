@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 03-experiment-infrastructure/03-02-PLAN.md
-last_updated: "2026-03-20T12:43:52.670Z"
+stopped_at: Completed 04-full-run-and-analysis/04-01-PLAN.md
+last_updated: "2026-03-20T13:15:47.175Z"
 progress:
   total_phases: 4
   completed_phases: 3
-  total_plans: 6
-  completed_plans: 6
+  total_plans: 8
+  completed_plans: 7
 ---
 
 # Project State
@@ -19,11 +19,11 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-19)
 
 **Core value:** Fair, reproducible comparison of FTL vs FTRL vs BC across 7 Atari games with normalized scores and publication-quality figures
-**Current focus:** Phase 03 — experiment-infrastructure
+**Current focus:** Phase 04 — full-run-and-analysis
 
 ## Current Position
 
-Phase: 03 (experiment-infrastructure) — EXECUTING
+Phase: 04 (full-run-and-analysis) — EXECUTING
 Plan: 1 of 2
 
 ## Performance Metrics
@@ -52,6 +52,7 @@ Plan: 1 of 2
 | Phase 02 P02 | 353 | 2 tasks | 4 files |
 | Phase 03 P01 | 6 | 2 tasks | 2 files |
 | Phase 03-experiment-infrastructure P02 | 2 | 2 tasks | 1 files |
+| Phase 04-full-run-and-analysis P01 | 4 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -77,6 +78,7 @@ Recent decisions affecting current work:
 - [Phase 03-01]: Pre-parser defaults must match Sacred config defaults to prevent silent observer path mismatch when only Sacred with syntax is used
 - [Phase 03-01]: BC logs normalized_score with step=0 as round-0 entry so Phase 4 analysis finds a metric entry for every run regardless of algorithm
 - [Phase 03-02]: --jobs N_GPUS limits concurrency to 1 job/GPU; {%} maps 1-indexed slot to 0-indexed GPU via (({%}-1)); tmux auto-relaunch via --_in-tmux flag pattern; --halt soon,fail=1 lets in-flight jobs complete before stopping
+- [Phase 04-full-run-and-analysis]: Use typing.Optional for Python 3.8 compat in analyze_results.py
 
 ### Pending Todos
 
@@ -90,6 +92,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-20T12:43:52.668Z
-Stopped at: Completed 03-experiment-infrastructure/03-02-PLAN.md
+Last session: 2026-03-20T13:15:47.172Z
+Stopped at: Completed 04-full-run-and-analysis/04-01-PLAN.md
 Resume file: None
