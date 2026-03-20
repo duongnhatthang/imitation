@@ -25,12 +25,12 @@ Verify empirically whether FTL (DAgger) is better than or at least no worse than
 - ✓ Atari game suite setup (7 seals games with consistent preprocessing; ALE extension as v2) — Validated in Phase 2: Atari Setup
 - ✓ Expert policy acquisition from HuggingFace RL Zoo for all 7 games — Validated in Phase 2: Atari Setup
 - ✓ Random policy baseline scores for all 7 games — Validated in Phase 2: Atari Setup
-- [ ] Normalized evaluation pipeline (score = (agent - random) / (expert - random))
+- ✓ Normalized evaluation pipeline (score = (agent - random) / (expert - random)) — Validated in Phase 4: Full Run and Analysis
 - ✓ Multi-GPU parallel experiment runner (4 GPUs on CC-server) — Validated in Phase 3: Experiment Infrastructure
 - ✓ Experiment scripts with logging for remote tmux execution — Validated in Phase 3: Experiment Infrastructure
 - ✓ Quick smoke-test configuration (1-2 games, few rounds) — Validated in Phase 2: Atari Setup
 - ✓ Full benchmark configuration (7 games, full training) — Validated in Phase 3: Experiment Infrastructure
-- [ ] Figure generation script producing normalized performance curves
+- ✓ Figure generation script producing normalized performance curves — Validated in Phase 4: Full Run and Analysis
 
 ### Out of Scope
 
@@ -71,4 +71,4 @@ Verify empirically whether FTL (DAgger) is better than or at least no worse than
 | Isolated Python env on server | User requirement, cleaner than system Python | — Pending |
 
 ---
-*Last updated: 2026-03-20 — Phase 3 (Experiment Infrastructure) complete, all INFRA requirements verified*
+*Last updated: 2026-03-20 — All 4 phases complete, all 25 v1 requirements verified*
