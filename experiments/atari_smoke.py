@@ -16,6 +16,13 @@ import traceback
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Ensure the project root is on sys.path so that both
+# `python experiments/atari_smoke.py` and `python -m experiments.atari_smoke`
+# can resolve the `experiments` package.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import numpy as np
 from stable_baselines3.common.policies import ActorCriticCnnPolicy
 
@@ -65,8 +72,10 @@ def evaluate_policy(policy, eval_venv, rng: np.random.Generator, n_episodes: int
         rng=rng,
         unwrap=False,
     )
-    stats = rollout.rollout_stats(trajs)
-    return stats["return_mean"]
+    # Compute mean return directly from trajectory rewards to avoid any
+    # rollout_stats edge cases after long DAgger training runs.
+    returns = [float(sum(t.rews)) for t in trajs]
+    return float(np.mean(returns))
 
 
 def make_bc_trainer(
@@ -131,6 +140,7 @@ def run_bc(
         # Collect expert score for normalization
         expert_score = evaluate_policy(expert, eval_venv, rng=rng, n_episodes=10)
         print(f"  [{game_name}] Expert score: {expert_score:.2f}")
+        sys.stdout.flush()
 
         # Collect expert demonstrations for BC
         expert_trajs = rollout.rollout(
@@ -151,6 +161,7 @@ def run_bc(
         agent_score = evaluate_policy(bc_trainer.policy, eval_venv, rng=rng, n_episodes=10)
         norm_score = compute_normalized_score(agent_score, random_score, expert_score)
         print(f"  [{game_name}] BC agent score: {agent_score:.2f}, normalized: {norm_score:.4f}")
+        sys.stdout.flush()
         return norm_score
     finally:
         venv.close()
@@ -199,6 +210,7 @@ def run_dagger(
         # Expert score for normalization
         expert_score = evaluate_policy(expert, eval_venv, rng=rng, n_episodes=10)
         print(f"  [{game_name}] Expert score: {expert_score:.2f}")
+        sys.stdout.flush()
 
         # Create BC trainer with fresh CnnPolicy
         bc_trainer = make_bc_trainer(venv, rng)
@@ -227,6 +239,7 @@ def run_dagger(
         agent_score = evaluate_policy(trainer.bc_trainer.policy, eval_venv, rng=rng, n_episodes=10)
         norm_score = compute_normalized_score(agent_score, random_score, expert_score)
         print(f"  [{game_name}] {method} agent score: {agent_score:.2f}, normalized: {norm_score:.4f}")
+        sys.stdout.flush()
         return norm_score
     finally:
         venv.close()
@@ -297,7 +310,8 @@ def main():
 
     for game_name in game_names:
         game_id = ATARI_GAMES[game_name]
-        random_score = random_baselines.get(game_name, 0.0)
+        baseline_entry = random_baselines.get(game_name, {"mean": 0.0})
+        random_score = baseline_entry["mean"] if isinstance(baseline_entry, dict) else float(baseline_entry)
         print(f"\n{'='*60}")
         print(f"Game: {game_name} ({game_id}), random_score={random_score:.2f}")
         print(f"{'='*60}")

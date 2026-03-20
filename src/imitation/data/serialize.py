@@ -20,7 +20,13 @@ def save(path: AnyPath, trajectories: Sequence[Trajectory]) -> None:
         trajectories: The trajectories to save.
     """
     p = util.parse_path(path)
-    huggingface_utils.trajectories_to_dataset(trajectories).save_to_disk(str(p))
+    ds = huggingface_utils.trajectories_to_dataset(trajectories)
+    # Clamp num_shards to the dataset size so HuggingFace never requests more
+    # shards than there are rows. Without this guard, very short trajectories
+    # (e.g. single-step Breakout episodes) cause IndexError because the default
+    # num_shards (based on CPU count) exceeds len(ds).
+    num_shards = max(1, len(ds))
+    ds.save_to_disk(str(p), num_shards=num_shards)
     logging.info(f"Dumped demonstrations to {p}.")
 
 
