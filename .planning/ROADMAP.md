@@ -10,7 +10,7 @@ This study compares FTL (DAgger), FTRL, and BC on 7 Atari games to produce norma
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
-- [ ] **Phase 1: FTRL Algorithm** - Implement and verify FTRLTrainer + FTRLLossCalculator against Lavington et al. Eq. 6
+- [x] **Phase 1: FTRL Algorithm** - Implement and verify FTRLTrainer + FTRLLossCalculator against Lavington et al. Eq. 6 (completed 2026-03-20)
 - [ ] **Phase 2: Atari Setup and Smoke Test** - Verify 7-game expert coverage, random baselines, and run a smoke test on real Atari before paying full compute costs
 - [ ] **Phase 3: Experiment Infrastructure** - Sacred named configs, multi-GPU GNU parallel runner, per-experiment logging and isolation
 - [ ] **Phase 4: Full Run and Analysis** - Execute 300+ runs, collect results, produce normalized learning curves and aggregate figures
@@ -86,7 +86,7 @@ Phases execute in order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. FTRL Algorithm | 1/2 | In Progress|  |
+| 1. FTRL Algorithm | 2/2 | Complete   | 2026-03-20 |
 | 2. Atari Setup and Smoke Test | 0/2 | Not started | - |
 | 3. Experiment Infrastructure | 0/2 | Not started | - |
 | 4. Full Run and Analysis | 0/2 | Not started | - |

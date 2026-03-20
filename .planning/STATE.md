@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 01-ftrl-algorithm/01-01-PLAN.md
-last_updated: "2026-03-20T04:49:31.206Z"
+stopped_at: Completed 01-ftrl-algorithm/01-02-PLAN.md
+last_updated: "2026-03-20T05:28:15.588Z"
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 2
-  completed_plans: 1
+  completed_plans: 2
 ---
 
 # Project State
@@ -47,6 +47,7 @@ Plan: 1 of 2
 
 *Updated after each plan completion*
 | Phase 01-ftrl-algorithm P01 | 4 | 2 tasks | 2 files |
+| Phase 01-ftrl-algorithm P02 | 35 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -60,6 +61,8 @@ Recent decisions affecting current work:
 - [Research]: GNU parallel with `slot()-1` for GPU assignment; no Ray cluster needed
 - [Phase 01-ftrl-algorithm]: eta_t = alpha / cumulative_sigma so large alpha = FTL degeneracy (ALGO-05); sigma_i = 1.0 constant (eta_t = alpha/t)
 - [Phase 01-ftrl-algorithm]: BC loss_calculator injection via optional constructor param; FTRLLossCalculator uses dataclasses.replace to return BCTrainingMetrics
+- [Phase 01-ftrl-algorithm]: sigma_grad must be normalized by n_batches (per-batch average) to prevent linear correction term from dominating BC loss in later rounds
+- [Phase 01-ftrl-algorithm]: FTL degeneracy test validates code property (proximal_coeff < 1e-6) not reward outcome; CartPole smoke uses alpha=100.0 with 35000 timesteps for n_envs stability
 
 ### Pending Todos
 
@@ -73,6 +76,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-20T04:49:31.204Z
-Stopped at: Completed 01-ftrl-algorithm/01-01-PLAN.md
+Last session: 2026-03-20T05:28:15.586Z
+Stopped at: Completed 01-ftrl-algorithm/01-02-PLAN.md
 Resume file: None

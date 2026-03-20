@@ -13,8 +13,8 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 - [x] **ALGO-02**: FTRL loss includes proximal term `(1/(2*eta_t))||w - w_t||^2` centered on current weights w_t (NOT on zero)
 - [x] **ALGO-03**: FTRL loss includes linear correction `-⟨w, Σ_{i=1}^{t-1} ∇l_i(w_t)⟩` using gradients of past losses evaluated at current weights w_t
 - [x] **ALGO-04**: Before each round: save w_t snapshot and compute gradient of past accumulated data at w_t; both are fixed during the round's optimization
-- [ ] **ALGO-05**: FTRL degenerates to FTL when alpha → infinity (verified by test)
-- [ ] **ALGO-06**: FTRL passes smoke test on CartPole matching or exceeding BC performance
+- [x] **ALGO-05**: FTRL degenerates to FTL when alpha → infinity (verified by test)
+- [x] **ALGO-06**: FTRL passes smoke test on CartPole matching or exceeding BC performance
 
 ### Environment
 
@@ -85,8 +85,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ALGO-02 | Phase 1 | Complete |
 | ALGO-03 | Phase 1 | Complete |
 | ALGO-04 | Phase 1 | Complete |
-| ALGO-05 | Phase 1 | Pending |
-| ALGO-06 | Phase 1 | Pending |
+| ALGO-05 | Phase 1 | Complete |
+| ALGO-06 | Phase 1 | Complete |
 | ENV-01 | Phase 2 | Pending |
 | ENV-02 | Phase 2 | Pending |
 | ENV-03 | Phase 2 | Pending |
