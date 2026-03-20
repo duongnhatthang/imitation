@@ -18,11 +18,11 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 
 ### Environment
 
-- [ ] **ENV-01**: 7 seals Atari games configured: Pong, Breakout, BeamRider, Enduro, Qbert, Seaquest, SpaceInvaders
-- [ ] **ENV-02**: Consistent Atari preprocessing: frame stacking (4), grayscale, 84x84 resize
-- [ ] **ENV-03**: Expert policies loaded from HuggingFace `sb3` org for all 7 games
-- [ ] **ENV-04**: Expert observation space matches learner observation space (verified by assertion)
-- [ ] **ENV-05**: Random baseline scores computed and cached for all 7 games
+- [x] **ENV-01**: 7 seals Atari games configured: Pong, Breakout, BeamRider, Enduro, Qbert, Seaquest, SpaceInvaders
+- [x] **ENV-02**: Consistent Atari preprocessing: frame stacking (4), grayscale, 84x84 resize
+- [x] **ENV-03**: Expert policies loaded from HuggingFace `sb3` org for all 7 games
+- [x] **ENV-04**: Expert observation space matches learner observation space (verified by assertion)
+- [x] **ENV-05**: Random baseline scores computed and cached for all 7 games
 
 ### Experiment Infrastructure
 
@@ -32,7 +32,7 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 - [ ] **INFRA-04**: Separate Sacred FileStorageObserver directories per experiment (no run ID collisions)
 - [ ] **INFRA-05**: Quick smoke-test config: 1-2 games, 1 seed, 3-5 DAgger rounds
 - [ ] **INFRA-06**: Full benchmark config: 7 games, 3+ seeds, 20+ DAgger rounds
-- [ ] **INFRA-07**: Server setup script: create isolated Python env (venv or conda), install dependencies, clone repo
+- [x] **INFRA-07**: Server setup script: create isolated Python env (venv or conda), install dependencies, clone repo
 
 ### Evaluation & Visualization
 
@@ -87,18 +87,18 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ALGO-04 | Phase 1 | Complete |
 | ALGO-05 | Phase 1 | Complete |
 | ALGO-06 | Phase 1 | Complete |
-| ENV-01 | Phase 2 | Pending |
-| ENV-02 | Phase 2 | Pending |
-| ENV-03 | Phase 2 | Pending |
-| ENV-04 | Phase 2 | Pending |
-| ENV-05 | Phase 2 | Pending |
+| ENV-01 | Phase 2 | Complete |
+| ENV-02 | Phase 2 | Complete |
+| ENV-03 | Phase 2 | Complete |
+| ENV-04 | Phase 2 | Complete |
+| ENV-05 | Phase 2 | Complete |
 | INFRA-01 | Phase 3 | Pending |
 | INFRA-02 | Phase 3 | Pending |
 | INFRA-03 | Phase 3 | Pending |
 | INFRA-04 | Phase 3 | Pending |
 | INFRA-05 | Phase 2 | Pending |
 | INFRA-06 | Phase 3 | Pending |
-| INFRA-07 | Phase 2 | Pending |
+| INFRA-07 | Phase 2 | Complete |
 | EVAL-01 | Phase 4 | Pending |
 | EVAL-02 | Phase 4 | Pending |
 | EVAL-03 | Phase 4 | Pending |
