@@ -60,6 +60,55 @@ def seals_cartpole():
 
 
 @train_imitation_ex.named_config
+def atari_pong():
+    environment = dict(gym_id="PongNoFrameskip-v4")
+    expert = dict(loader_kwargs=dict(organization="sb3"))
+    dagger = dict(total_timesteps=100000)
+
+
+@train_imitation_ex.named_config
+def atari_breakout():
+    environment = dict(gym_id="BreakoutNoFrameskip-v4")
+    expert = dict(loader_kwargs=dict(organization="sb3"))
+    dagger = dict(total_timesteps=100000)
+
+
+@train_imitation_ex.named_config
+def atari_beamrider():
+    environment = dict(gym_id="BeamRiderNoFrameskip-v4")
+    expert = dict(loader_kwargs=dict(organization="sb3"))
+    dagger = dict(total_timesteps=100000)
+
+
+@train_imitation_ex.named_config
+def atari_enduro():
+    environment = dict(gym_id="EnduroNoFrameskip-v4")
+    expert = dict(loader_kwargs=dict(organization="sb3"))
+    dagger = dict(total_timesteps=100000)
+
+
+@train_imitation_ex.named_config
+def atari_qbert():
+    environment = dict(gym_id="QbertNoFrameskip-v4")
+    expert = dict(loader_kwargs=dict(organization="sb3"))
+    dagger = dict(total_timesteps=100000)
+
+
+@train_imitation_ex.named_config
+def atari_seaquest():
+    environment = dict(gym_id="SeaquestNoFrameskip-v4")
+    expert = dict(loader_kwargs=dict(organization="sb3"))
+    dagger = dict(total_timesteps=100000)
+
+
+@train_imitation_ex.named_config
+def atari_spaceinvaders():
+    environment = dict(gym_id="SpaceInvadersNoFrameskip-v4")
+    expert = dict(loader_kwargs=dict(organization="sb3"))
+    dagger = dict(total_timesteps=100000)
+
+
+@train_imitation_ex.named_config
 def pendulum():
     environment = dict(gym_id="Pendulum-v1")
 
