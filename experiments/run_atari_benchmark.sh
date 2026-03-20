@@ -78,7 +78,9 @@ BENCH_START=$(date +%s)
 # ---------------------------------------------------------------------------
 # Resolve the active Python so GNU parallel sub-shells use the right interpreter
 # (conda activate does not propagate into parallel's shells).
-PYTHON_BIN="$(which python)"
+# Try the current interpreter first, fall back to which python.
+PYTHON_BIN="${CONDA_PREFIX:+${CONDA_PREFIX}/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$(which python)}"
 echo "  Python bin : ${PYTHON_BIN}"
 
 parallel --jobs "${N_GPUS}" --eta --halt soon,fail=1 \
