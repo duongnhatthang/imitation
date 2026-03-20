@@ -127,7 +127,7 @@ if __name__ == "__main__":
     pre.add_argument("--game", default="Pong")
     pre.add_argument("--seed", type=int, default=0)
     pre.add_argument("--output-dir", default="output/sacred")
-    known, _ = pre.parse_known_args()
+    known, remaining = pre.parse_known_args()
 
     # Build isolated observer path: {output_dir}/{algo}/{game}/{seed}
     # Each (algo, game, seed) triple gets its own directory, so Sacred run IDs
@@ -135,4 +135,7 @@ if __name__ == "__main__":
     obs_path = f"{known.output_dir}/{known.algo}/{known.game}/{known.seed}"
     ex.observers.append(FileStorageObserver(obs_path))
 
+    # Replace sys.argv with only the remaining args so Sacred doesn't see
+    # the pre-parsed --algo/--game/--seed/--output-dir flags.
+    sys.argv = [sys.argv[0]] + remaining
     ex.run_commandline()
