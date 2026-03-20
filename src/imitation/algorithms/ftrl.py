@@ -169,9 +169,14 @@ class FTRLDAggerTrainer(dagger.SimpleDAggerTrainer):
                 th.zeros_like(p) for p in self.bc_trainer.policy.parameters()
             ]
         else:
-            # Accumulate gradients over the full dataset at current weights w_t
+            # Accumulate gradients over the full dataset at current weights w_t.
+            # Normalize by the number of batches so sigma_grad is a per-batch-average
+            # gradient, keeping it on the same scale as the BC loss gradient during
+            # the inner optimization loop. Without this, sigma_grad grows with the
+            # dataset size and can overwhelm the BC loss in later rounds.
             self.bc_trainer.policy.zero_grad()
             base_calc = self._default_bc_loss_calculator
+            n_batches = 0
             for batch in self.bc_trainer._demo_data_loader:
                 obs_tensor = types.map_maybe_dict(
                     lambda x: util.safe_to_tensor(x, device=self.bc_trainer.policy.device),
@@ -182,9 +187,11 @@ class FTRLDAggerTrainer(dagger.SimpleDAggerTrainer):
                 )
                 metrics = base_calc(self.bc_trainer.policy, obs_tensor, acts)
                 metrics.loss.backward()
-            # Collect accumulated gradients as frozen snapshot
+                n_batches += 1
+            # Normalize by number of batches so gradient is on per-batch scale
+            n_batches = max(n_batches, 1)
             sigma_grad = [
-                p.grad.detach().clone() if p.grad is not None else th.zeros_like(p)
+                (p.grad / n_batches).detach().clone() if p.grad is not None else th.zeros_like(p)
                 for p in self.bc_trainer.policy.parameters()
             ]
             # Clear gradients so BC.train() starts from zero (CRITICAL: prevents stale grads)
