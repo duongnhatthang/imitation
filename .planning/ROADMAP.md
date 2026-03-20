@@ -57,11 +57,11 @@ Plans:
   2. Each (algorithm, game, seed) combination writes to its own Sacred observer directory; concurrent runs produce no ID collisions
   3. Each experiment produces a per-round log file showing reward, loss, eta_t, norm(g_t), and round number
   4. Full benchmark config (7 games, 3+ seeds, 20+ rounds) launches in a tmux session and survives SSH disconnect
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 03-01: Write Sacred named configs per game and single-run entry point
-- [ ] 03-02: Write GNU parallel multi-GPU orchestration script with tmux and per-experiment logging
+- [ ] 03-01-PLAN.md — Sacred single-run entry point + FTRL per-round metric logging
+- [ ] 03-02-PLAN.md — GNU parallel multi-GPU orchestration script with tmux and full benchmark config
 
 ### Phase 4: Full Run and Analysis
 **Goal**: Publication-quality figures comparing FTL, FTRL, BC, and Expert are generated from the completed benchmark
