@@ -42,11 +42,11 @@ Plans:
   3. Random baseline scores for all 7 games are available (from HumanCompatibleAI datasets or locally collected) and cached to disk
   4. Smoke test on 2 Atari games with 1 seed and 3 DAgger rounds runs all three methods (BC, DAgger, FTRL) to completion and produces Sacred output with normalized scores
   5. CC-server Python venv is set up with all dependencies installed and the repo synced
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: Verify expert availability, obs-space correctness, and random baselines for all 7 games
-- [ ] 02-02: Create server setup script and run Atari smoke test
+- [ ] 02-01-PLAN.md — Atari helpers (env creation, expert loading, random baselines), tests for ENV-01 through ENV-05, server setup script
+- [ ] 02-02-PLAN.md — Sacred Atari named configs and smoke test running BC, DAgger, FTRL on Pong and Breakout
 
 ### Phase 3: Experiment Infrastructure
 **Goal**: A single command launches all 84+ experiment combinations (3 algorithms x 7 games x 4+ seeds) across 4 GPUs with isolated logging and no Sacred run-ID collisions
