@@ -73,11 +73,11 @@ Plans:
   3. A completion dashboard shows which (algorithm, game, seed) combinations are done, running, or pending
   4. Aggregate figure shows mean and IQM with 95% CI across all 7 games for each method, matching Lavington et al. Figure 4 style
   5. All figures use consistent colors and line styles across methods and are saved as publication-quality PDF/PNG
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 04-01: Run full benchmark on CC-server and monitor completion
-- [ ] 04-02: Generate per-game curves, aggregate metrics, and final publication figures
+- [ ] 04-01-PLAN.md — Plot config, Sacred output reader, completion dashboard, and test scaffolding
+- [ ] 04-02-PLAN.md — Per-game learning curves, aggregate metrics (mean + IQM with 95% CI), and publication figures
 
 ## Progress
 
