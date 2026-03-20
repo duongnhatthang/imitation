@@ -213,6 +213,15 @@ class FTRLDAggerTrainer(dagger.SimpleDAggerTrainer):
         # Step 7: train and advance round counter
         logging.info(f"FTRL training at round {self.round_num} with eta_t={eta_t:.6f}")
         self.bc_trainer.train(**bc_train_kwargs)
+
+        # Per-round metric logging (INFRA-03)
+        norm_g = float(
+            th.sqrt(sum(th.sum(g ** 2) for g in sigma_grad)).item()
+        )
+        self._logger.record("ftrl/eta_t", eta_t)
+        self._logger.record("ftrl/norm_g", norm_g)
+        self._logger.record("ftrl/round", self.round_num)
+
         self.round_num += 1
         logging.info(f"FTRL new round number is {self.round_num}")
         return self.round_num
