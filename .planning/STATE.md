@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 02-atari-setup-and-smoke-test/02-01-PLAN.md
-last_updated: "2026-03-20T06:07:36.020Z"
+stopped_at: Completed 02-atari-setup-and-smoke-test/02-02-PLAN.md
+last_updated: "2026-03-20T12:05:02.736Z"
 progress:
   total_phases: 4
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 4
-  completed_plans: 3
+  completed_plans: 4
 ---
 
 # Project State
@@ -23,8 +23,8 @@ See: .planning/PROJECT.md (updated 2026-03-19)
 
 ## Current Position
 
-Phase: 02 (atari-setup-and-smoke-test) — EXECUTING
-Plan: 1 of 2
+Phase: 02 (atari-setup-and-smoke-test) — COMPLETE
+Plan: 2 of 2
 
 ## Performance Metrics
 
@@ -49,6 +49,7 @@ Plan: 1 of 2
 | Phase 01-ftrl-algorithm P01 | 4 | 2 tasks | 2 files |
 | Phase 01-ftrl-algorithm P02 | 35 | 2 tasks | 2 files |
 | Phase 02-atari-setup-and-smoke-test P01 | 10 | 2 tasks | 5 files |
+| Phase 02 P02 | 353 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -68,6 +69,8 @@ Recent decisions affecting current work:
 - [Phase 02-atari-setup-and-smoke-test]: gym==0.26.2 must be installed alongside gymnasium; HF sb3 models were pickled with old gym module and require it for cloudpickle deserialization
 - [Phase 02-atari-setup-and-smoke-test]: rollout.rollout(unwrap=False) used for random baseline collection to bypass RolloutInfoWrapper requirement; rollout_stats works correctly without unwrapping
 - [Phase 02-atari-setup-and-smoke-test]: Random baselines cached: Pong=-20.42, Breakout=0.30, BeamRider=120.0, Enduro=0.0, Qbert=40.15, Seaquest=21.82, SpaceInvaders=63.48 (30 episodes, seed=0)
+- [Phase 02]: Use total_timesteps=8000 for CPU smoke test (50000 produces 80+ DAgger rounds, O(n^2) BC training growth, 6+ hours on CPU vs 30min GPU estimate)
+- [Phase 02]: serialize.py: clamp num_shards=max(1,len(ds)) to prevent HuggingFace IndexError when dataset has fewer rows than default shard count (short Breakout episodes)
 
 ### Pending Todos
 
@@ -81,6 +84,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-20T06:07:36.018Z
-Stopped at: Completed 02-atari-setup-and-smoke-test/02-01-PLAN.md
+Last session: 2026-03-20T12:05:02.734Z
+Stopped at: Completed 02-atari-setup-and-smoke-test/02-02-PLAN.md
 Resume file: None
