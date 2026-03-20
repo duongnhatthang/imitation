@@ -690,13 +690,15 @@ def plot_aggregate(results: Dict[Tuple, Dict], output_dir_figures: Path) -> None
         )
 
     # Plot using rliable's plot_interval_estimates
+    # colors must be a dict mapping algorithm display name to color
+    colors_dict = {k: COLOR_MAP[k] for k in scores_dict.keys()}
     fig, axes = plot_utils.plot_interval_estimates(
         agg_scores,
         agg_cis,
         metric_names=["Mean", "IQM"],
         algorithms=list(scores_dict.keys()),
         xlabel="Normalized Score",
-        colors=[COLOR_MAP[k] for k in scores_dict.keys()],
+        colors=colors_dict,
     )
 
     # Annotate with completion count
