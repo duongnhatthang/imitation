@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 02-atari-setup-and-smoke-test/02-02-PLAN.md
-last_updated: "2026-03-20T12:05:02.736Z"
+stopped_at: Completed 03-experiment-infrastructure/03-01-PLAN.md
+last_updated: "2026-03-20T12:40:27.189Z"
 progress:
   total_phases: 4
   completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
+  total_plans: 6
+  completed_plans: 5
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-19)
 
 **Core value:** Fair, reproducible comparison of FTL vs FTRL vs BC across 7 Atari games with normalized scores and publication-quality figures
-**Current focus:** Phase 02 — atari-setup-and-smoke-test
+**Current focus:** Phase 03 — experiment-infrastructure
 
 ## Current Position
 
-Phase: 02 (atari-setup-and-smoke-test) — COMPLETE
-Plan: 2 of 2
+Phase: 03 (experiment-infrastructure) — EXECUTING
+Plan: 1 of 2
 
 ## Performance Metrics
 
@@ -50,6 +50,7 @@ Plan: 2 of 2
 | Phase 01-ftrl-algorithm P02 | 35 | 2 tasks | 2 files |
 | Phase 02-atari-setup-and-smoke-test P01 | 10 | 2 tasks | 5 files |
 | Phase 02 P02 | 353 | 2 tasks | 4 files |
+| Phase 03 P01 | 6 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -71,6 +72,9 @@ Recent decisions affecting current work:
 - [Phase 02-atari-setup-and-smoke-test]: Random baselines cached: Pong=-20.42, Breakout=0.30, BeamRider=120.0, Enduro=0.0, Qbert=40.15, Seaquest=21.82, SpaceInvaders=63.48 (30 episodes, seed=0)
 - [Phase 02]: Use total_timesteps=8000 for CPU smoke test (50000 produces 80+ DAgger rounds, O(n^2) BC training growth, 6+ hours on CPU vs 30min GPU estimate)
 - [Phase 02]: serialize.py: clamp num_shards=max(1,len(ds)) to prevent HuggingFace IndexError when dataset has fewer rows than default shard count (short Breakout episodes)
+- [Phase 03-01]: Log ftrl/round before round_num increment so round number reflects current round (0-indexed, consistent with dagger/round_num)
+- [Phase 03-01]: Pre-parser defaults must match Sacred config defaults to prevent silent observer path mismatch when only Sacred with syntax is used
+- [Phase 03-01]: BC logs normalized_score with step=0 as round-0 entry so Phase 4 analysis finds a metric entry for every run regardless of algorithm
 
 ### Pending Todos
 
@@ -84,6 +88,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-20T12:05:02.734Z
-Stopped at: Completed 02-atari-setup-and-smoke-test/02-02-PLAN.md
+Last session: 2026-03-20T12:40:27.187Z
+Stopped at: Completed 03-experiment-infrastructure/03-01-PLAN.md
 Resume file: None
