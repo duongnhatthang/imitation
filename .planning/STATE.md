@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 04-full-run-and-analysis/04-01-PLAN.md
-last_updated: "2026-03-20T13:15:47.175Z"
+stopped_at: Completed 04-full-run-and-analysis/04-02-PLAN.md
+last_updated: "2026-03-20T13:23:00.000Z"
 progress:
   total_phases: 4
   completed_phases: 3
@@ -23,8 +23,8 @@ See: .planning/PROJECT.md (updated 2026-03-19)
 
 ## Current Position
 
-Phase: 04 (full-run-and-analysis) — EXECUTING
-Plan: 1 of 2
+Phase: 04 (full-run-and-analysis) — COMPLETE
+Plan: 2 of 2
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ Plan: 1 of 2
 | Phase 03 P01 | 6 | 2 tasks | 2 files |
 | Phase 03-experiment-infrastructure P02 | 2 | 2 tasks | 1 files |
 | Phase 04-full-run-and-analysis P01 | 4 | 2 tasks | 3 files |
+| Phase 04-full-run-and-analysis P02 | 6 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -79,6 +80,8 @@ Recent decisions affecting current work:
 - [Phase 03-01]: BC logs normalized_score with step=0 as round-0 entry so Phase 4 analysis finds a metric entry for every run regardless of algorithm
 - [Phase 03-02]: --jobs N_GPUS limits concurrency to 1 job/GPU; {%} maps 1-indexed slot to 0-indexed GPU via (({%}-1)); tmux auto-relaunch via --_in-tmux flag pattern; --halt soon,fail=1 lets in-flight jobs complete before stopping
 - [Phase 04-full-run-and-analysis]: Use typing.Optional for Python 3.8 compat in analyze_results.py
+- [Phase 04-02]: rliable plot_interval_estimates colors param must be dict[algo_name->color] not list (rliable 1.2.0 API)
+- [Phase 04-02]: BC plotted as axhline (single step=0 entry); NaN filled with 0.0 before rliable call with missing count annotated in figure title
 
 ### Pending Todos
 

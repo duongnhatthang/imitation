@@ -37,11 +37,11 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 ### Evaluation & Visualization
 
 - [x] **EVAL-01**: Normalized scores computed as `(agent - random) / (expert - random)` for each game
-- [ ] **EVAL-02**: Learning curves plotted: normalized return vs environment interactions for each game
-- [ ] **EVAL-03**: Aggregate metrics across games: mean and IQM with 95% confidence intervals
+- [x] **EVAL-02**: Learning curves plotted: normalized return vs environment interactions for each game
+- [x] **EVAL-03**: Aggregate metrics across games: mean and IQM with 95% confidence intervals
 - [x] **EVAL-04**: Figure generation works on partial results (incremental — runnable anytime mid-experiment)
 - [x] **EVAL-05**: Completion dashboard showing which (algorithm, game, seed) runs are done/running/pending
-- [ ] **EVAL-06**: Final publication-quality figures comparing FTL, FTRL, BC, and Expert baselines
+- [x] **EVAL-06**: Final publication-quality figures comparing FTL, FTRL, BC, and Expert baselines
 - [x] **EVAL-07**: All figures use consistent colors/styles across methods
 
 ## v2 Requirements
@@ -100,11 +100,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INFRA-06 | Phase 3 | Complete |
 | INFRA-07 | Phase 2 | Complete |
 | EVAL-01 | Phase 4 | Complete |
-| EVAL-02 | Phase 4 | Pending |
-| EVAL-03 | Phase 4 | Pending |
+| EVAL-02 | Phase 4 | Complete |
+| EVAL-03 | Phase 4 | Complete |
 | EVAL-04 | Phase 4 | Complete |
 | EVAL-05 | Phase 4 | Complete |
-| EVAL-06 | Phase 4 | Pending |
+| EVAL-06 | Phase 4 | Complete |
 | EVAL-07 | Phase 4 | Complete |
 
 **Coverage:**
