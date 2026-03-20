@@ -9,10 +9,10 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 
 ### Algorithm
 
-- [ ] **ALGO-01**: FTRL algorithm implemented as `FTRLDAggerTrainer` subclassing `SimpleDAggerTrainer`
-- [ ] **ALGO-02**: FTRL loss includes proximal term `(1/(2*eta_t))||w - w_t||^2` centered on current weights w_t (NOT on zero)
-- [ ] **ALGO-03**: FTRL loss includes linear correction `-⟨w, Σ_{i=1}^{t-1} ∇l_i(w_t)⟩` using gradients of past losses evaluated at current weights w_t
-- [ ] **ALGO-04**: Before each round: save w_t snapshot and compute gradient of past accumulated data at w_t; both are fixed during the round's optimization
+- [x] **ALGO-01**: FTRL algorithm implemented as `FTRLDAggerTrainer` subclassing `SimpleDAggerTrainer`
+- [x] **ALGO-02**: FTRL loss includes proximal term `(1/(2*eta_t))||w - w_t||^2` centered on current weights w_t (NOT on zero)
+- [x] **ALGO-03**: FTRL loss includes linear correction `-⟨w, Σ_{i=1}^{t-1} ∇l_i(w_t)⟩` using gradients of past losses evaluated at current weights w_t
+- [x] **ALGO-04**: Before each round: save w_t snapshot and compute gradient of past accumulated data at w_t; both are fixed during the round's optimization
 - [ ] **ALGO-05**: FTRL degenerates to FTL when alpha → infinity (verified by test)
 - [ ] **ALGO-06**: FTRL passes smoke test on CartPole matching or exceeding BC performance
 
@@ -81,10 +81,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ALGO-01 | Phase 1 | Pending |
-| ALGO-02 | Phase 1 | Pending |
-| ALGO-03 | Phase 1 | Pending |
-| ALGO-04 | Phase 1 | Pending |
+| ALGO-01 | Phase 1 | Complete |
+| ALGO-02 | Phase 1 | Complete |
+| ALGO-03 | Phase 1 | Complete |
+| ALGO-04 | Phase 1 | Complete |
 | ALGO-05 | Phase 1 | Pending |
 | ALGO-06 | Phase 1 | Pending |
 | ENV-01 | Phase 2 | Pending |

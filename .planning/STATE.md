@@ -1,3 +1,17 @@
+---
+gsd_state_version: 1.0
+milestone: v1.0
+milestone_name: milestone
+status: unknown
+stopped_at: Completed 01-ftrl-algorithm/01-01-PLAN.md
+last_updated: "2026-03-20T04:49:31.206Z"
+progress:
+  total_phases: 4
+  completed_phases: 0
+  total_plans: 2
+  completed_plans: 1
+---
+
 # Project State
 
 ## Project Reference
@@ -5,20 +19,17 @@
 See: .planning/PROJECT.md (updated 2026-03-19)
 
 **Core value:** Fair, reproducible comparison of FTL vs FTRL vs BC across 7 Atari games with normalized scores and publication-quality figures
-**Current focus:** Phase 1 — FTRL Algorithm
+**Current focus:** Phase 01 — ftrl-algorithm
 
 ## Current Position
 
-Phase: 1 of 4 (FTRL Algorithm)
-Plan: 0 of 2 in current phase
-Status: Ready to plan
-Last activity: 2026-03-19 — Roadmap created; research complete
-
-Progress: [░░░░░░░░░░] 0%
+Phase: 01 (ftrl-algorithm) — EXECUTING
+Plan: 1 of 2
 
 ## Performance Metrics
 
 **Velocity:**
+
 - Total plans completed: 0
 - Average duration: -
 - Total execution time: 0 hours
@@ -30,10 +41,12 @@ Progress: [░░░░░░░░░░] 0%
 | - | - | - | - |
 
 **Recent Trend:**
+
 - Last 5 plans: -
 - Trend: -
 
 *Updated after each plan completion*
+| Phase 01-ftrl-algorithm P01 | 4 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -45,6 +58,8 @@ Recent decisions affecting current work:
 - [Research]: Use `FTRLLossCalculator` injected into `BC` via constructor — do NOT use `LpRegularizer` or `WeightDecayRegularizer`; proximal term is `||theta - anchor||^2` not `||theta||^2`
 - [Research]: Game list is the 7 seals games (Pong, Breakout, BeamRider, Enduro, Qbert, Seaquest, SpaceInvaders) — BeamRider/Enduro/Qbert HF expert coverage must be verified in Phase 2
 - [Research]: GNU parallel with `slot()-1` for GPU assignment; no Ray cluster needed
+- [Phase 01-ftrl-algorithm]: eta_t = alpha / cumulative_sigma so large alpha = FTL degeneracy (ALGO-05); sigma_i = 1.0 constant (eta_t = alpha/t)
+- [Phase 01-ftrl-algorithm]: BC loss_calculator injection via optional constructor param; FTRLLossCalculator uses dataclasses.replace to return BCTrainingMetrics
 
 ### Pending Todos
 
@@ -58,6 +73,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-19
-Stopped at: Roadmap created; no plans written yet
+Last session: 2026-03-20T04:49:31.204Z
+Stopped at: Completed 01-ftrl-algorithm/01-01-PLAN.md
 Resume file: None

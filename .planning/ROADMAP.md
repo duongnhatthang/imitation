@@ -86,7 +86,7 @@ Phases execute in order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. FTRL Algorithm | 0/2 | Not started | - |
+| 1. FTRL Algorithm | 1/2 | In Progress|  |
 | 2. Atari Setup and Smoke Test | 0/2 | Not started | - |
 | 3. Experiment Infrastructure | 0/2 | Not started | - |
 | 4. Full Run and Analysis | 0/2 | Not started | - |
