@@ -26,11 +26,11 @@ This study compares FTL (DAgger), FTRL, and BC on 7 Atari games to produce norma
   2. FTRL loss per Eq. 6: proximal term `(1/(2η_t))||w - w_t||^2` centered on current weights, plus linear correction `-⟨w, Σ ∇l_i(w_t)⟩` using gradients of past losses at current weights
   3. Setting alpha to a very large value produces training curves statistically indistinguishable from plain DAgger (FTL degeneracy test passes)
   4. Running FTRL on CartPole for 5 rounds completes without error and achieves reward matching or exceeding BC
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: Implement FTRLLossCalculator and FTRLDAggerTrainer with per-round w_t snapshot and past-gradient computation
-- [ ] 01-02: Add BC constructor injection point and write degeneracy + CartPole smoke tests
+- [ ] 01-01-PLAN.md — BC loss_calculator injection + FTRLLossCalculator and FTRLDAggerTrainer implementation
+- [ ] 01-02-PLAN.md — Unit tests (proximal centering, linear correction, anchor freezing) + FTL degeneracy + CartPole smoke test
 
 ### Phase 2: Atari Setup and Smoke Test
 **Goal**: The 7-game Atari suite is verified end-to-end — experts load, observation spaces match, random baselines exist, and a smoke test on a real Atari game passes all three methods
