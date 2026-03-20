@@ -17,7 +17,7 @@ source experiments/common.sh
 GAMES=(Pong Breakout BeamRider Enduro Qbert Seaquest SpaceInvaders)
 SEEDS=(0 1 2)
 N_ROUNDS=20
-TOTAL_TIMESTEPS=500000
+TOTAL_TIMESTEPS=200000
 N_ENVS=4
 ALPHA=1.0
 N_GPUS=4
@@ -92,7 +92,10 @@ echo ""
 echo "=== Phase B: DAgger + FTRL (${N_DAGGER_FTRL} jobs, 2 parallel) ==="
 echo ""
 
-parallel --jobs 2 --eta \
+# Run sequentially (1 job) — DAgger/FTRL accumulate all trajectories across
+# rounds in memory. A single 20-round Pong DAgger job peaks at ~30-45GB RAM.
+# Running 2+ concurrently on 93GB server causes OOM kills (signal 137).
+parallel --jobs 1 --eta \
   --joblog "${OUTPUT_DIR}/joblog_dagger_ftrl.txt" \
   "CUDA_VISIBLE_DEVICES=\$(( {%} - 1 )) ${PYTHON_BIN} experiments/run_atari_experiment.py \
     --algo {1} --game {2} --seed {3} --output-dir ${OUTPUT_DIR} \
