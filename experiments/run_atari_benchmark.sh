@@ -21,7 +21,7 @@ ALGOS=(bc dagger ftrl)
 SEEDS=(0 1 2)
 N_ROUNDS=20
 TOTAL_TIMESTEPS=500000
-N_ENVS=8
+N_ENVS=4
 ALPHA=1.0
 N_GPUS=4
 OUTPUT_DIR="output/sacred/${TIMESTAMP}"
@@ -83,7 +83,7 @@ PYTHON_BIN="${CONDA_PREFIX:+${CONDA_PREFIX}/bin/python}"
 PYTHON_BIN="${PYTHON_BIN:-$(which python)}"
 echo "  Python bin : ${PYTHON_BIN}"
 
-parallel --jobs "${N_GPUS}" --eta --halt soon,fail=1 \
+parallel --jobs "${N_GPUS}" --eta \
   --joblog "${OUTPUT_DIR}/joblog.txt" \
   "CUDA_VISIBLE_DEVICES=\$(( {%} - 1 )) ${PYTHON_BIN} experiments/run_atari_experiment.py \
     --algo {1} --game {2} --seed {3} --output-dir ${OUTPUT_DIR} \
