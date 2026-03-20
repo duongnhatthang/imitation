@@ -38,11 +38,15 @@ created: 2026-03-19
 
 | Task ID | Plan | Wave | Requirement | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|-----------|-------------------|-------------|--------|
-| 1-01-01 | 01 | 1 | ALGO-01 | unit | `pytest tests/algorithms/test_ftrl.py::test_ftrl_import -x` | ❌ W0 | ⬜ pending |
-| 1-01-02 | 01 | 1 | ALGO-02, ALGO-03 | unit | `pytest tests/algorithms/test_ftrl.py::test_ftrl_loss -x` | ❌ W0 | ⬜ pending |
-| 1-01-03 | 01 | 1 | ALGO-04 | unit | `pytest tests/algorithms/test_ftrl.py::test_snapshot -x` | ❌ W0 | ⬜ pending |
-| 1-02-01 | 02 | 1 | ALGO-05 | integration | `pytest tests/algorithms/test_ftrl.py::test_degeneracy -x` | ❌ W0 | ⬜ pending |
-| 1-02-02 | 02 | 1 | ALGO-06 | integration | `pytest tests/algorithms/test_ftrl.py::test_cartpole -x` | ❌ W0 | ⬜ pending |
+| 1-01-01 | 01 | 1 | ALGO-01 | unit | `python -c "from imitation.algorithms.bc import BC; import inspect; sig = inspect.signature(BC.__init__); assert 'loss_calculator' in sig.parameters"` | n/a (code check) | ⬜ pending |
+| 1-01-02 | 01 | 1 | ALGO-01..04 | unit | `python -c "from imitation.algorithms.ftrl import FTRLLossCalculator, FTRLDAggerTrainer"` | n/a (code check) | ⬜ pending |
+| 1-02-01 | 02 | 2 | ALGO-01 | unit | `pytest tests/algorithms/test_ftrl.py::test_ftrl_instantiation -x` | ❌ W0 | ⬜ pending |
+| 1-02-02 | 02 | 2 | ALGO-02 | unit | `pytest tests/algorithms/test_ftrl.py::test_proximal_term_centering -x` | ❌ W0 | ⬜ pending |
+| 1-02-03 | 02 | 2 | ALGO-03 | unit | `pytest tests/algorithms/test_ftrl.py::test_linear_correction_sign -x` | ❌ W0 | ⬜ pending |
+| 1-02-04 | 02 | 2 | ALGO-03 | unit | `pytest tests/algorithms/test_ftrl.py::test_sigma_grad_at_current_weights -x` | ❌ W0 | ⬜ pending |
+| 1-02-05 | 02 | 2 | ALGO-04 | unit | `pytest tests/algorithms/test_ftrl.py::test_anchor_frozen_during_round -x` | ❌ W0 | ⬜ pending |
+| 1-02-06 | 02 | 2 | ALGO-05 | integration | `pytest tests/algorithms/test_ftrl.py::test_ftl_degeneracy -x` | ❌ W0 | ⬜ pending |
+| 1-02-07 | 02 | 2 | ALGO-06 | integration | `pytest tests/algorithms/test_ftrl.py::test_cartpole_smoke -x` | ❌ W0 | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
