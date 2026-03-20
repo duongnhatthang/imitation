@@ -21,7 +21,7 @@ Verify empirically whether FTL (DAgger) is better than or at least no worse than
 
 ### Active
 
-- [ ] FTRL algorithm implementation (regularized DAgger per Lavington et al. Eq. 6)
+- ✓ FTRL algorithm implementation (regularized DAgger per Lavington et al. Eq. 6) — Validated in Phase 1: FTRL Algorithm
 - [ ] Atari game suite setup (7 seals games with consistent preprocessing; ALE extension as v2)
 - [ ] Expert policy acquisition from HuggingFace RL Zoo for all 7 games
 - [ ] Random policy baseline scores for all 7 games
@@ -71,4 +71,4 @@ Verify empirically whether FTL (DAgger) is better than or at least no worse than
 | Isolated Python env on server | User requirement, cleaner than system Python | — Pending |
 
 ---
-*Last updated: 2026-03-19 after initialization*
+*Last updated: 2026-03-20 — Phase 1 (FTRL Algorithm) complete, all 6 ALGO requirements verified*
