@@ -1,7 +1,7 @@
 # Requirements: DAgger vs FTRL Empirical Study
 
 **Defined:** 2026-03-19
-**Core Value:** Fair, reproducible comparison of FTL vs FTRL vs BC across Atari games with normalized scores and publication-quality figures
+**Core Value:** Verify empirically whether FTL (DAgger) is better than or at least no worse than FTRL across discrete-action Atari tasks, with normalized scores and publication-quality figures
 
 ## v1 Requirements
 
@@ -10,9 +10,9 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 ### Algorithm
 
 - [ ] **ALGO-01**: FTRL algorithm implemented as `FTRLDAggerTrainer` subclassing `SimpleDAggerTrainer`
-- [ ] **ALGO-02**: FTRL loss includes round-dependent L2 regularization `(1/(2*eta_t))||w||^2` with `eta_t = alpha/sqrt(t)`
-- [ ] **ALGO-03**: FTRL loss includes linear anchor term `-w^T * g_t` where `g_t` accumulates from previous iterates
-- [ ] **ALGO-04**: g_t stored as `dict[str, Tensor]`, detached, constant within round, updated between rounds
+- [ ] **ALGO-02**: FTRL loss includes proximal term `(1/(2*eta_t))||w - w_t||^2` centered on current weights w_t (NOT on zero)
+- [ ] **ALGO-03**: FTRL loss includes linear correction `-⟨w, Σ_{i=1}^{t-1} ∇l_i(w_t)⟩` using gradients of past losses evaluated at current weights w_t
+- [ ] **ALGO-04**: Before each round: save w_t snapshot and compute gradient of past accumulated data at w_t; both are fixed during the round's optimization
 - [ ] **ALGO-05**: FTRL degenerates to FTL when alpha → infinity (verified by test)
 - [ ] **ALGO-06**: FTRL passes smoke test on CartPole matching or exceeding BC performance
 
@@ -32,7 +32,7 @@ Requirements for initial benchmark. Each maps to roadmap phases.
 - [ ] **INFRA-04**: Separate Sacred FileStorageObserver directories per experiment (no run ID collisions)
 - [ ] **INFRA-05**: Quick smoke-test config: 1-2 games, 1 seed, 3-5 DAgger rounds
 - [ ] **INFRA-06**: Full benchmark config: 7 games, 3+ seeds, 20+ DAgger rounds
-- [ ] **INFRA-07**: Server setup script: create isolated Python env, install dependencies, clone repo
+- [ ] **INFRA-07**: Server setup script: create isolated Python env (venv or conda), install dependencies, clone repo
 
 ### Evaluation & Visualization
 
@@ -81,37 +81,37 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ALGO-01 | TBD | Pending |
-| ALGO-02 | TBD | Pending |
-| ALGO-03 | TBD | Pending |
-| ALGO-04 | TBD | Pending |
-| ALGO-05 | TBD | Pending |
-| ALGO-06 | TBD | Pending |
-| ENV-01 | TBD | Pending |
-| ENV-02 | TBD | Pending |
-| ENV-03 | TBD | Pending |
-| ENV-04 | TBD | Pending |
-| ENV-05 | TBD | Pending |
-| INFRA-01 | TBD | Pending |
-| INFRA-02 | TBD | Pending |
-| INFRA-03 | TBD | Pending |
-| INFRA-04 | TBD | Pending |
-| INFRA-05 | TBD | Pending |
-| INFRA-06 | TBD | Pending |
-| INFRA-07 | TBD | Pending |
-| EVAL-01 | TBD | Pending |
-| EVAL-02 | TBD | Pending |
-| EVAL-03 | TBD | Pending |
-| EVAL-04 | TBD | Pending |
-| EVAL-05 | TBD | Pending |
-| EVAL-06 | TBD | Pending |
-| EVAL-07 | TBD | Pending |
+| ALGO-01 | Phase 1 | Pending |
+| ALGO-02 | Phase 1 | Pending |
+| ALGO-03 | Phase 1 | Pending |
+| ALGO-04 | Phase 1 | Pending |
+| ALGO-05 | Phase 1 | Pending |
+| ALGO-06 | Phase 1 | Pending |
+| ENV-01 | Phase 2 | Pending |
+| ENV-02 | Phase 2 | Pending |
+| ENV-03 | Phase 2 | Pending |
+| ENV-04 | Phase 2 | Pending |
+| ENV-05 | Phase 2 | Pending |
+| INFRA-01 | Phase 3 | Pending |
+| INFRA-02 | Phase 3 | Pending |
+| INFRA-03 | Phase 3 | Pending |
+| INFRA-04 | Phase 3 | Pending |
+| INFRA-05 | Phase 2 | Pending |
+| INFRA-06 | Phase 3 | Pending |
+| INFRA-07 | Phase 2 | Pending |
+| EVAL-01 | Phase 4 | Pending |
+| EVAL-02 | Phase 4 | Pending |
+| EVAL-03 | Phase 4 | Pending |
+| EVAL-04 | Phase 4 | Pending |
+| EVAL-05 | Phase 4 | Pending |
+| EVAL-06 | Phase 4 | Pending |
+| EVAL-07 | Phase 4 | Pending |
 
 **Coverage:**
 - v1 requirements: 25 total
-- Mapped to phases: 0
-- Unmapped: 25 ⚠️
+- Mapped to phases: 25
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-19*
-*Last updated: 2026-03-19 after initial definition*
+*Last updated: 2026-03-19 after roadmap creation*

@@ -2,11 +2,11 @@
 
 ## What This Is
 
-An empirical study comparing DAgger (FTL) against its regularized variant FTRL for online imitation learning across a standard suite of 10+ Atari games. Built on top of an existing popular imitation learning library that already implements BC and DAgger. The goal is to produce normalized performance curves (between random and expert) showing whether FTRL improves upon or matches DAgger, similar to Figure 4 in Lavington et al. (2022).
+An empirical study verifying whether DAgger (FTL) is better than, or at least no worse than, its regularized variant FTRL for online imitation learning across a suite of 7 Atari games with discrete action spaces. Built on top of an existing popular imitation learning library that already implements BC and DAgger. The goal is to produce normalized performance curves (between random and expert) testing this hypothesis broadly, similar to Figure 4 in Lavington et al. (2022).
 
 ## Core Value
 
-Produce a fair, reproducible comparison of FTL vs FTRL vs BC (plus expert baseline) across a broad Atari benchmark with normalized scores, generating publication-quality figures.
+Verify empirically whether FTL (DAgger) is better than or at least no worse than FTRL across discrete-action Atari tasks, with normalized scores and publication-quality figures.
 
 ## Requirements
 
@@ -22,14 +22,14 @@ Produce a fair, reproducible comparison of FTL vs FTRL vs BC (plus expert baseli
 ### Active
 
 - [ ] FTRL algorithm implementation (regularized DAgger per Lavington et al. Eq. 6)
-- [ ] Atari game suite setup (10+ games with consistent preprocessing)
-- [ ] Expert policy acquisition from HuggingFace RL Zoo for all games
-- [ ] Random policy baseline scores for all games
+- [ ] Atari game suite setup (7 seals games with consistent preprocessing; ALE extension as v2)
+- [ ] Expert policy acquisition from HuggingFace RL Zoo for all 7 games
+- [ ] Random policy baseline scores for all 7 games
 - [ ] Normalized evaluation pipeline (score = (agent - random) / (expert - random))
 - [ ] Multi-GPU parallel experiment runner (4 GPUs on CC-server)
 - [ ] Experiment scripts with logging for remote tmux execution
 - [ ] Quick smoke-test configuration (1-2 games, few rounds)
-- [ ] Full benchmark configuration (10+ games, full training)
+- [ ] Full benchmark configuration (7 games, full training)
 - [ ] Figure generation script producing normalized performance curves
 
 ### Out of Scope
@@ -43,15 +43,17 @@ Produce a fair, reproducible comparison of FTL vs FTRL vs BC (plus expert baseli
 ## Context
 
 - **Paper reference**: Lavington et al. (2022) "Improved Policy Optimization for Online Imitation Learning" (CoLLAs 2022)
-- **FTRL formulation**: Memory-efficient reformulation from Proposition 4.1, Eq. 6 — adds L2 regularization with a linear correction term anchored to previous iterates, matching FTL's memory footprint
-- **Key insight from paper**: FTRL often matches or outperforms FTL (DAgger) in average cumulative loss and sometimes in return; both dominate on-policy methods (OGD, AdaGrad)
+- **FTRL formulation**: Memory-efficient reformulation from Proposition 4.1, Eq. 6:
+  `w_{t+1} = argmin_w [ Σ l_i(w) - ⟨w, Σ_{i=1}^{t-1} ∇l_i(w_t)⟩ + (1/(2η_t)) ||w - w_t||^2 ]`
+  Three terms: (1) cumulative loss (same as FTL), (2) linear correction using gradients of past losses at current weights, (3) proximal term centered on current weights w_t. η_t = 1/(Σ σ_i).
+- **Key insight from paper**: Figure 4 suggests FTL (DAgger) often has good empirical performance. Our goal is to verify whether this holds broadly across many discrete-action tasks — i.e., whether FTRL's regularization helps or is unnecessary.
 - **Codebase**: Fork of the `imitation` library (HumanCompatibleAI) — well-structured with BC, DAgger, Sacred scripts, and benchmarking tools
 - **Server**: CC-server accessible via `ssh CC-server`, 4 GPUs, needs venv and repo setup
 - **Workflow**: Code edits locally → push to GitHub → sync to server → run in tmux with logging
 
 ## Constraints
 
-- **Server setup**: Must use Python virtual environment (not conda) on CC-server
+- **Server setup**: Must use an isolated Python environment (venv or conda) on CC-server
 - **GPU parallelism**: 4 GPUs available — design experiments to utilize all 4 concurrently
 - **Remote execution**: All training/eval runs via tmux sessions for resilience to disconnects
 - **Logging**: All processes must produce readable logs for monitoring progress
@@ -66,7 +68,7 @@ Produce a fair, reproducible comparison of FTL vs FTRL vs BC (plus expert baseli
 | End-to-end neural net only | Practical setting users care about | — Pending |
 | HuggingFace RL Zoo experts | Standard, reproducible, no extra compute for expert training | — Pending |
 | Quick smoke test before full run | Catch bugs early, save GPU hours | — Pending |
-| Virtual environment on server | User requirement, cleaner than system Python | — Pending |
+| Isolated Python env on server | User requirement, cleaner than system Python | — Pending |
 
 ---
 *Last updated: 2026-03-19 after initialization*
