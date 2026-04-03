@@ -166,11 +166,13 @@ def _plot_metric(
         mean = stats["mean"].values
         std = stats["std"].values
 
-        ax.plot(rounds, mean, color=color, label=label, linewidth=2)
+        ax.plot(rounds, mean, color=color, label=label, linewidth=2, marker="o",
+                markersize=3)
         ax.fill_between(rounds, mean - std, mean + std, color=color, alpha=0.15)
 
     ax.set_xlabel("Round")
     ax.set_ylabel(ylabel)
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -180,9 +182,11 @@ def plot_env(
     env_name: str,
     output_path: pathlib.Path,
 ) -> None:
-    """Generate a 2-subplot figure for one environment.
+    """Generate a 3-subplot figure for one environment.
 
-    Top: cumulative loss. Bottom: cumulative regret.
+    Top: per-round cross-entropy (learning curve).
+    Middle: cumulative loss.
+    Bottom: cumulative regret.
 
     Args:
         df: Full DataFrame with cum_loss and cum_regret columns.
@@ -194,11 +198,16 @@ def plot_env(
         logger.warning(f"No data for {env_name}, skipping")
         return
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
-    fig.suptitle(f"{env_name}", fontsize=14, fontweight="bold")
+    # Detect policy mode for title
+    policy_modes = env_df["policy_mode"].unique()
+    mode_str = policy_modes[0] if len(policy_modes) == 1 else "mixed"
 
-    _plot_metric(ax1, env_df, "cum_loss", "Cumulative Cross-Entropy Loss")
-    _plot_metric(ax2, env_df, "cum_regret", "Cumulative Regret (vs best)")
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+    fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
+
+    _plot_metric(ax1, env_df, "cross_entropy", "Per-Round Cross-Entropy")
+    _plot_metric(ax2, env_df, "cum_loss", "Cumulative Cross-Entropy Loss")
+    _plot_metric(ax3, env_df, "cum_regret", "Cumulative Regret (vs best)")
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
