@@ -97,31 +97,32 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
 def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
     """Compute cumulative cross-entropy loss per (algo, env, seed).
 
+    Also computes expert cumulative loss if expert_cross_entropy is available.
+
     Args:
         df: DataFrame from load_results.
 
     Returns:
-        Same DataFrame with an added 'cum_loss' column.
+        Same DataFrame with added 'cum_loss' column (and 'expert_cum_loss'
+        if expert_cross_entropy is present).
     """
     df = df.sort_values(["algo", "env", "seed", "round"]).copy()
     df["cum_loss"] = df.groupby(["algo", "env", "seed"])["cross_entropy"].cumsum()
+    if "expert_cross_entropy" in df.columns:
+        df["expert_cum_loss"] = (
+            df.groupby(["algo", "env", "seed"])["expert_cross_entropy"].cumsum()
+        )
     return df
 
 
-def compute_cumulative_regret(
-    df: pd.DataFrame,
-    baseline_algo: str = "ftl",
-) -> pd.DataFrame:
-    """Compute cumulative regret relative to best algo's cumulative loss.
+def compute_cumulative_regret(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute cumulative regret relative to the expert's cumulative loss.
 
-    Regret for algo A at round t = cum_loss_A(t) - cum_loss_baseline(t),
-    where baseline is typically the best-performing algo (FTL by default).
-    Since we don't have a true expert baseline per-round, we use the minimum
-    cumulative loss across algos at each round as the baseline.
+    Regret for algo A at round t = cum_loss_A(t) - expert_cum_loss(t).
+    Falls back to best-algo baseline if expert data is unavailable.
 
     Args:
         df: DataFrame with 'cum_loss' column (from compute_cumulative_loss).
-        baseline_algo: Not used — baseline is computed as min across algos.
 
     Returns:
         Same DataFrame with an added 'cum_regret' column.
@@ -129,15 +130,19 @@ def compute_cumulative_regret(
     if "cum_loss" not in df.columns:
         df = compute_cumulative_loss(df)
 
-    # Baseline: minimum cumulative loss across algos at each (env, seed, round)
-    baseline = (
-        df.groupby(["env", "seed", "round"])["cum_loss"]
-        .min()
-        .rename("baseline_cum_loss")
-    )
-    df = df.merge(baseline, on=["env", "seed", "round"])
-    df["cum_regret"] = df["cum_loss"] - df["baseline_cum_loss"]
-    df.drop(columns=["baseline_cum_loss"], inplace=True)
+    if "expert_cum_loss" in df.columns:
+        # Use expert as baseline
+        df["cum_regret"] = df["cum_loss"] - df["expert_cum_loss"]
+    else:
+        # Fallback: minimum cumulative loss across algos
+        baseline = (
+            df.groupby(["env", "seed", "round"])["cum_loss"]
+            .min()
+            .rename("baseline_cum_loss")
+        )
+        df = df.merge(baseline, on=["env", "seed", "round"])
+        df["cum_regret"] = df["cum_loss"] - df["baseline_cum_loss"]
+        df.drop(columns=["baseline_cum_loss"], inplace=True)
     return df
 
 
@@ -178,11 +183,22 @@ def _plot_metric(
 
     # Expert baseline
     if expert_baseline is not None and not expert_baseline.empty:
-        ax.axhline(
-            y=expert_baseline.mean(),
-            color="black", linestyle="--", linewidth=1.5, alpha=0.7,
-            label=f"Expert (π*) = {expert_baseline.mean():.3f}",
-        )
+        rounds = expert_baseline.index.values
+        values = expert_baseline.values
+        # If values are roughly constant, draw a flat line; otherwise a curve
+        if np.std(values) < 0.01 * (np.mean(np.abs(values)) + 1e-8):
+            ax.axhline(
+                y=np.mean(values),
+                color="black", linestyle="--", linewidth=1.5, alpha=0.7,
+                label=f"Expert (π*) = {np.mean(values):.3f}",
+            )
+        else:
+            ax.plot(
+                rounds, values,
+                color="black", linestyle="--", linewidth=1.5, alpha=0.7,
+                marker="s", markersize=3,
+                label="Expert (π*)",
+            )
 
     ax.set_xlabel("Round")
     ax.set_ylabel(ylabel)
@@ -219,15 +235,20 @@ def plot_env(
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
     fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
 
-    # Get expert baseline if available
-    expert_baseline = None
+    # Get expert baselines if available
+    expert_ce = None
+    expert_cum = None
     if "expert_cross_entropy" in env_df.columns:
-        expert_baseline = env_df.groupby("round")["expert_cross_entropy"].mean()
+        expert_ce = env_df.groupby("round")["expert_cross_entropy"].mean()
+    if "expert_cum_loss" in env_df.columns:
+        expert_cum = env_df.groupby("round")["expert_cum_loss"].mean()
 
     _plot_metric(ax1, env_df, "cross_entropy", "Per-Round Cross-Entropy",
-                 expert_baseline=expert_baseline)
-    _plot_metric(ax2, env_df, "cum_loss", "Cumulative Cross-Entropy Loss")
-    _plot_metric(ax3, env_df, "cum_regret", "Cumulative Regret (vs best)")
+                 expert_baseline=expert_ce)
+    _plot_metric(ax2, env_df, "cum_loss", "Cumulative Cross-Entropy Loss",
+                 expert_baseline=expert_cum)
+    _plot_metric(ax3, env_df, "cum_regret", "Cumulative Regret (vs expert)",
+                 expert_baseline=None)  # regret is relative, no expert line needed
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)

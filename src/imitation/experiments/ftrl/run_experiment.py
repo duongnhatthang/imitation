@@ -378,7 +378,7 @@ def main():
                         help="Min timesteps per DAgger round")
     parser.add_argument("--policy-mode", choices=["end_to_end", "linear"],
                         default="linear", help="Policy training mode")
-    parser.add_argument("--l2-lambda", type=float, default=1e-4,
+    parser.add_argument("--l2-lambda", type=float, default=0.01,
                         help="L2 regularization weight for FTRL")
     parser.add_argument("--l2-decay", action="store_true",
                         help="Use decaying L2 schedule (lambda/n)")
