@@ -1,7 +1,8 @@
 """Expert training and trajectory collection for FTRL experiments.
 
-Provides get_or_train_expert (tries HuggingFace first, trains PPO as fallback)
-and make_expert_trajectories for collecting demonstration data.
+Always trains PPO experts with a consistent [64,64] architecture and caches
+them to disk. This ensures the expert's network architecture matches what
+create_linear_policy expects (same mlp_extractor structure).
 """
 
 import logging
@@ -14,20 +15,10 @@ from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.vec_env import VecEnv
 
 from imitation.data import rollout, types
-from imitation.policies import serialize
 
 from . import env_utils
 
 logger = logging.getLogger(__name__)
-
-
-# Map from our env names to HuggingFace model IDs (sb3 org).
-# Only environments with known good HF models are listed.
-_HF_ENV_MAP = {
-    "CartPole-v1": "CartPole-v1",
-    "Acrobot-v1": "Acrobot-v1",
-    "MountainCar-v0": "MountainCar-v0",
-}
 
 
 def get_or_train_expert(
@@ -37,11 +28,11 @@ def get_or_train_expert(
     rng: np.random.Generator,
     seed: int = 0,
 ) -> BasePolicy:
-    """Load an expert policy from HuggingFace or train one with PPO.
+    """Load a cached expert or train one with PPO.
 
-    Tries HuggingFace sb3 models first. If that fails (no model available or
-    env has discrete obs with one-hot wrapper), falls back to training PPO
-    locally and caching the result.
+    Always uses PPO with net_arch=[64,64] to ensure the expert architecture
+    matches what create_linear_policy expects. Trained models are cached to
+    disk for reuse across seeds and runs.
 
     Args:
         env_name: Gymnasium environment ID.
@@ -56,36 +47,18 @@ def get_or_train_expert(
     cache_path = pathlib.Path(cache_dir) / env_name.replace("/", "_")
     model_file = cache_path / "model.zip"
 
-    # Try loading cached model first
+    # Load cached model if available
     if model_file.exists():
         logger.info(f"Loading cached expert from {model_file}")
         model = PPO.load(model_file, env=venv)
         return model.policy
 
-    # Try HuggingFace for envs that don't need one-hot wrapper
+    # Train PPO expert
     config = env_utils.ENV_CONFIGS.get(env_name, {})
-    is_discrete_obs = config.get("obs_type") == "discrete"
-
-    if not is_discrete_obs and env_name in _HF_ENV_MAP:
-        try:
-            hf_env_name = _HF_ENV_MAP[env_name]
-            logger.info(f"Trying HuggingFace model for {hf_env_name}")
-            policy = serialize.load_policy(
-                "ppo-huggingface",
-                venv,
-                env_name=hf_env_name,
-                organization="sb3",
-            )
-            return policy
-        except Exception as e:
-            logger.warning(f"HuggingFace load failed for {env_name}: {e}")
-
-    # Fallback: train PPO
-    logger.info(
-        f"Training PPO expert for {env_name} "
-        f"({config.get('ppo_timesteps', 100_000)} timesteps)",
-    )
     ppo_timesteps = config.get("ppo_timesteps", 100_000)
+    logger.info(
+        f"Training PPO expert for {env_name} ({ppo_timesteps} timesteps)",
+    )
     model = PPO(
         "MlpPolicy",
         venv,
