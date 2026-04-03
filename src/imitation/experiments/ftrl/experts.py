@@ -95,6 +95,18 @@ def get_or_train_expert(
     )
     model.learn(total_timesteps=ppo_timesteps)
 
+    # Evaluate expert quality
+    from stable_baselines3.common.evaluation import evaluate_policy
+
+    mean_reward, std_reward = evaluate_policy(
+        model, venv, n_eval_episodes=20, deterministic=True,
+    )
+    logger.info(
+        f"Expert quality for {env_name}: "
+        f"reward={mean_reward:.1f}±{std_reward:.1f} "
+        f"(trained {ppo_timesteps} steps)",
+    )
+
     # Cache the trained model
     cache_path.mkdir(parents=True, exist_ok=True)
     model.save(model_file)

@@ -17,23 +17,26 @@ from imitation.util import util
 # Environment configurations for the 5 classical MDPs.
 # obs_type: "discrete" means Discrete obs space that needs one-hot encoding.
 # obs_size: size of the Discrete space (only for discrete obs_type).
-# ppo_timesteps: rough number of PPO training steps to solve the env.
+# ppo_timesteps: PPO training steps to solve the env (benchmarked locally with
+#   net_arch=[64,64], n_steps=256, batch_size=64, 4 parallel envs).
+#   FrozenLake: 5k steps (~1s), CartPole: 20k (~7s).
+#   CliffWalking/Acrobot/MountainCar: may need 200k+ (tune on server).
 ENV_CONFIGS: Dict[str, dict] = {
     "CartPole-v1": {
         "obs_type": "continuous",
-        "ppo_timesteps": 100_000,
+        "ppo_timesteps": 25_000,
         "env_kwargs": {},
     },
     "FrozenLake-v1": {
         "obs_type": "discrete",
         "obs_size": 16,
-        "ppo_timesteps": 50_000,
+        "ppo_timesteps": 10_000,
         "env_kwargs": {"is_slippery": False},
     },
     "CliffWalking-v0": {
         "obs_type": "discrete",
         "obs_size": 48,
-        "ppo_timesteps": 50_000,
+        "ppo_timesteps": 200_000,
         "env_kwargs": {},
     },
     "Acrobot-v1": {
