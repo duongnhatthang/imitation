@@ -462,7 +462,7 @@ def transitions_collate_fn(
         info dict into a single dict, which is incorrect.)
     """
     batch_acts_and_dones = [
-        {k: np.array(v) for k, v in sample.items() if k in ["acts", "dones"]}
+        {k: np.asarray(v) for k, v in sample.items() if k in ["acts", "dones"]}
         for sample in batch
     ]
 

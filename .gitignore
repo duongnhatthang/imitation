@@ -160,3 +160,8 @@ dmypy.json
 /quickstart/
 
 .vscode/
+
+# FTRL experiment artifacts
+experiments/results/
+experiments/expert_cache/
+experiments/setup_server.sh
