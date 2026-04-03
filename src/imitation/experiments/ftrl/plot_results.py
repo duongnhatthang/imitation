@@ -67,7 +67,7 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
             continue
 
         for m in data.get("per_round", []):
-            rows.append({
+            row = {
                 "algo": data["algo"],
                 "env": data["env"],
                 "seed": data["seed"],
@@ -76,7 +76,10 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
                 "cross_entropy": m["cross_entropy"],
                 "l2_norm": m["l2_norm"],
                 "total_loss": m["total_loss"],
-            })
+            }
+            if "expert_cross_entropy" in m:
+                row["expert_cross_entropy"] = m["expert_cross_entropy"]
+            rows.append(row)
 
     if not rows:
         logger.warning(f"No results found in {results_dir}")
@@ -143,6 +146,7 @@ def _plot_metric(
     df: pd.DataFrame,
     metric: str,
     ylabel: str,
+    expert_baseline: Optional[pd.Series] = None,
 ):
     """Plot a metric with mean ± 1 std bands across seeds.
 
@@ -151,6 +155,8 @@ def _plot_metric(
         df: DataFrame filtered to a single env.
         metric: Column name to plot.
         ylabel: Y-axis label.
+        expert_baseline: Optional Series indexed by round with expert metric
+            values. Plotted as a black dashed line.
     """
     algos = sorted(df["algo"].unique(), key=lambda a: list(ALGO_COLORS.keys()).index(a)
                    if a in ALGO_COLORS else 99)
@@ -169,6 +175,14 @@ def _plot_metric(
         ax.plot(rounds, mean, color=color, label=label, linewidth=2, marker="o",
                 markersize=3)
         ax.fill_between(rounds, mean - std, mean + std, color=color, alpha=0.15)
+
+    # Expert baseline
+    if expert_baseline is not None and not expert_baseline.empty:
+        ax.axhline(
+            y=expert_baseline.mean(),
+            color="black", linestyle="--", linewidth=1.5, alpha=0.7,
+            label=f"Expert (π*) = {expert_baseline.mean():.3f}",
+        )
 
     ax.set_xlabel("Round")
     ax.set_ylabel(ylabel)
@@ -205,7 +219,13 @@ def plot_env(
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
     fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
 
-    _plot_metric(ax1, env_df, "cross_entropy", "Per-Round Cross-Entropy")
+    # Get expert baseline if available
+    expert_baseline = None
+    if "expert_cross_entropy" in env_df.columns:
+        expert_baseline = env_df.groupby("round")["expert_cross_entropy"].mean()
+
+    _plot_metric(ax1, env_df, "cross_entropy", "Per-Round Cross-Entropy",
+                 expert_baseline=expert_baseline)
     _plot_metric(ax2, env_df, "cum_loss", "Cumulative Cross-Entropy Loss")
     _plot_metric(ax3, env_df, "cum_regret", "Cumulative Regret (vs best)")
 

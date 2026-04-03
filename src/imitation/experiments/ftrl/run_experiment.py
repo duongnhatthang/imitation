@@ -217,14 +217,27 @@ def _run_dagger_variant(
         rollout_round_min_timesteps=config.samples_per_round,
     )
 
-    # Extract metrics
+    # Extract metrics and compute expert baseline CE per round
+    from imitation.data import serialize
+
     per_round = []
     for m in trainer.get_metrics():
+        # m.round_num is post-increment (1-indexed); demo dirs are 0-indexed
+        demo_round = m.round_num - 1
+        round_dir = trainer._demo_dir_path_for_round(demo_round)
+        demo_paths = trainer._get_demo_paths(round_dir)
+        round_demos = []
+        for p in demo_paths:
+            round_demos.extend(serialize.load(p))
+        round_transitions = rollout.flatten_trajectories(round_demos)
+        expert_ce = _evaluate_policy_cross_entropy(expert_policy, round_transitions)
+
         per_round.append({
             "round": m.round_num,
             "cross_entropy": round(m.cross_entropy, 6),
             "l2_norm": round(m.l2_norm, 6),
             "total_loss": round(m.total_loss, 6),
+            "expert_cross_entropy": round(expert_ce, 6),
         })
 
     return per_round
@@ -295,6 +308,7 @@ def _run_bc(
             break
         chunk = all_transitions[start_idx:end_idx]
         ce = _evaluate_policy_cross_entropy(bc_trainer.policy, chunk)
+        expert_ce = _evaluate_policy_cross_entropy(expert_policy, chunk)
 
         # Compute L2 norm for consistency
         l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
@@ -305,6 +319,7 @@ def _run_bc(
             "cross_entropy": round(ce, 6),
             "l2_norm": round(l2_norm, 6),
             "total_loss": round(ce, 6),  # BC has no L2 penalty in loss
+            "expert_cross_entropy": round(expert_ce, 6),
         })
 
     return per_round
