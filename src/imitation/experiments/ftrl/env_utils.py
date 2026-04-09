@@ -61,7 +61,7 @@ ENV_CONFIGS: Dict[str, dict] = {
     "Taxi-v3": {
         "obs_type": "discrete",
         "obs_size": 500,
-        "ppo_timesteps": 100_000,
+        "ppo_timesteps": 500_000,
         "env_kwargs": {},
     },
     "Blackjack-v1": {

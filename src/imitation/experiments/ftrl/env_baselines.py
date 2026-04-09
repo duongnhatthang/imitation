@@ -173,17 +173,15 @@ def compute_baselines(
     Returns:
         Dict with keys ``"expert_return"`` and ``"random_return"``.
     """
-    from imitation.data import rollout
+    from stable_baselines3.common.evaluation import evaluate_policy
 
-    # Expert return
-    expert_trajs = rollout.rollout(
+    # Expert return (using SB3's evaluate_policy which works with any VecEnv)
+    expert_return, _ = evaluate_policy(
         expert_policy,
         venv,
-        rollout.make_sample_until(min_episodes=n_expert_episodes),
-        rng=rng,
+        n_eval_episodes=n_expert_episodes,
+        deterministic=True,
     )
-    expert_returns = [float(np.sum(t.rews)) for t in expert_trajs]
-    expert_return = float(np.mean(expert_returns))
 
     # Random return
     random_return = compute_random_return(venv, n_episodes=n_random_episodes)
