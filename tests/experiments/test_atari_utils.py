@@ -37,3 +37,30 @@ class TestGetAtariEnvId:
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown"):
             get_atari_env_id("NonexistentGame")
+
+
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+
+from imitation.experiments.ftrl.experts import get_or_train_expert
+
+
+class TestAtariExpertRouting:
+    """Test that get_or_train_expert routes correctly for Atari games."""
+
+    @patch("imitation.experiments.ftrl.atari_utils.download_hub_expert")
+    def test_tier1_downloads_from_hub(self, mock_download, tmp_path):
+        """Tier 1 Atari game should attempt HuggingFace download."""
+        mock_download.side_effect = ValueError(
+            "mock_hub_download: no real download in test",
+        )
+
+        # Use a mock venv to avoid needing Atari ROMs in CI
+        mock_venv = MagicMock()
+
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match="mock_hub_download"):
+            get_or_train_expert(
+                "PongNoFrameskip-v4", mock_venv, cache_dir=tmp_path, rng=rng,
+            )
