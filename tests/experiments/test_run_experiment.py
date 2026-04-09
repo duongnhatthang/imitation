@@ -5,7 +5,11 @@ import json
 import numpy as np
 import pytest
 
-from imitation.experiments.ftrl.run_experiment import ExperimentConfig, run_single
+from imitation.experiments.ftrl.run_experiment import (
+    ExperimentConfig,
+    resolve_envs,
+    run_single,
+)
 
 
 def _make_config(algo, tmp_path, **overrides):
@@ -89,3 +93,29 @@ def test_run_ftrl_decaying_l2(tmp_path):
     assert result["algo"] == "ftrl"
     assert result["config"]["l2_decay"] is True
     assert len(result["per_round"]) >= 2
+
+
+class TestResolveEnvs:
+    """Test --env-group resolution."""
+
+    def test_classical_group(self):
+        envs = resolve_envs(env_group="classical", envs=None)
+        assert "CartPole-v1" in envs
+        assert len(envs) == 8
+
+    def test_explicit_envs_override_group(self):
+        envs = resolve_envs(env_group=None, envs=["CartPole-v1"])
+        assert envs == ["CartPole-v1"]
+
+    def test_atari_zoo_group(self):
+        envs = resolve_envs(env_group="atari-zoo", envs=None)
+        assert "PongNoFrameskip-v4" in envs
+
+    def test_default_is_classical(self):
+        envs = resolve_envs(env_group=None, envs=None)
+        assert "CartPole-v1" in envs
+        assert not any("NoFrameskip" in e for e in envs)
+
+    def test_both_raises(self):
+        with pytest.raises(ValueError, match="not both"):
+            resolve_envs(env_group="classical", envs=["CartPole-v1"])

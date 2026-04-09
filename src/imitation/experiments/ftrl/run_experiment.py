@@ -29,8 +29,40 @@ from imitation.util import logger as imit_logger
 
 logger = logging.getLogger(__name__)
 
-ALL_ENVS = list(env_utils.ENV_CONFIGS.keys())
 ALL_ALGOS = ["ftl", "ftrl", "bc"]
+
+
+def resolve_envs(
+    env_group: Optional[str] = None,
+    envs: Optional[List[str]] = None,
+) -> List[str]:
+    """Resolve environment list from --env-group or --envs.
+
+    Args:
+        env_group: Name of a predefined environment group (e.g. "classical",
+            "atari-zoo"). Mutually exclusive with ``envs``.
+        envs: Explicit list of environment names. Mutually exclusive with
+            ``env_group``.
+
+    Returns:
+        List of environment names to run.
+
+    Raises:
+        ValueError: If both ``env_group`` and ``envs`` are specified, or if
+            ``env_group`` is not a recognised group name.
+    """
+    if env_group and envs:
+        raise ValueError("Specify --env-group or --envs, not both")
+    if env_group:
+        if env_group not in env_utils.ENV_GROUPS:
+            raise ValueError(
+                f"Unknown env group: {env_group}. "
+                f"Available: {list(env_utils.ENV_GROUPS.keys())}"
+            )
+        return env_utils.ENV_GROUPS[env_group]
+    if envs:
+        return envs
+    return list(env_utils.ENV_CONFIGS.keys())  # default: classical only
 
 
 @dataclasses.dataclass
@@ -84,11 +116,16 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
     start_time = time.time()
     rng = np.random.default_rng(config.seed)
 
-    # Force CPU for classical MDPs
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # Force CPU for classical MDPs (Atari uses GPU for CNN)
+    if not env_utils.is_atari(config.env_name):
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     # Create env
-    venv = env_utils.make_env(config.env_name, n_envs=1, rng=rng)
+    if env_utils.is_atari(config.env_name):
+        from imitation.experiments.ftrl.atari_utils import make_atari_venv
+        venv = make_atari_venv(config.env_name, n_envs=1, seed=config.seed)
+    else:
+        venv = env_utils.make_env(config.env_name, n_envs=1, rng=rng)
 
     # Get expert
     expert_policy = experts.get_or_train_expert(
@@ -370,8 +407,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run FTL vs FTRL vs BC experiments on classical MDPs",
     )
-    parser.add_argument("--envs", nargs="+", default=ALL_ENVS,
-                        choices=ALL_ENVS, help="Environments to test")
+    parser.add_argument("--envs", nargs="+", default=None,
+                        help="Environments to test")
+    parser.add_argument("--env-group", type=str, default=None,
+                        choices=list(env_utils.ENV_GROUPS.keys()),
+                        help="Predefined environment group to run")
     parser.add_argument("--algos", nargs="+", default=ALL_ALGOS,
                         choices=ALL_ALGOS, help="Algorithms to run")
     parser.add_argument("--seeds", type=int, default=5,
@@ -402,6 +442,7 @@ def main():
     parser.add_argument("--n-workers", type=int, default=1,
                         help="Number of parallel workers (1=sequential)")
     args = parser.parse_args()
+    args.envs = resolve_envs(env_group=args.env_group, envs=args.envs)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -423,7 +464,11 @@ def main():
     expert_cache_dir = pathlib.Path(args.expert_cache_dir)
     for env_name in args.envs:
         rng = np.random.default_rng(0)
-        venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
+        if env_utils.is_atari(env_name):
+            from imitation.experiments.ftrl.atari_utils import make_atari_venv
+            venv = make_atari_venv(env_name, n_envs=1, seed=0)
+        else:
+            venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
         experts.get_or_train_expert(
             env_name, venv, cache_dir=expert_cache_dir, rng=rng, seed=0,
         )
