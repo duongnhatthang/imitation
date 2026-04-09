@@ -1,7 +1,8 @@
 """Environment utilities for FTRL experiments.
 
-Provides a OneHotObsWrapper for discrete-state environments and a unified
-make_env factory that auto-applies it where needed.
+Provides observation wrappers (OneHotObsWrapper for discrete-state environments,
+FlattenTupleObsWrapper for tuple-of-discrete environments) and a unified
+make_env factory that auto-applies them where needed.
 """
 
 from typing import Dict, Optional
