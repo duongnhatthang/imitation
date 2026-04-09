@@ -61,37 +61,22 @@ def reinitialize_action_net(policy: ActorCriticPolicy) -> None:
 
 def create_linear_policy(
     expert_policy: ActorCriticPolicy,
-    obs_space: spaces.Space,
-    act_space: spaces.Space,
 ) -> ActorCriticPolicy:
-    """Create a linear-mode policy by copying expert features and freezing them.
+    """Create a linear-mode policy by cloning expert and resetting action_net.
 
-    Creates a new policy with the same [64,64] architecture, copies the expert's
-    features_extractor and mlp_extractor weights, freezes everything except
-    action_net, and reinitializes action_net.
+    Deep-copies the expert's entire policy, freezes all parameters except
+    action_net, and reinitializes action_net. Works with any architecture
+    (MLP, CNN, etc.) without needing to know internals.
 
     Args:
-        expert_policy: Trained expert policy to copy features from.
-        obs_space: Observation space.
-        act_space: Action space.
+        expert_policy: Trained expert policy to clone features from.
 
     Returns:
         A policy with frozen hidden layers and fresh action_net.
     """
-    policy = create_end_to_end_policy(obs_space, act_space)
+    import copy
 
-    # Copy features_extractor state dict if it has parameters
-    expert_fe_state = expert_policy.features_extractor.state_dict()
-    if expert_fe_state:
-        policy.features_extractor.load_state_dict(expert_fe_state)
-
-    # Copy mlp_extractor (policy_net + value_net hidden layers)
-    policy.mlp_extractor.load_state_dict(
-        expert_policy.mlp_extractor.state_dict(),
-    )
-
-    # Freeze everything except action_net, then reinitialize action_net
+    policy = copy.deepcopy(expert_policy)
     freeze_feature_layers(policy)
     reinitialize_action_net(policy)
-
     return policy

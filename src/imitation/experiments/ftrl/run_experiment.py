@@ -151,11 +151,7 @@ def _run_dagger_variant(
 
     # Create policy
     if config.policy_mode == "linear":
-        policy = policy_utils.create_linear_policy(
-            expert_policy,
-            venv.observation_space,
-            venv.action_space,
-        )
+        policy = policy_utils.create_linear_policy(expert_policy)
         use_trainable_params_loss = True
     else:
         policy = policy_utils.create_end_to_end_policy(
@@ -278,11 +274,7 @@ def _run_bc(
 
     # Create policy
     if config.policy_mode == "linear":
-        policy = policy_utils.create_linear_policy(
-            expert_policy,
-            venv.observation_space,
-            venv.action_space,
-        )
+        policy = policy_utils.create_linear_policy(expert_policy)
     else:
         policy = policy_utils.create_end_to_end_policy(
             venv.observation_space,
