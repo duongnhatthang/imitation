@@ -66,6 +66,15 @@ cd docs/ && make doctest               # Check doctests
 - **Test markers**: `@pytest.mark.expensive` for slow tests
 - **Environments**: Uses `gymnasium` (not old `gym`) and `seals` for test environments
 
+## CC-server Sync
+
+Use the existing sync script for all code/results transfers — do NOT write raw rsync commands:
+```bash
+./experiments/sync_results.sh push   # push code to server
+./experiments/sync_results.sh pull   # pull JSON results (skips bloat)
+```
+The script is gitignored. Edit it if new exclusions are needed rather than inlining rsync flags.
+
 ## Dependencies
 
 Core: `torch`, `stable-baselines3 ~= 2.2.1`, `gymnasium ~= 0.29`, `sacred >= 0.8.4`, `seals ~= 0.2.1`

@@ -56,23 +56,36 @@ def get_or_train_expert(
     # Train PPO expert
     config = env_utils.ENV_CONFIGS.get(env_name, {})
     ppo_timesteps = config.get("ppo_timesteps", 100_000)
+    ppo_kwargs = config.get("ppo_kwargs", {})
+    ppo_n_envs = config.get("ppo_n_envs", None)
     logger.info(
         f"Training PPO expert for {env_name} ({ppo_timesteps} timesteps)",
     )
+
+    # Use multi-env training if configured (e.g. MountainCar needs more exploration)
+    if ppo_n_envs and ppo_n_envs > 1:
+        train_venv = env_utils.make_env(env_name, n_envs=ppo_n_envs, rng=rng)
+    else:
+        train_venv = venv
+
     model = PPO(
         "MlpPolicy",
-        venv,
+        train_venv,
         policy_kwargs=dict(net_arch=[64, 64]),
         seed=seed,
         verbose=0,
+        **ppo_kwargs,
     )
     model.learn(total_timesteps=ppo_timesteps)
 
-    # Evaluate expert quality
+    if ppo_n_envs and ppo_n_envs > 1:
+        train_venv.close()
+
+    # Evaluate expert quality using the 1-env venv
     from stable_baselines3.common.evaluation import evaluate_policy
 
     mean_reward, std_reward = evaluate_policy(
-        model, venv, n_eval_episodes=20, deterministic=True,
+        model.policy, venv, n_eval_episodes=20, deterministic=True,
     )
     logger.info(
         f"Expert quality for {env_name}: "

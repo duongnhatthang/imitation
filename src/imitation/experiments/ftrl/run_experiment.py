@@ -221,6 +221,7 @@ def _run_dagger_variant(
     from imitation.data import serialize
 
     per_round = []
+    cum_obs = 0
     for m in trainer.get_metrics():
         # m.round_num is post-increment (1-indexed); demo dirs are 0-indexed
         demo_round = m.round_num - 1
@@ -231,9 +232,11 @@ def _run_dagger_variant(
             round_demos.extend(serialize.load(p))
         round_transitions = rollout.flatten_trajectories(round_demos)
         expert_ce = _evaluate_policy_cross_entropy(expert_policy, round_transitions)
+        cum_obs += len(round_transitions)
 
         per_round.append({
             "round": m.round_num,
+            "n_observations": cum_obs,
             "cross_entropy": round(m.cross_entropy, 6),
             "l2_norm": round(m.l2_norm, 6),
             "total_loss": round(m.total_loss, 6),
@@ -255,13 +258,19 @@ def _run_bc(
     """
     total_timesteps = config.n_rounds * config.samples_per_round
 
-    # Collect expert trajectories
-    # Estimate episodes needed: each episode is ~200-500 steps for classical MDPs
-    n_trajectories = max(total_timesteps // 100, config.n_rounds * 5)
-    trajs = experts.make_expert_trajectories(
-        expert_policy, venv, n_trajectories=n_trajectories, rng=rng,
+    # Collect expert trajectories with min_timesteps to guarantee enough data
+    sample_until = rollout.make_sample_until(
+        min_timesteps=total_timesteps,
+        min_episodes=1,
     )
-    all_transitions = rollout.flatten_trajectories(trajs)
+    trajs = rollout.generate_trajectories(
+        policy=expert_policy,
+        venv=venv,
+        sample_until=sample_until,
+        deterministic_policy=True,
+        rng=rng,
+    )
+    all_transitions = rollout.flatten_trajectories(list(trajs))
 
     # Trim to exact total_timesteps if we got more
     if len(all_transitions) > total_timesteps:
@@ -301,12 +310,14 @@ def _run_bc(
     # Evaluate on round-sized chunks
     per_round = []
     chunk_size = config.samples_per_round
+    cum_obs = 0
     for round_num in range(config.n_rounds):
         start_idx = round_num * chunk_size
         end_idx = min(start_idx + chunk_size, len(all_transitions))
         if start_idx >= len(all_transitions):
             break
         chunk = all_transitions[start_idx:end_idx]
+        cum_obs += len(chunk)
         ce = _evaluate_policy_cross_entropy(bc_trainer.policy, chunk)
         expert_ce = _evaluate_policy_cross_entropy(expert_policy, chunk)
 
@@ -315,7 +326,8 @@ def _run_bc(
         l2_norm = sum(l2_norms) / 2
 
         per_round.append({
-            "round": round_num,
+            "round": round_num + 1,
+            "n_observations": cum_obs,
             "cross_entropy": round(ce, 6),
             "l2_norm": round(l2_norm, 6),
             "total_loss": round(ce, 6),  # BC has no L2 penalty in loss
@@ -412,6 +424,19 @@ def main():
     )
     logger.info(f"Policy mode: {args.policy_mode}, workers: {args.n_workers}")
 
+    # Pre-train and cache experts sequentially before parallel dispatch.
+    # Without this, parallel workers all see "no cache" simultaneously and
+    # redundantly train the same expert (e.g. 15 workers each training
+    # MountainCar for 1M steps instead of one training + 14 cache hits).
+    expert_cache_dir = pathlib.Path(args.expert_cache_dir)
+    for env_name in args.envs:
+        rng = np.random.default_rng(0)
+        venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
+        experts.get_or_train_expert(
+            env_name, venv, cache_dir=expert_cache_dir, rng=rng, seed=0,
+        )
+        venv.close()
+
     start_time = time.time()
 
     if args.n_workers <= 1:
@@ -420,7 +445,8 @@ def main():
             logger.info(f"[{i+1}/{total}] {config.algo}/{config.env_name}/seed{config.seed}")
             results.append(run_single(config))
     else:
-        with multiprocessing.Pool(args.n_workers) as pool:
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(args.n_workers) as pool:
             results = pool.map(_run_single_wrapper, configs)
 
     elapsed = time.time() - start_time
