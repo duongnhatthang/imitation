@@ -180,6 +180,7 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
     # Create env
     if env_utils.is_atari(config.env_name):
         from imitation.experiments.ftrl.atari_utils import make_atari_venv
+
         venv = make_atari_venv(config.env_name, n_envs=1, seed=config.seed)
     else:
         venv = env_utils.make_env(config.env_name, n_envs=1, rng=rng)
@@ -239,7 +240,11 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
 
     if config.algo in ("ftl", "ftrl"):
         result["per_round"] = _run_dagger_variant(
-            config, venv, expert_policy, rng, baselines,
+            config,
+            venv,
+            expert_policy,
+            rng,
+            baselines,
         )
     elif config.algo == "bc":
         result["per_round"] = _run_bc(config, venv, expert_policy, rng, baselines)
@@ -290,7 +295,9 @@ def _run_dagger_variant(
 
     # Create custom logger (suppress output)
     custom_logger = imit_logger.configure(
-        str(config.output_dir / "tb" / f"{config.algo}_{config.env_name}_{config.seed}"),
+        str(
+            config.output_dir / "tb" / f"{config.algo}_{config.env_name}_{config.seed}"
+        ),
         format_strs=[],
     )
 
@@ -305,9 +312,7 @@ def _run_dagger_variant(
 
     # Create scratch dir for this run
     scratch_dir = (
-        config.output_dir
-        / "scratch"
-        / f"{config.algo}_{config.env_name}_{config.seed}"
+        config.output_dir / "scratch" / f"{config.algo}_{config.env_name}_{config.seed}"
     )
 
     # Create FTRL trainer
@@ -374,7 +379,10 @@ def _run_dagger_variant(
         is_final = m.round_num == total_rounds
         if is_first or is_interval or is_final:
             eval_metrics = _evaluate_learner_metrics(
-                bc_trainer.policy, expert_policy, venv, baselines,
+                bc_trainer.policy,
+                expert_policy,
+                venv,
+                baselines,
             )
             round_data.update(eval_metrics)
 
@@ -475,7 +483,10 @@ def _run_bc(
         is_final = round_num == config.n_rounds - 1
         if is_first or is_interval or is_final:
             eval_metrics = _evaluate_learner_metrics(
-                bc_trainer.policy, expert_policy, venv, baselines,
+                bc_trainer.policy,
+                expert_policy,
+                venv,
+                baselines,
             )
             round_data.update(eval_metrics)
 
@@ -492,9 +503,14 @@ def _run_single_wrapper(args):
     except Exception as e:
         logger.error(f"Failed: {config.algo}/{config.env_name}/seed{config.seed}: {e}")
         import traceback
+
         traceback.print_exc()
-        return {"error": str(e), "algo": config.algo, "env": config.env_name,
-                "seed": config.seed}
+        return {
+            "error": str(e),
+            "algo": config.algo,
+            "env": config.env_name,
+            "seed": config.seed,
+        }
 
 
 def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
@@ -503,22 +519,24 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
     for env_name in args.envs:
         for algo in args.algos:
             for seed in range(args.seeds):
-                configs.append(ExperimentConfig(
-                    algo=algo,
-                    env_name=env_name,
-                    seed=seed,
-                    policy_mode=args.policy_mode,
-                    n_rounds=args.n_rounds,
-                    samples_per_round=args.samples_per_round,
-                    l2_lambda=args.l2_lambda,
-                    l2_decay=args.l2_decay,
-                    warm_start=args.warm_start,
-                    beta_rampdown=args.beta_rampdown,
-                    bc_n_epochs=args.bc_n_epochs,
-                    eval_interval=args.eval_interval,
-                    output_dir=pathlib.Path(args.output_dir),
-                    expert_cache_dir=pathlib.Path(args.expert_cache_dir),
-                ))
+                configs.append(
+                    ExperimentConfig(
+                        algo=algo,
+                        env_name=env_name,
+                        seed=seed,
+                        policy_mode=args.policy_mode,
+                        n_rounds=args.n_rounds,
+                        samples_per_round=args.samples_per_round,
+                        l2_lambda=args.l2_lambda,
+                        l2_decay=args.l2_decay,
+                        warm_start=args.warm_start,
+                        beta_rampdown=args.beta_rampdown,
+                        bc_n_epochs=args.bc_n_epochs,
+                        eval_interval=args.eval_interval,
+                        output_dir=pathlib.Path(args.output_dir),
+                        expert_cache_dir=pathlib.Path(args.expert_cache_dir),
+                    )
+                )
     return configs
 
 
@@ -526,42 +544,91 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run FTL vs FTRL vs BC experiments on classical MDPs",
     )
-    parser.add_argument("--envs", nargs="+", default=None,
-                        help="Environments to test")
-    parser.add_argument("--env-group", type=str, default=None,
-                        choices=list(env_utils.ENV_GROUPS.keys()),
-                        help="Predefined environment group to run")
-    parser.add_argument("--algos", nargs="+", default=ALL_ALGOS,
-                        choices=ALL_ALGOS, help="Algorithms to run")
-    parser.add_argument("--seeds", type=int, default=5,
-                        help="Number of random seeds")
-    parser.add_argument("--n-rounds", type=int, default=20,
-                        help="Number of DAgger rounds")
-    parser.add_argument("--samples-per-round", type=int, default=500,
-                        help="Min timesteps per DAgger round")
-    parser.add_argument("--policy-mode", choices=["end_to_end", "linear"],
-                        default="linear", help="Policy training mode")
-    parser.add_argument("--l2-lambda", type=float, default=0.01,
-                        help="L2 regularization weight for FTRL")
-    parser.add_argument("--l2-decay", action="store_true",
-                        help="Use decaying L2 schedule (lambda/n)")
-    parser.add_argument("--warm-start", action="store_true", default=True,
-                        help="Keep policy weights between rounds (default)")
-    parser.add_argument("--no-warm-start", dest="warm_start", action="store_false",
-                        help="Reinitialize trainable params each round")
-    parser.add_argument("--beta-rampdown", type=int, default=15,
-                        help="Rounds for beta schedule linear rampdown")
-    parser.add_argument("--bc-n-epochs", type=int, default=20,
-                        help="Number of BC training epochs")
-    parser.add_argument("--eval-interval", type=int, default=5,
-                        help="Evaluate learner every N rounds (also first and last)")
-    parser.add_argument("--output-dir", type=str, default="experiments/results",
-                        help="Directory for results")
-    parser.add_argument("--expert-cache-dir", type=str,
-                        default="experiments/expert_cache",
-                        help="Directory for caching trained experts")
-    parser.add_argument("--n-workers", type=int, default=1,
-                        help="Number of parallel workers (1=sequential)")
+    parser.add_argument("--envs", nargs="+", default=None, help="Environments to test")
+    parser.add_argument(
+        "--env-group",
+        type=str,
+        default=None,
+        choices=list(env_utils.ENV_GROUPS.keys()),
+        help="Predefined environment group to run",
+    )
+    parser.add_argument(
+        "--algos",
+        nargs="+",
+        default=ALL_ALGOS,
+        choices=ALL_ALGOS,
+        help="Algorithms to run",
+    )
+    parser.add_argument("--seeds", type=int, default=5, help="Number of random seeds")
+    parser.add_argument(
+        "--n-rounds", type=int, default=20, help="Number of DAgger rounds"
+    )
+    parser.add_argument(
+        "--samples-per-round",
+        type=int,
+        default=500,
+        help="Min timesteps per DAgger round",
+    )
+    parser.add_argument(
+        "--policy-mode",
+        choices=["end_to_end", "linear"],
+        default="linear",
+        help="Policy training mode",
+    )
+    parser.add_argument(
+        "--l2-lambda",
+        type=float,
+        default=0.01,
+        help="L2 regularization weight for FTRL",
+    )
+    parser.add_argument(
+        "--l2-decay", action="store_true", help="Use decaying L2 schedule (lambda/n)"
+    )
+    parser.add_argument(
+        "--warm-start",
+        action="store_true",
+        default=True,
+        help="Keep policy weights between rounds (default)",
+    )
+    parser.add_argument(
+        "--no-warm-start",
+        dest="warm_start",
+        action="store_false",
+        help="Reinitialize trainable params each round",
+    )
+    parser.add_argument(
+        "--beta-rampdown",
+        type=int,
+        default=15,
+        help="Rounds for beta schedule linear rampdown",
+    )
+    parser.add_argument(
+        "--bc-n-epochs", type=int, default=20, help="Number of BC training epochs"
+    )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=5,
+        help="Evaluate learner every N rounds (also first and last)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="experiments/results",
+        help="Directory for results",
+    )
+    parser.add_argument(
+        "--expert-cache-dir",
+        type=str,
+        default="experiments/expert_cache",
+        help="Directory for caching trained experts",
+    )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers (1=sequential)",
+    )
     args = parser.parse_args()
     args.envs = resolve_envs(env_group=args.env_group, envs=args.envs)
 
@@ -587,11 +654,16 @@ def main():
         rng = np.random.default_rng(0)
         if env_utils.is_atari(env_name):
             from imitation.experiments.ftrl.atari_utils import make_atari_venv
+
             venv = make_atari_venv(env_name, n_envs=1, seed=0)
         else:
             venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
         experts.get_or_train_expert(
-            env_name, venv, cache_dir=expert_cache_dir, rng=rng, seed=0,
+            env_name,
+            venv,
+            cache_dir=expert_cache_dir,
+            rng=rng,
+            seed=0,
         )
         venv.close()
 
@@ -600,7 +672,9 @@ def main():
     if args.n_workers <= 1:
         results = []
         for i, config in enumerate(configs):
-            logger.info(f"[{i+1}/{total}] {config.algo}/{config.env_name}/seed{config.seed}")
+            logger.info(
+                f"[{i+1}/{total}] {config.algo}/{config.env_name}/seed{config.seed}"
+            )
             results.append(run_single(config))
     else:
         ctx = multiprocessing.get_context("spawn")
@@ -618,7 +692,9 @@ def main():
     )
     if errors:
         for e in errors:
-            logger.error(f"  FAILED: {e['algo']}/{e['env']}/seed{e['seed']}: {e['error']}")
+            logger.error(
+                f"  FAILED: {e['algo']}/{e['env']}/seed{e['seed']}: {e['error']}"
+            )
 
 
 if __name__ == "__main__":

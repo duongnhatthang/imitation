@@ -209,7 +209,7 @@ def test_create_linear_policy():
         for p in expert.mlp_extractor.parameters():
             p.fill_(0.42)
 
-    linear_policy = policy_utils.create_linear_policy(expert, obs_space, act_space)
+    linear_policy = policy_utils.create_linear_policy(expert)
 
     # mlp_extractor weights should match expert
     for (name_e, pe), (name_l, pl) in zip(

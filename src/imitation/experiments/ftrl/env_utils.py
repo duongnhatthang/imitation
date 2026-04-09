@@ -14,7 +14,6 @@ from stable_baselines3.common.vec_env import VecEnv
 from imitation.data.wrappers import RolloutInfoWrapper
 from imitation.util import util
 
-
 # Environment configurations for the 8 classical MDPs.
 # obs_type: "discrete" means Discrete obs space that needs one-hot encoding.
 # obs_size: size of the Discrete space (only for discrete obs_type).

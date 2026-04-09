@@ -125,7 +125,8 @@ class TestResolveEnvs:
 def test_run_ftrl_lunarlander(tmp_path):
     """FTRL smoke test on LunarLander-v2 (new classical MDP)."""
     config = _make_config(
-        "ftrl", tmp_path,
+        "ftrl",
+        tmp_path,
         env_name="LunarLander-v2",
         policy_mode="linear",
         n_rounds=2,
@@ -140,7 +141,8 @@ def test_run_ftrl_lunarlander(tmp_path):
 def test_run_bc_taxi(tmp_path):
     """BC smoke test on Taxi-v3 (discrete obs, one-hot encoded)."""
     config = _make_config(
-        "bc", tmp_path,
+        "bc",
+        tmp_path,
         env_name="Taxi-v3",
         policy_mode="linear",
         n_rounds=2,

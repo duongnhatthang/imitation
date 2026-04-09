@@ -111,7 +111,10 @@ def _get_atari_expert(
     from stable_baselines3.common.evaluation import evaluate_policy
 
     mean_reward, std_reward = evaluate_policy(
-        model.policy, venv, n_eval_episodes=10, deterministic=True,
+        model.policy,
+        venv,
+        n_eval_episodes=10,
+        deterministic=True,
     )
     logger.info(
         f"Expert quality for {env_name}: reward={mean_reward:.1f}±{std_reward:.1f}"
@@ -169,7 +172,10 @@ def _train_classical_expert(
     from stable_baselines3.common.evaluation import evaluate_policy
 
     mean_reward, std_reward = evaluate_policy(
-        model.policy, venv, n_eval_episodes=20, deterministic=True,
+        model.policy,
+        venv,
+        n_eval_episodes=20,
+        deterministic=True,
     )
     logger.info(
         f"Expert quality for {env_name}: "

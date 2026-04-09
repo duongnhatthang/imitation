@@ -140,9 +140,7 @@ def compute_random_return(venv: VecEnv, n_episodes: int = 100) -> float:
     running_returns = np.zeros(venv.num_envs)
 
     while len(episode_returns) < n_episodes:
-        actions = np.array(
-            [venv.action_space.sample() for _ in range(venv.num_envs)]
-        )
+        actions = np.array([venv.action_space.sample() for _ in range(venv.num_envs)])
         obs, rewards, dones, infos = venv.step(actions)
         running_returns += rewards
         for i, done in enumerate(dones):

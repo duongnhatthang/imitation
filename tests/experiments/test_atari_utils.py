@@ -2,10 +2,7 @@
 
 import pytest
 
-from imitation.experiments.ftrl.atari_utils import (
-    ATARI_CONFIGS,
-    get_atari_env_id,
-)
+from imitation.experiments.ftrl.atari_utils import ATARI_CONFIGS, get_atari_env_id
 
 
 class TestAtariConfigs:
@@ -62,5 +59,8 @@ class TestAtariExpertRouting:
         rng = np.random.default_rng(0)
         with pytest.raises(ValueError, match="mock_hub_download"):
             get_or_train_expert(
-                "PongNoFrameskip-v4", mock_venv, cache_dir=tmp_path, rng=rng,
+                "PongNoFrameskip-v4",
+                mock_venv,
+                cache_dir=tmp_path,
+                rng=rng,
             )

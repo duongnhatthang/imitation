@@ -34,9 +34,9 @@ class TestCreateLinearPolicy:
 
         for name, param in linear_policy.named_parameters():
             if name.startswith("action_net") and "weight" in name:
-                assert not th.equal(param, expert_action_weights[name]), (
-                    f"action_net param {name} was not reinitialized"
-                )
+                assert not th.equal(
+                    param, expert_action_weights[name]
+                ), f"action_net param {name} was not reinitialized"
         env.close()
 
     def test_mlp_policy_features_frozen(self):
@@ -68,9 +68,9 @@ class TestCreateLinearPolicy:
 
         for name, param in linear_policy.named_parameters():
             if not name.startswith("action_net"):
-                assert th.equal(param, expert_state[name]), (
-                    f"Feature param {name} doesn't match expert"
-                )
+                assert th.equal(
+                    param, expert_state[name]
+                ), f"Feature param {name} doesn't match expert"
         env.close()
 
     def test_does_not_modify_expert(self):
@@ -83,7 +83,7 @@ class TestCreateLinearPolicy:
         create_linear_policy(expert_policy)
 
         for name, param in expert_policy.named_parameters():
-            assert th.equal(param, original_state[name]), (
-                f"Expert param {name} was modified"
-            )
+            assert th.equal(
+                param, original_state[name]
+            ), f"Expert param {name} was modified"
         env.close()

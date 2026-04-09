@@ -190,9 +190,7 @@ def download_hub_expert(
 
     from huggingface_sb3 import load_from_hub
 
-    logger.info(
-        f"Downloading expert from HuggingFace: {config['hub_repo_id']}"
-    )
+    logger.info(f"Downloading expert from HuggingFace: {config['hub_repo_id']}")
     downloaded_path = load_from_hub(
         repo_id=config["hub_repo_id"],
         filename=config["hub_filename"],

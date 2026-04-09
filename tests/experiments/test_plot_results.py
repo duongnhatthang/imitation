@@ -73,7 +73,11 @@ def _populate_results(results_dir, envs=None, algos=None, seeds=3, n_rounds=5):
         for algo in algos:
             for seed in range(seeds):
                 _write_fake_result(
-                    results_dir, algo, env, seed, n_rounds,
+                    results_dir,
+                    algo,
+                    env,
+                    seed,
+                    n_rounds,
                     base_ce=base_ces.get(algo, 1.0),
                 )
 
@@ -87,8 +91,14 @@ def test_load_results(tmp_path):
     # 2 envs x 3 algos x 2 seeds x 4 rounds = 48 rows
     assert len(df) == 48
     assert set(df.columns) >= {
-        "algo", "env", "seed", "round", "cross_entropy", "l2_norm",
-        "normalized_return", "disagreement_rate",
+        "algo",
+        "env",
+        "seed",
+        "round",
+        "cross_entropy",
+        "l2_norm",
+        "normalized_return",
+        "disagreement_rate",
     }
     assert set(df["algo"].unique()) == {"ftl", "ftrl", "bc"}
     assert set(df["env"].unique()) == {"CartPole-v1", "FrozenLake-v1"}
@@ -111,7 +121,9 @@ def test_load_results_skips_errors(tmp_path):
 
     # Write an error result
     err_file = results_dir / "CartPole-v1" / "err.json"
-    err_file.write_text(json.dumps({"error": "boom", "algo": "x", "env": "y", "seed": 0}))
+    err_file.write_text(
+        json.dumps({"error": "boom", "algo": "x", "env": "y", "seed": 0})
+    )
 
     df = load_results(results_dir)
     # Should only have the 1 valid file's data

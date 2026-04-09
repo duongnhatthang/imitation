@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 matplotlib.use("Agg")
 
 ALGO_COLORS: Dict[str, str] = {
-    "ftl": "#1f77b4",   # blue
+    "ftl": "#1f77b4",  # blue
     "ftrl": "#d62728",  # red
-    "bc": "#2ca02c",    # green
+    "bc": "#2ca02c",  # green
 }
 
 ALGO_LABELS: Dict[str, str] = {
@@ -153,9 +153,9 @@ def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["algo", "env", "seed", "round"]).copy()
     df["cum_loss"] = df.groupby(["algo", "env", "seed"])["cross_entropy"].cumsum()
     if "expert_cross_entropy" in df.columns:
-        df["expert_cum_loss"] = (
-            df.groupby(["algo", "env", "seed"])["expert_cross_entropy"].cumsum()
-        )
+        df["expert_cum_loss"] = df.groupby(["algo", "env", "seed"])[
+            "expert_cross_entropy"
+        ].cumsum()
     return df
 
 
@@ -211,8 +211,7 @@ def _plot_metric(
     """
     algos = sorted(
         df["algo"].unique(),
-        key=lambda a: list(ALGO_COLORS.keys()).index(a)
-        if a in ALGO_COLORS else 99,
+        key=lambda a: list(ALGO_COLORS.keys()).index(a) if a in ALGO_COLORS else 99,
     )
 
     for algo in algos:
@@ -251,8 +250,13 @@ def _plot_metric(
         color = ALGO_COLORS.get(algo, "#888888")
         label = ALGO_LABELS.get(algo, algo)
         ax.plot(
-            x, iqm, color=color, label=label, linewidth=2,
-            marker="o", markersize=3,
+            x,
+            iqm,
+            color=color,
+            label=label,
+            linewidth=2,
+            marker="o",
+            markersize=3,
         )
         ax.fill_between(x, ci_lo, ci_hi, color=color, alpha=0.15)
 
@@ -264,14 +268,22 @@ def _plot_metric(
         if np.std(values) < 0.01 * (np.mean(np.abs(values)) + 1e-8):
             ax.axhline(
                 y=np.mean(values),
-                color="black", linestyle="--", linewidth=1.5, alpha=0.7,
+                color="black",
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.7,
                 label=f"Expert (\u03c0*) = {np.mean(values):.3f}",
             )
         else:
             ax.plot(
-                x, values,
-                color="black", linestyle="--", linewidth=1.5, alpha=0.7,
-                marker="s", markersize=3,
+                x,
+                values,
+                color="black",
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.7,
+                marker="s",
+                markersize=3,
                 label="Expert (\u03c0*)",
             )
 
@@ -327,18 +339,30 @@ def plot_env(
 
     # Subplot 1: Per-round imitation loss (log scale)
     _plot_metric(
-        ax1, env_df, "cross_entropy", "Per-Round Imitation Loss",
-        log_scale=True, expert_baseline=expert_ce,
+        ax1,
+        env_df,
+        "cross_entropy",
+        "Per-Round Imitation Loss",
+        log_scale=True,
+        expert_baseline=expert_ce,
     )
 
     # Subplot 2: Normalized expected return
     _plot_metric(ax2, env_df, "normalized_return", "Normalized Expected Return")
     ax2.axhline(
-        y=1.0, color="black", linestyle="--", linewidth=1, alpha=0.5,
+        y=1.0,
+        color="black",
+        linestyle="--",
+        linewidth=1,
+        alpha=0.5,
         label="Expert (1.0)",
     )
     ax2.axhline(
-        y=0.0, color="gray", linestyle=":", linewidth=1, alpha=0.5,
+        y=0.0,
+        color="gray",
+        linestyle=":",
+        linewidth=1,
+        alpha=0.5,
         label="Random (0.0)",
     )
     ax2.legend(fontsize=9)
@@ -398,15 +422,21 @@ def main():
         description="Plot FTL vs FTRL vs BC experiment results",
     )
     parser.add_argument(
-        "--results-dir", type=str, default="experiments/results",
+        "--results-dir",
+        type=str,
+        default="experiments/results",
         help="Directory containing JSON result files",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="experiments/plots",
+        "--output-dir",
+        type=str,
+        default="experiments/plots",
         help="Directory to save PNG plots",
     )
     parser.add_argument(
-        "--envs", nargs="+", default=None,
+        "--envs",
+        nargs="+",
+        default=None,
         help="Filter to specific environments",
     )
     args = parser.parse_args()
