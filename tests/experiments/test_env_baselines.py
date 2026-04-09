@@ -51,3 +51,28 @@ class TestValidateExpertQuality:
     def test_unknown_env_passes(self):
         is_ok, msg = validate_expert_quality("UnknownEnv-v0", 100.0)
         assert is_ok
+
+
+from stable_baselines3.common.evaluation import evaluate_policy
+from imitation.experiments.ftrl.env_utils import ENV_CONFIGS, make_env
+from imitation.experiments.ftrl.experts import get_or_train_expert
+
+
+@pytest.mark.expensive
+class TestExpertQualityHardFail:
+    """Fail hard if any trained expert is degenerate."""
+
+    @pytest.mark.parametrize("env_name", list(ENV_CONFIGS.keys()))
+    def test_expert_meets_quality_threshold(self, env_name, tmp_path):
+        rng = np.random.default_rng(42)
+        venv = make_env(env_name, n_envs=1, rng=rng)
+        expert = get_or_train_expert(
+            env_name, venv, cache_dir=tmp_path, rng=rng, seed=42,
+        )
+        mean_return, _ = evaluate_policy(
+            expert, venv, n_eval_episodes=20, deterministic=True,
+        )
+        venv.close()
+
+        is_ok, msg = validate_expert_quality(env_name, mean_return)
+        assert is_ok, msg

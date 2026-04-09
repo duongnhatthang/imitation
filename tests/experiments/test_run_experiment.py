@@ -120,3 +120,33 @@ class TestResolveEnvs:
     def test_both_raises(self):
         with pytest.raises(ValueError, match="not both"):
             resolve_envs(env_group="classical", envs=["CartPole-v1"])
+
+
+def test_run_ftrl_lunarlander(tmp_path):
+    """FTRL smoke test on LunarLander-v2 (new classical MDP)."""
+    config = _make_config(
+        "ftrl", tmp_path,
+        env_name="LunarLander-v2",
+        policy_mode="linear",
+        n_rounds=2,
+        samples_per_round=200,
+    )
+    result = run_single(config)
+    assert result["algo"] == "ftrl"
+    assert result["env"] == "LunarLander-v2"
+    assert len(result["per_round"]) >= 1
+
+
+def test_run_bc_taxi(tmp_path):
+    """BC smoke test on Taxi-v3 (discrete obs, one-hot encoded)."""
+    config = _make_config(
+        "bc", tmp_path,
+        env_name="Taxi-v3",
+        policy_mode="linear",
+        n_rounds=2,
+        samples_per_round=200,
+    )
+    result = run_single(config)
+    assert result["algo"] == "bc"
+    assert result["env"] == "Taxi-v3"
+    assert len(result["per_round"]) >= 1
