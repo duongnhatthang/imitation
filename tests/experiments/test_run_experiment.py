@@ -26,6 +26,7 @@ def _make_config(algo, tmp_path, **overrides):
         warm_start=True,
         beta_rampdown=2,
         bc_n_epochs=2,
+        eval_interval=5,
         output_dir=tmp_path / "results",
         expert_cache_dir=tmp_path / "experts",
     )

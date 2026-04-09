@@ -80,6 +80,7 @@ class ExperimentConfig:
     warm_start: bool
     beta_rampdown: int
     bc_n_epochs: int
+    eval_interval: int
     output_dir: pathlib.Path
     expert_cache_dir: pathlib.Path
 
@@ -102,6 +103,62 @@ def _evaluate_policy_cross_entropy(
         cross_entropy = -log_prob.mean().item()
     policy.train()
     return cross_entropy
+
+
+def _evaluate_learner_metrics(
+    learner_policy,
+    expert_policy,
+    venv,
+    baselines: Dict[str, float],
+    n_episodes: int = 10,
+) -> Dict[str, Optional[float]]:
+    """Evaluate normalized return and on-policy disagreement rate.
+
+    Rolls out the learner policy for n_episodes, at each step also querying
+    the expert to compute disagreement. Returns normalized return (0=random,
+    1=expert) and disagreement rate (fraction of steps where actions differ).
+    """
+    learner_policy.eval()
+
+    episode_returns: List[float] = []
+    total_steps = 0
+    total_disagreements = 0
+    current_return = 0.0
+
+    obs = venv.reset()
+    while len(episode_returns) < n_episodes:
+        learner_action = learner_policy.predict(obs, deterministic=True)[0]
+        expert_action = expert_policy.predict(obs, deterministic=True)[0]
+
+        total_steps += 1
+        if learner_action[0] != expert_action[0]:
+            total_disagreements += 1
+
+        obs, rewards, dones, infos = venv.step(learner_action)
+        current_return += rewards[0]
+
+        if dones[0]:
+            episode_returns.append(current_return)
+            current_return = 0.0
+
+    learner_policy.train()
+
+    mean_return = float(np.mean(episode_returns))
+    expert_ret = baselines["expert_return"]
+    random_ret = baselines["random_return"]
+    score_range = expert_ret - random_ret
+
+    if abs(score_range) < 1e-8:
+        normalized_return = 0.0
+    else:
+        normalized_return = (mean_return - random_ret) / score_range
+
+    disagreement_rate = total_disagreements / max(total_steps, 1)
+
+    return {
+        "normalized_return": round(normalized_return, 6),
+        "disagreement_rate": round(disagreement_rate, 6),
+    }
 
 
 def run_single(config: ExperimentConfig) -> Dict[str, Any]:
@@ -136,6 +193,28 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         seed=config.seed,
     )
 
+    # Load or compute baselines for normalized return
+    from imitation.experiments.ftrl.env_baselines import (
+        load_or_compute_baselines,
+        validate_expert_quality,
+    )
+
+    baselines = load_or_compute_baselines(
+        config.env_name,
+        venv,
+        expert_policy,
+        config.expert_cache_dir,
+        rng,
+    )
+
+    # Warn if expert quality is below reference
+    is_ok, msg = validate_expert_quality(
+        config.env_name,
+        baselines["expert_return"],
+    )
+    if not is_ok:
+        logger.warning(f"WARNING: {msg}")
+
     # Create output dir
     env_dir = config.output_dir / config.env_name.replace("/", "_")
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -154,13 +233,16 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
             "beta_rampdown": config.beta_rampdown,
             "bc_n_epochs": config.bc_n_epochs,
         },
+        "baselines": baselines,
         "per_round": [],
     }
 
     if config.algo in ("ftl", "ftrl"):
-        result["per_round"] = _run_dagger_variant(config, venv, expert_policy, rng)
+        result["per_round"] = _run_dagger_variant(
+            config, venv, expert_policy, rng, baselines,
+        )
     elif config.algo == "bc":
-        result["per_round"] = _run_bc(config, venv, expert_policy, rng)
+        result["per_round"] = _run_bc(config, venv, expert_policy, rng, baselines)
     else:
         raise ValueError(f"Unknown algo: {config.algo}")
 
@@ -182,6 +264,7 @@ def _run_dagger_variant(
     venv,
     expert_policy,
     rng: np.random.Generator,
+    baselines: Dict[str, float],
 ) -> List[Dict[str, Any]]:
     """Run FTL or FTRL (DAgger variants)."""
     from imitation.algorithms.dagger import LinearBetaSchedule
@@ -253,9 +336,12 @@ def _run_dagger_variant(
     # Extract metrics and compute expert baseline CE per round
     from imitation.data import serialize
 
+    metrics = list(trainer.get_metrics())
+    total_rounds = len(metrics)
+
     per_round = []
     cum_obs = 0
-    for m in trainer.get_metrics():
+    for m in metrics:
         # m.round_num is post-increment (1-indexed); demo dirs are 0-indexed
         demo_round = m.round_num - 1
         round_dir = trainer._demo_dir_path_for_round(demo_round)
@@ -267,14 +353,32 @@ def _run_dagger_variant(
         expert_ce = _evaluate_policy_cross_entropy(expert_policy, round_transitions)
         cum_obs += len(round_transitions)
 
-        per_round.append({
+        round_data = {
             "round": m.round_num,
             "n_observations": cum_obs,
             "cross_entropy": round(m.cross_entropy, 6),
             "l2_norm": round(m.l2_norm, 6),
             "total_loss": round(m.total_loss, 6),
             "expert_cross_entropy": round(expert_ce, 6),
-        })
+            "normalized_return": None,
+            "disagreement_rate": None,
+        }
+
+        # Evaluate at intervals: round 1, every eval_interval, and final round
+        # NOTE: For DAgger, bc_trainer.policy is the *final* trained policy at
+        # this point (trainer.train() runs all rounds). Per-round evaluation
+        # during training would be more informative but requires a bigger
+        # refactor. This is acceptable for the first version.
+        is_first = m.round_num == 1
+        is_interval = m.round_num % config.eval_interval == 0
+        is_final = m.round_num == total_rounds
+        if is_first or is_interval or is_final:
+            eval_metrics = _evaluate_learner_metrics(
+                bc_trainer.policy, expert_policy, venv, baselines,
+            )
+            round_data.update(eval_metrics)
+
+        per_round.append(round_data)
 
     return per_round
 
@@ -284,6 +388,7 @@ def _run_bc(
     venv,
     expert_policy,
     rng: np.random.Generator,
+    baselines: Dict[str, float],
 ) -> List[Dict[str, Any]]:
     """Run BC baseline.
 
@@ -354,14 +459,27 @@ def _run_bc(
         l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
         l2_norm = sum(l2_norms) / 2
 
-        per_round.append({
+        round_data = {
             "round": round_num + 1,
             "n_observations": cum_obs,
             "cross_entropy": round(ce, 6),
             "l2_norm": round(l2_norm, 6),
             "total_loss": round(ce, 6),  # BC has no L2 penalty in loss
             "expert_cross_entropy": round(expert_ce, 6),
-        })
+            "normalized_return": None,
+            "disagreement_rate": None,
+        }
+
+        is_first = round_num == 0
+        is_interval = (round_num + 1) % config.eval_interval == 0
+        is_final = round_num == config.n_rounds - 1
+        if is_first or is_interval or is_final:
+            eval_metrics = _evaluate_learner_metrics(
+                bc_trainer.policy, expert_policy, venv, baselines,
+            )
+            round_data.update(eval_metrics)
+
+        per_round.append(round_data)
 
     return per_round
 
@@ -397,6 +515,7 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                     warm_start=args.warm_start,
                     beta_rampdown=args.beta_rampdown,
                     bc_n_epochs=args.bc_n_epochs,
+                    eval_interval=args.eval_interval,
                     output_dir=pathlib.Path(args.output_dir),
                     expert_cache_dir=pathlib.Path(args.expert_cache_dir),
                 ))
@@ -434,6 +553,8 @@ def main():
                         help="Rounds for beta schedule linear rampdown")
     parser.add_argument("--bc-n-epochs", type=int, default=20,
                         help="Number of BC training epochs")
+    parser.add_argument("--eval-interval", type=int, default=5,
+                        help="Evaluate learner every N rounds (also first and last)")
     parser.add_argument("--output-dir", type=str, default="experiments/results",
                         help="Directory for results")
     parser.add_argument("--expert-cache-dir", type=str,
