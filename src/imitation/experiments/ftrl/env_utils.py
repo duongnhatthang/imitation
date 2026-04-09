@@ -79,6 +79,42 @@ ENV_CONFIGS: Dict[str, dict] = {
 }
 
 
+def is_atari(env_name: str) -> bool:
+    """Check if an environment name refers to an Atari game."""
+    return "NoFrameskip" in env_name
+
+
+ENV_GROUPS: Dict[str, list] = {
+    "classical": list(ENV_CONFIGS.keys()),
+    "atari-zoo": [
+        "PongNoFrameskip-v4",
+        "BreakoutNoFrameskip-v4",
+        "SpaceInvadersNoFrameskip-v4",
+        "BeamRiderNoFrameskip-v4",
+        "QbertNoFrameskip-v4",
+        "MsPacmanNoFrameskip-v4",
+        "EnduroNoFrameskip-v4",
+        "SeaquestNoFrameskip-v4",
+    ],
+    "atari-fast": [
+        "FreewayNoFrameskip-v4",
+        "AtlantisNoFrameskip-v4",
+        "DemonAttackNoFrameskip-v4",
+        "CrazyClimberNoFrameskip-v4",
+    ],
+    "atari-medium": [
+        "AsterixNoFrameskip-v4",
+        "FrostbiteNoFrameskip-v4",
+        "KangarooNoFrameskip-v4",
+        "BankHeistNoFrameskip-v4",
+    ],
+}
+ENV_GROUPS["atari-all"] = (
+    ENV_GROUPS["atari-zoo"] + ENV_GROUPS["atari-fast"] + ENV_GROUPS["atari-medium"]
+)
+ENV_GROUPS["all"] = ENV_GROUPS["classical"] + ENV_GROUPS["atari-all"]
+
+
 class OneHotObsWrapper(gym.ObservationWrapper):
     """Converts a Discrete observation space to a one-hot Box space.
 

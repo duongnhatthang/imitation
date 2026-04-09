@@ -6,8 +6,10 @@ import pytest
 
 from imitation.experiments.ftrl.env_utils import (
     ENV_CONFIGS,
+    ENV_GROUPS,
     FlattenTupleObsWrapper,
     OneHotObsWrapper,
+    is_atari,
     make_env,
 )
 
@@ -71,3 +73,38 @@ class TestFlattenTupleObsWrapper:
         with pytest.raises(TypeError, match="Tuple"):
             FlattenTupleObsWrapper(env)
         env.close()
+
+
+class TestEnvGroups:
+    """Test environment group definitions."""
+
+    def test_classical_group_has_8_envs(self):
+        assert len(ENV_GROUPS["classical"]) == 8
+
+    def test_atari_zoo_group(self):
+        assert "PongNoFrameskip-v4" in ENV_GROUPS["atari-zoo"]
+        assert len(ENV_GROUPS["atari-zoo"]) == 8
+
+    def test_atari_all_is_union(self):
+        expected = (
+            set(ENV_GROUPS["atari-zoo"])
+            | set(ENV_GROUPS["atari-fast"])
+            | set(ENV_GROUPS["atari-medium"])
+        )
+        assert set(ENV_GROUPS["atari-all"]) == expected
+
+    def test_all_is_classical_plus_atari(self):
+        expected = set(ENV_GROUPS["classical"]) | set(ENV_GROUPS["atari-all"])
+        assert set(ENV_GROUPS["all"]) == expected
+
+
+class TestIsAtari:
+    """Test Atari environment detection."""
+
+    def test_atari_envs(self):
+        assert is_atari("PongNoFrameskip-v4") is True
+        assert is_atari("BreakoutNoFrameskip-v4") is True
+
+    def test_classical_envs(self):
+        assert is_atari("CartPole-v1") is False
+        assert is_atari("Taxi-v3") is False
