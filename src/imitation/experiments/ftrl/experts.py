@@ -117,6 +117,18 @@ def _get_atari_expert(
         f"Expert quality for {env_name}: reward={mean_reward:.1f}±{std_reward:.1f}"
     )
 
+    from .env_baselines import load_or_compute_baselines, validate_expert_quality
+
+    rng = np.random.default_rng(seed)
+
+    # Compute and cache baselines
+    load_or_compute_baselines(env_name, venv, model.policy, cache_dir, rng)
+
+    # Warn if expert quality is below reference
+    is_ok, msg = validate_expert_quality(env_name, mean_reward)
+    if not is_ok:
+        logger.warning(f"WARNING: {msg}")
+
     return model.policy
 
 
@@ -169,6 +181,16 @@ def _train_classical_expert(
     cache_path.mkdir(parents=True, exist_ok=True)
     model.save(cache_path / "model.zip")
     logger.info(f"Saved expert to {cache_path / 'model.zip'}")
+
+    from .env_baselines import load_or_compute_baselines, validate_expert_quality
+
+    # Compute and cache baselines
+    load_or_compute_baselines(env_name, venv, model.policy, cache_dir, rng)
+
+    # Warn if expert quality is below reference
+    is_ok, msg = validate_expert_quality(env_name, mean_reward)
+    if not is_ok:
+        logger.warning(f"WARNING: {msg}")
 
     return model.policy
 
