@@ -1,7 +1,13 @@
 """Plotting for FTL vs FTRL vs BC experiment results.
 
-Generates per-environment figures with cumulative loss and cumulative regret.
-Supports incremental generation — can plot partial results as experiments complete.
+Generates per-environment figures with 4 subplots:
+  1. Per-round imitation loss (log scale)
+  2. Normalized expected return
+  3. On-policy disagreement rate
+  4. Cumulative regret
+
+Uses IQM + 95% stratified bootstrap CI (via rliable) instead of mean +/- std.
+Supports incremental generation -- can plot partial results as experiments complete.
 
 Usage:
     python -m imitation.experiments.ftrl.plot_results --results-dir experiments/results/
@@ -12,7 +18,7 @@ import argparse
 import json
 import logging
 import pathlib
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -33,10 +39,35 @@ ALGO_COLORS: Dict[str, str] = {
 }
 
 ALGO_LABELS: Dict[str, str] = {
-    "ftl": "FTL (DAgger, λ=0)",
+    "ftl": "FTL (DAgger, \u03bb=0)",
     "ftrl": "FTRL (DAgger + L2)",
     "bc": "BC (offline)",
 }
+
+
+def _compute_iqm_and_ci(
+    values_by_seed: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Compute IQM and 95% stratified bootstrap CI using rliable.
+
+    Args:
+        values_by_seed: 1D array of values, one per seed.
+
+    Returns:
+        (iqm_value, ci_low, ci_high)
+    """
+    from rliable import library as rly
+    from rliable import metrics as rly_metrics
+
+    if len(values_by_seed) < 2:
+        val = float(values_by_seed[0]) if len(values_by_seed) == 1 else 0.0
+        return val, val, val
+
+    # rliable expects dict of {algo_name: array of shape (n_runs, n_tasks)}
+    data = {"a": values_by_seed.reshape(-1, 1)}
+    aggregate_func = lambda x: np.array([rly_metrics.aggregate_iqm(x)])
+    scores, cis = rly.get_interval_estimates(data, aggregate_func, reps=2000)
+    return float(scores["a"][0]), float(cis["a"][0, 0]), float(cis["a"][1, 0])
 
 
 def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
@@ -49,7 +80,8 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
 
     Returns:
         DataFrame with columns: algo, env, seed, policy_mode, round,
-        cross_entropy, l2_norm, total_loss.
+        cross_entropy, l2_norm, total_loss, normalized_return,
+        disagreement_rate.
     """
     rows = []
     results_path = pathlib.Path(results_dir)
@@ -80,6 +112,17 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
             }
             if "expert_cross_entropy" in m:
                 row["expert_cross_entropy"] = m["expert_cross_entropy"]
+
+            # New optional fields
+            if "normalized_return" in m and m["normalized_return"] is not None:
+                row["normalized_return"] = m["normalized_return"]
+            else:
+                row["normalized_return"] = np.nan
+            if "disagreement_rate" in m and m["disagreement_rate"] is not None:
+                row["disagreement_rate"] = m["disagreement_rate"]
+            else:
+                row["disagreement_rate"] = np.nan
+
             rows.append(row)
 
     if not rows:
@@ -152,40 +195,66 @@ def _plot_metric(
     df: pd.DataFrame,
     metric: str,
     ylabel: str,
+    log_scale: bool = False,
     expert_baseline: Optional[pd.DataFrame] = None,
 ):
-    """Plot a metric with mean ± 1 std bands across seeds.
+    """Plot a metric with IQM and 95% bootstrap CI bands across seeds.
 
     Args:
         ax: Matplotlib axes to plot on.
         df: DataFrame filtered to a single env.
         metric: Column name to plot.
         ylabel: Y-axis label.
+        log_scale: Whether to use log scale on y-axis.
         expert_baseline: Optional DataFrame with 'mean_metric' and 'mean_obs'
             columns. Plotted as a black dashed line.
     """
-    algos = sorted(df["algo"].unique(), key=lambda a: list(ALGO_COLORS.keys()).index(a)
-                   if a in ALGO_COLORS else 99)
+    algos = sorted(
+        df["algo"].unique(),
+        key=lambda a: list(ALGO_COLORS.keys()).index(a)
+        if a in ALGO_COLORS else 99,
+    )
 
     for algo in algos:
         algo_df = df[df["algo"] == algo]
-        stats = (
-            algo_df.groupby("round")
-            .agg(mean_metric=(metric, "mean"), std_metric=(metric, "std"),
-                 mean_obs=("n_observations", "mean"))
-            .reset_index()
-        )
-        stats["std_metric"] = stats["std_metric"].fillna(0)
+
+        # Filter to non-null values for this metric
+        valid_df = algo_df.dropna(subset=[metric])
+        if valid_df.empty:
+            continue
+
+        rounds = sorted(valid_df["round"].unique())
+        x_vals, iqm_vals, ci_lows, ci_highs = [], [], [], []
+
+        for rnd in rounds:
+            rnd_df = valid_df[valid_df["round"] == rnd]
+            values = rnd_df[metric].values
+
+            if len(values) == 0:
+                continue
+
+            iqm, ci_lo, ci_hi = _compute_iqm_and_ci(values)
+            mean_obs = rnd_df["n_observations"].mean()
+            x_vals.append(mean_obs)
+            iqm_vals.append(iqm)
+            ci_lows.append(ci_lo)
+            ci_highs.append(ci_hi)
+
+        if not x_vals:
+            continue
+
+        x = np.array(x_vals)
+        iqm = np.array(iqm_vals)
+        ci_lo = np.array(ci_lows)
+        ci_hi = np.array(ci_highs)
 
         color = ALGO_COLORS.get(algo, "#888888")
         label = ALGO_LABELS.get(algo, algo)
-        x = stats["mean_obs"].values
-        mean = stats["mean_metric"].values
-        std = stats["std_metric"].values
-
-        ax.plot(x, mean, color=color, label=label, linewidth=2, marker="o",
-                markersize=3)
-        ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
+        ax.plot(
+            x, iqm, color=color, label=label, linewidth=2,
+            marker="o", markersize=3,
+        )
+        ax.fill_between(x, ci_lo, ci_hi, color=color, alpha=0.15)
 
     # Expert baseline
     if expert_baseline is not None and not expert_baseline.empty:
@@ -196,15 +265,18 @@ def _plot_metric(
             ax.axhline(
                 y=np.mean(values),
                 color="black", linestyle="--", linewidth=1.5, alpha=0.7,
-                label=f"Expert (π*) = {np.mean(values):.3f}",
+                label=f"Expert (\u03c0*) = {np.mean(values):.3f}",
             )
         else:
             ax.plot(
                 x, values,
                 color="black", linestyle="--", linewidth=1.5, alpha=0.7,
                 marker="s", markersize=3,
-                label="Expert (π*)",
+                label="Expert (\u03c0*)",
             )
+
+    if log_scale:
+        ax.set_yscale("log")
 
     ax.set_xlabel("Number of Observations")
     ax.set_ylabel(ylabel)
@@ -217,11 +289,12 @@ def plot_env(
     env_name: str,
     output_path: pathlib.Path,
 ) -> None:
-    """Generate a 3-subplot figure for one environment.
+    """Generate a 4-subplot figure for one environment.
 
-    Top: per-round cross-entropy (learning curve).
-    Middle: cumulative loss.
-    Bottom: cumulative regret.
+    Subplot 1: per-round imitation loss (log scale).
+    Subplot 2: normalized expected return.
+    Subplot 3: on-policy disagreement rate.
+    Subplot 4: cumulative regret.
 
     Args:
         df: Full DataFrame with cum_loss and cum_regret columns.
@@ -237,33 +310,45 @@ def plot_env(
     policy_modes = env_df["policy_mode"].unique()
     mode_str = policy_modes[0] if len(policy_modes) == 1 else "mixed"
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(8, 14), sharex=True)
     fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
 
     # Get expert baselines if available (as DataFrames with mean_obs column)
     expert_ce = None
-    expert_cum = None
     if "expert_cross_entropy" in env_df.columns:
         expert_ce = (
             env_df.groupby("round")
-            .agg(mean_metric=("expert_cross_entropy", "mean"),
-                 mean_obs=("n_observations", "mean"))
-            .reset_index()
-        )
-    if "expert_cum_loss" in env_df.columns:
-        expert_cum = (
-            env_df.groupby("round")
-            .agg(mean_metric=("expert_cum_loss", "mean"),
-                 mean_obs=("n_observations", "mean"))
+            .agg(
+                mean_metric=("expert_cross_entropy", "mean"),
+                mean_obs=("n_observations", "mean"),
+            )
             .reset_index()
         )
 
-    _plot_metric(ax1, env_df, "cross_entropy", "Per-Round Cross-Entropy",
-                 expert_baseline=expert_ce)
-    _plot_metric(ax2, env_df, "cum_loss", "Cumulative Cross-Entropy Loss",
-                 expert_baseline=expert_cum)
-    _plot_metric(ax3, env_df, "cum_regret", "Cumulative Regret (vs expert)",
-                 expert_baseline=None)  # regret is relative, no expert line needed
+    # Subplot 1: Per-round imitation loss (log scale)
+    _plot_metric(
+        ax1, env_df, "cross_entropy", "Per-Round Imitation Loss",
+        log_scale=True, expert_baseline=expert_ce,
+    )
+
+    # Subplot 2: Normalized expected return
+    _plot_metric(ax2, env_df, "normalized_return", "Normalized Expected Return")
+    ax2.axhline(
+        y=1.0, color="black", linestyle="--", linewidth=1, alpha=0.5,
+        label="Expert (1.0)",
+    )
+    ax2.axhline(
+        y=0.0, color="gray", linestyle=":", linewidth=1, alpha=0.5,
+        label="Random (0.0)",
+    )
+    ax2.legend(fontsize=9)
+
+    # Subplot 3: On-policy disagreement rate
+    _plot_metric(ax3, env_df, "disagreement_rate", "On-Policy Disagreement Rate")
+    ax3.set_ylim(-0.05, 1.05)
+
+    # Subplot 4: Cumulative regret
+    _plot_metric(ax4, env_df, "cum_regret", "Cumulative Regret (vs Expert)")
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -339,7 +424,7 @@ def main():
     if paths:
         logger.info(f"Generated {len(paths)} plots in {args.output_dir}")
     else:
-        logger.warning("No plots generated — check results directory")
+        logger.warning("No plots generated -- check results directory")
 
 
 if __name__ == "__main__":
