@@ -14,7 +14,7 @@ from imitation.data.wrappers import RolloutInfoWrapper
 from imitation.util import util
 
 
-# Environment configurations for the 5 classical MDPs.
+# Environment configurations for the 8 classical MDPs.
 # obs_type: "discrete" means Discrete obs space that needs one-hot encoding.
 # obs_size: size of the Discrete space (only for discrete obs_type).
 # ppo_timesteps: PPO training steps to solve the env (benchmarked locally with
@@ -56,6 +56,23 @@ ENV_CONFIGS: Dict[str, dict] = {
             "learning_rate": 1e-3,
         },
         "ppo_n_envs": 4,
+        "env_kwargs": {},
+    },
+    "Taxi-v3": {
+        "obs_type": "discrete",
+        "obs_size": 500,
+        "ppo_timesteps": 100_000,
+        "env_kwargs": {},
+    },
+    "Blackjack-v1": {
+        "obs_type": "tuple",
+        "obs_sizes": [32, 11, 2],
+        "ppo_timesteps": 50_000,
+        "env_kwargs": {},
+    },
+    "LunarLander-v2": {
+        "obs_type": "continuous",
+        "ppo_timesteps": 300_000,
         "env_kwargs": {},
     },
 }
@@ -106,13 +123,68 @@ class OneHotObsWrapper(gym.ObservationWrapper):
         return one_hot
 
 
+class FlattenTupleObsWrapper(gym.ObservationWrapper):
+    """Converts a Tuple of Discrete observation spaces to a concatenated one-hot Box.
+
+    For Blackjack-v1: Tuple(Discrete(32), Discrete(11), Discrete(2)) -> Box(45,).
+    Each discrete component is one-hot encoded and concatenated.
+    """
+
+    def __init__(self, env: gym.Env) -> None:
+        """Builds FlattenTupleObsWrapper.
+
+        Args:
+            env: Environment with a Tuple observation space of Discrete spaces.
+
+        Raises:
+            TypeError: If the observation space is not a Tuple of Discrete spaces.
+        """
+        super().__init__(env)
+        if not isinstance(env.observation_space, gym.spaces.Tuple):
+            raise TypeError(
+                f"FlattenTupleObsWrapper requires Tuple obs space, "
+                f"got {type(env.observation_space).__name__}",
+            )
+        self._sizes = []
+        for space in env.observation_space.spaces:
+            if not isinstance(space, gym.spaces.Discrete):
+                raise TypeError(
+                    f"FlattenTupleObsWrapper requires all Tuple elements to be "
+                    f"Discrete, got {type(space).__name__}",
+                )
+            self._sizes.append(int(space.n))
+        total = sum(self._sizes)
+        self.observation_space = gym.spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(total,),
+            dtype=np.float32,
+        )
+
+    def observation(self, obs) -> np.ndarray:
+        """Convert tuple of integers to concatenated one-hot vector.
+
+        Args:
+            obs: Tuple observation from the wrapped environment.
+
+        Returns:
+            Concatenated one-hot encoded float32 array.
+        """
+        parts = []
+        for i, size in enumerate(self._sizes):
+            one_hot = np.zeros(size, dtype=np.float32)
+            one_hot[int(obs[i])] = 1.0
+            parts.append(one_hot)
+        return np.concatenate(parts)
+
+
 def make_env(
     env_name: str,
     n_envs: int,
     rng: np.random.Generator,
     env_kwargs: Optional[dict] = None,
 ) -> VecEnv:
-    """Create a vectorized environment, auto-applying one-hot for discrete obs.
+    """Create a vectorized environment, auto-applying obs wrappers as needed.
 
     Args:
         env_name: Gymnasium environment ID.
@@ -122,18 +194,20 @@ def make_env(
             the defaults from ENV_CONFIGS (or empty dict if env not in configs).
 
     Returns:
-        A VecEnv with RolloutInfoWrapper applied. Discrete-obs envs also
-        get OneHotObsWrapper.
+        A VecEnv with RolloutInfoWrapper applied. Discrete-obs envs get
+        OneHotObsWrapper; tuple-obs envs get FlattenTupleObsWrapper.
     """
     config = ENV_CONFIGS.get(env_name, {})
-    is_discrete = config.get("obs_type") == "discrete"
+    obs_type = config.get("obs_type", "continuous")
 
     if env_kwargs is None:
         env_kwargs = config.get("env_kwargs", {})
 
     def post_wrapper(env, _):
-        if is_discrete:
+        if obs_type == "discrete":
             env = OneHotObsWrapper(env)
+        elif obs_type == "tuple":
+            env = FlattenTupleObsWrapper(env)
         return RolloutInfoWrapper(env)
 
     return util.make_vec_env(
