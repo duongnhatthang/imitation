@@ -28,12 +28,14 @@ def _write_fake_result(
     env_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(seed + hash(algo) % 1000)
+    samples_per_round = 500
     per_round = []
     for r in range(n_rounds):
         ce = base_ce * np.exp(-0.1 * r) + rng.normal(0, 0.05)
         ce = max(ce, 0.01)
         per_round.append({
-            "round": r,
+            "round": r + 1,
+            "n_observations": (r + 1) * samples_per_round,
             "cross_entropy": round(ce, 6),
             "l2_norm": round(rng.uniform(0.1, 1.0), 6),
             "total_loss": round(ce + 0.001, 6),

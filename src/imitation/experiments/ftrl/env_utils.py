@@ -46,7 +46,16 @@ ENV_CONFIGS: Dict[str, dict] = {
     },
     "MountainCar-v0": {
         "obs_type": "continuous",
-        "ppo_timesteps": 1_000_000,
+        "ppo_timesteps": 2_000_000,
+        "ppo_kwargs": {
+            "n_steps": 2048,
+            "batch_size": 256,
+            "n_epochs": 10,
+            "gamma": 0.999,
+            "gae_lambda": 0.98,
+            "learning_rate": 1e-3,
+        },
+        "ppo_n_envs": 4,
         "env_kwargs": {},
     },
 }

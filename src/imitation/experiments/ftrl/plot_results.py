@@ -73,6 +73,7 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
                 "seed": data["seed"],
                 "policy_mode": data.get("policy_mode", "unknown"),
                 "round": m["round"],
+                "n_observations": m.get("n_observations", 0),
                 "cross_entropy": m["cross_entropy"],
                 "l2_norm": m["l2_norm"],
                 "total_loss": m["total_loss"],
@@ -151,7 +152,7 @@ def _plot_metric(
     df: pd.DataFrame,
     metric: str,
     ylabel: str,
-    expert_baseline: Optional[pd.Series] = None,
+    expert_baseline: Optional[pd.DataFrame] = None,
 ):
     """Plot a metric with mean ± 1 std bands across seeds.
 
@@ -160,31 +161,36 @@ def _plot_metric(
         df: DataFrame filtered to a single env.
         metric: Column name to plot.
         ylabel: Y-axis label.
-        expert_baseline: Optional Series indexed by round with expert metric
-            values. Plotted as a black dashed line.
+        expert_baseline: Optional DataFrame with 'mean_metric' and 'mean_obs'
+            columns. Plotted as a black dashed line.
     """
     algos = sorted(df["algo"].unique(), key=lambda a: list(ALGO_COLORS.keys()).index(a)
                    if a in ALGO_COLORS else 99)
 
     for algo in algos:
         algo_df = df[df["algo"] == algo]
-        stats = algo_df.groupby("round")[metric].agg(["mean", "std"]).reset_index()
-        stats["std"] = stats["std"].fillna(0)
+        stats = (
+            algo_df.groupby("round")
+            .agg(mean_metric=(metric, "mean"), std_metric=(metric, "std"),
+                 mean_obs=("n_observations", "mean"))
+            .reset_index()
+        )
+        stats["std_metric"] = stats["std_metric"].fillna(0)
 
         color = ALGO_COLORS.get(algo, "#888888")
         label = ALGO_LABELS.get(algo, algo)
-        rounds = stats["round"].values
-        mean = stats["mean"].values
-        std = stats["std"].values
+        x = stats["mean_obs"].values
+        mean = stats["mean_metric"].values
+        std = stats["std_metric"].values
 
-        ax.plot(rounds, mean, color=color, label=label, linewidth=2, marker="o",
+        ax.plot(x, mean, color=color, label=label, linewidth=2, marker="o",
                 markersize=3)
-        ax.fill_between(rounds, mean - std, mean + std, color=color, alpha=0.15)
+        ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
 
     # Expert baseline
     if expert_baseline is not None and not expert_baseline.empty:
-        rounds = expert_baseline.index.values
-        values = expert_baseline.values
+        x = expert_baseline["mean_obs"].values
+        values = expert_baseline["mean_metric"].values
         # If values are roughly constant, draw a flat line; otherwise a curve
         if np.std(values) < 0.01 * (np.mean(np.abs(values)) + 1e-8):
             ax.axhline(
@@ -194,15 +200,14 @@ def _plot_metric(
             )
         else:
             ax.plot(
-                rounds, values,
+                x, values,
                 color="black", linestyle="--", linewidth=1.5, alpha=0.7,
                 marker="s", markersize=3,
                 label="Expert (π*)",
             )
 
-    ax.set_xlabel("Round")
+    ax.set_xlabel("Number of Observations")
     ax.set_ylabel(ylabel)
-    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -235,13 +240,23 @@ def plot_env(
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
     fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
 
-    # Get expert baselines if available
+    # Get expert baselines if available (as DataFrames with mean_obs column)
     expert_ce = None
     expert_cum = None
     if "expert_cross_entropy" in env_df.columns:
-        expert_ce = env_df.groupby("round")["expert_cross_entropy"].mean()
+        expert_ce = (
+            env_df.groupby("round")
+            .agg(mean_metric=("expert_cross_entropy", "mean"),
+                 mean_obs=("n_observations", "mean"))
+            .reset_index()
+        )
     if "expert_cum_loss" in env_df.columns:
-        expert_cum = env_df.groupby("round")["expert_cum_loss"].mean()
+        expert_cum = (
+            env_df.groupby("round")
+            .agg(mean_metric=("expert_cum_loss", "mean"),
+                 mean_obs=("n_observations", "mean"))
+            .reset_index()
+        )
 
     _plot_metric(ax1, env_df, "cross_entropy", "Per-Round Cross-Entropy",
                  expert_baseline=expert_ce)
