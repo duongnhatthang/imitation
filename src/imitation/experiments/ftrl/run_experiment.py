@@ -173,9 +173,9 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
     start_time = time.time()
     rng = np.random.default_rng(config.seed)
 
-    # Force CPU for classical MDPs (Atari uses GPU for CNN)
-    if not env_utils.is_atari(config.env_name):
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # Force CPU for all experiments. Even Atari linear mode only trains
+    # action_net (tiny), and GPU causes device mismatches with multiprocessing.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     # Create env
     if env_utils.is_atari(config.env_name):
