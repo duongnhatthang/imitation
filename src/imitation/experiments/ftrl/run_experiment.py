@@ -111,12 +111,14 @@ def _evaluate_learner_metrics(
     venv,
     baselines: Dict[str, float],
     n_episodes: int = 10,
+    max_steps: int = 10000,
 ) -> Dict[str, Optional[float]]:
     """Evaluate normalized return and on-policy disagreement rate.
 
-    Rolls out the learner policy for n_episodes, at each step also querying
-    the expert to compute disagreement. Returns normalized return (0=random,
-    1=expert) and disagreement rate (fraction of steps where actions differ).
+    Rolls out the learner policy for n_episodes (or until max_steps), at each
+    step also querying the expert to compute disagreement. Returns normalized
+    return (0=random, 1=expert) and disagreement rate (fraction of steps
+    where actions differ).
     """
     learner_policy.eval()
 
@@ -124,13 +126,15 @@ def _evaluate_learner_metrics(
     total_steps = 0
     total_disagreements = 0
     current_return = 0.0
+    current_episode_steps = 0
 
     obs = venv.reset()
-    while len(episode_returns) < n_episodes:
+    while len(episode_returns) < n_episodes and total_steps < max_steps:
         learner_action = learner_policy.predict(obs, deterministic=True)[0]
         expert_action = expert_policy.predict(obs, deterministic=True)[0]
 
         total_steps += 1
+        current_episode_steps += 1
         if learner_action[0] != expert_action[0]:
             total_disagreements += 1
 
@@ -140,6 +144,11 @@ def _evaluate_learner_metrics(
         if dones[0]:
             episode_returns.append(current_return)
             current_return = 0.0
+            current_episode_steps = 0
+
+    # If we hit max_steps mid-episode, count the partial return as an episode
+    if not episode_returns:
+        episode_returns.append(current_return)
 
     learner_policy.train()
 
@@ -173,9 +182,11 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
     start_time = time.time()
     rng = np.random.default_rng(config.seed)
 
-    # Force CPU for all experiments. Even Atari linear mode only trains
-    # action_net (tiny), and GPU causes device mismatches with multiprocessing.
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # Device selection: classical MDPs use CPU (tiny networks, GPU adds overhead).
+    # Atari uses the worker's assigned GPU if available, else CPU.
+    use_gpu = env_utils.is_atari(config.env_name) and _WORKER_GPU_ID is not None
+    if not use_gpu and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     # Create env
     if env_utils.is_atari(config.env_name):
@@ -502,9 +513,51 @@ def _run_bc(
     return per_round
 
 
+def _result_path(config: ExperimentConfig) -> pathlib.Path:
+    """Return the output JSON path for a given experiment config."""
+    env_dir = config.output_dir / config.env_name.replace("/", "_")
+    return env_dir / f"{config.algo}_{config.policy_mode}_seed{config.seed}.json"
+
+
+def _is_already_done(config: ExperimentConfig) -> bool:
+    """Check if this experiment has already been run (result JSON exists)."""
+    return _result_path(config).exists()
+
+
+_WORKER_GPU_ID: Optional[int] = None
+
+
+def _worker_init(gpu_queue):
+    """Pool initializer: assign each worker to a GPU from the queue."""
+    global _WORKER_GPU_ID
+    try:
+        gpu_id = gpu_queue.get_nowait()
+    except Exception:
+        gpu_id = None
+    if gpu_id is not None:
+        _WORKER_GPU_ID = gpu_id
+        # Best-effort CUDA device assignment
+        try:
+            import torch as _th
+
+            if _th.cuda.is_available():
+                _th.cuda.set_device(gpu_id)
+        except Exception:
+            pass
+
+
 def _run_single_wrapper(args):
     """Wrapper for multiprocessing.Pool.map (unpacks config)."""
     config = args
+    # Resume support: skip already-completed experiments
+    if _is_already_done(config):
+        out_file = _result_path(config)
+        try:
+            with open(out_file) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass  # corrupted, re-run
+
     try:
         return run_single(config)
     except Exception as e:
@@ -636,6 +689,17 @@ def main():
         default=1,
         help="Number of parallel workers (1=sequential)",
     )
+    parser.add_argument(
+        "--n-gpus",
+        type=int,
+        default=0,
+        help="Number of GPUs to distribute workers across (0=CPU only)",
+    )
+    parser.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="Re-run experiments even if result JSON already exists",
+    )
     args = parser.parse_args()
     args.envs = resolve_envs(env_group=args.env_group, envs=args.envs)
 
@@ -644,13 +708,34 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    configs = build_configs(args)
+    # Pass GPU count to workers via env var
+    os.environ["FTRL_N_GPUS"] = str(args.n_gpus)
+
+    all_configs = build_configs(args)
+    total_requested = len(all_configs)
+
+    # Resume support: skip configs whose result JSON already exists
+    if args.force_rerun:
+        configs = all_configs
+        skipped = 0
+    else:
+        configs = [c for c in all_configs if not _is_already_done(c)]
+        skipped = total_requested - len(configs)
+
     total = len(configs)
     logger.info(
-        f"Running {total} experiments: "
+        f"Running {total} new experiments ({skipped} already cached, "
+        f"{total_requested} total requested): "
         f"{len(args.envs)} envs × {len(args.algos)} algos × {args.seeds} seeds"
     )
-    logger.info(f"Policy mode: {args.policy_mode}, workers: {args.n_workers}")
+    logger.info(
+        f"Policy mode: {args.policy_mode}, workers: {args.n_workers}, "
+        f"GPUs: {args.n_gpus}"
+    )
+
+    if total == 0:
+        logger.info("All experiments already cached. Nothing to run.")
+        return
 
     # Pre-train and cache experts sequentially before parallel dispatch.
     # Without this, parallel workers all see "no cache" simultaneously and
@@ -678,17 +763,68 @@ def main():
 
     start_time = time.time()
 
+    def _fmt_eta(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        if seconds < 3600:
+            return f"{seconds / 60:.1f}m"
+        return f"{seconds / 3600:.1f}h"
+
     if args.n_workers <= 1:
         results = []
         for i, config in enumerate(configs):
+            t0 = time.time()
             logger.info(
                 f"[{i+1}/{total}] {config.algo}/{config.env_name}/seed{config.seed}"
             )
             results.append(run_single(config))
+            elapsed_so_far = time.time() - start_time
+            done = i + 1
+            avg_per_exp = elapsed_so_far / done
+            remaining = (total - done) * avg_per_exp
+            logger.info(
+                f"Progress: {done}/{total} done | "
+                f"elapsed {_fmt_eta(elapsed_so_far)} | "
+                f"avg {_fmt_eta(avg_per_exp)}/exp | "
+                f"ETA {_fmt_eta(remaining)}"
+            )
     else:
         ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(args.n_workers) as pool:
-            results = pool.map(_run_single_wrapper, configs)
+        # Build a queue of GPU IDs to hand out to workers (cycling).
+        gpu_queue = ctx.Queue()
+        if args.n_gpus > 0:
+            for w in range(args.n_workers):
+                gpu_queue.put(w % args.n_gpus)
+        else:
+            for _ in range(args.n_workers):
+                gpu_queue.put(None)
+
+        with ctx.Pool(
+            args.n_workers,
+            initializer=_worker_init,
+            initargs=(gpu_queue,),
+        ) as pool:
+            results = []
+            for i, result in enumerate(
+                pool.imap_unordered(_run_single_wrapper, configs)
+            ):
+                results.append(result)
+                elapsed_so_far = time.time() - start_time
+                done = i + 1
+                avg_per_exp = elapsed_so_far / done
+                # With n_workers parallel, effective time per exp is
+                # avg_per_exp (wall-clock). ETA = remaining_exps * avg_per_exp
+                # but divided by parallelism: remaining / n_workers * wall_per_batch
+                remaining_exps = total - done
+                # Conservative ETA: assumes same throughput continues
+                eta = remaining_exps * (elapsed_so_far / done)
+                if done % max(1, total // 20) == 0 or done == total:
+                    logger.info(
+                        f"Progress: {done}/{total} done | "
+                        f"elapsed {_fmt_eta(elapsed_so_far)} | "
+                        f"throughput {done/elapsed_so_far*60:.1f} exp/min | "
+                        f"ETA {_fmt_eta(eta)}"
+                    )
 
     elapsed = time.time() - start_time
 
