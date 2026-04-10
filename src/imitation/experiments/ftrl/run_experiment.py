@@ -182,6 +182,13 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         from imitation.experiments.ftrl.atari_utils import make_atari_venv
 
         venv = make_atari_venv(config.env_name, n_envs=1, seed=config.seed)
+        # Atari CNN policies expect CHW obs (transposed from HWC).
+        # VecTransposeImage handles this so BC/DAgger see the same obs space
+        # as the policy.
+        from stable_baselines3.common.vec_env import is_vecenv_wrapped, VecTransposeImage
+
+        if not is_vecenv_wrapped(venv, VecTransposeImage):
+            venv = VecTransposeImage(venv)
     else:
         venv = env_utils.make_env(config.env_name, n_envs=1, rng=rng)
 
@@ -654,8 +661,10 @@ def main():
         rng = np.random.default_rng(0)
         if env_utils.is_atari(env_name):
             from imitation.experiments.ftrl.atari_utils import make_atari_venv
+            from stable_baselines3.common.vec_env import VecTransposeImage
 
             venv = make_atari_venv(env_name, n_envs=1, seed=0)
+            venv = VecTransposeImage(venv)
         else:
             venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
         experts.get_or_train_expert(
