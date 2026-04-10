@@ -167,3 +167,5 @@ experiments/expert_cache/
 experiments/plots/
 experiments/setup_server.sh
 experiments/sync_results.sh
+
+.worktrees/
