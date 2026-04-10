@@ -59,11 +59,18 @@ def eval_policy_rollout(
 ) -> EvalResult:
     """Roll out a policy for exactly n_episodes complete episodes and return metrics.
 
-    If expert_policy is provided, at each step the expert's action is queried at the
-    current state and used to compute disagreement_rate and rollout_cross_entropy
-    (= -mean log prob of expert's action under the learner policy at the learner's
-    own rollout states). No extra rollouts are performed for CE -- the same
-    transitions that drive return are reused.
+    If expert_policy is provided, at each step the expert's deterministic action
+    a*(s) = argmax_a π*(a|s) is queried at the current state and used to compute:
+      - disagreement_rate: fraction of steps where learner's argmax != expert's argmax
+      - rollout_cross_entropy: sampled-action form,
+            -1/|D| * sum_{s in D} log π^t(a*(s) | s)
+        where D is the set of states visited during this rollout and π^t is the
+        learner's policy. This is the SAME form the imitation library uses as its
+        BC/DAgger training loss (see src/imitation/algorithms/bc.py:130-144), so
+        it is apples-to-apples with the training objective — only the state
+        distribution (D) differs between training and evaluation.
+    No extra rollouts are performed for CE -- the same transitions that drive
+    return are reused.
 
     Raises:
         RuntimeError: if safety_step_cap is hit before n_episodes complete.
@@ -136,11 +143,11 @@ max_total    = config["convergence"]["max_timesteps"]
 min_total    = config["convergence"]["min_timesteps"]
 threshold    = config["convergence"]["threshold"]          # default 0.95
 patience     = config["convergence"]["patience"]           # default 5 chunks
-tolerance    = 0.02                                        # normalized-return plateau tolerance
-entropy_eps  = config["convergence"]["entropy_eps"]        # default 0.05, residual entropy cap
+tolerance       = 0.02                                    # normalized-return plateau tolerance
+self_ce_eps     = config["convergence"]["self_ce_eps"]    # default 0.05, sharpness cap
 
-best_norm_return  = -inf
-best_residual_ent = +inf
+best_norm_return = -inf
+best_self_ce     = +inf
 chunks_since_best = 0
 total_steps       = 0
 
@@ -151,22 +158,26 @@ while total_steps < max_total:
 
     eval_result = eval_policy_rollout(ppo.policy, eval_venv, n_episodes=20,
                                       deterministic=True, expert_policy=ppo.policy)
-    norm_return  = normalize(eval_result.mean_return, ref_random, ref_expert)
-    residual_ent = eval_result.rollout_cross_entropy   # using ppo as both learner and expert
-                                                        # -> this is the residual entropy of
-                                                        # ppo's softmax at its own argmax
+    norm_return = normalize(eval_result.mean_return, ref_random, ref_expert)
+
+    # self_ce = -mean log π^ppo(argmax(π^ppo(·|s)) | s) averaged over ppo's own rollout
+    # states. For a sharp (nearly deterministic) softmax, log-prob of the argmax → 0,
+    # so self_ce → 0. For a diffuse softmax, self_ce is positive. This is the direct
+    # argmax-pathology gauge: if it is large, the policy's deterministic mode is
+    # unreliable and PPO needs to keep training.
+    self_ce = eval_result.rollout_cross_entropy
 
     improved = norm_return > best_norm_return + tolerance \
-            or residual_ent < best_residual_ent - tolerance
+            or self_ce < best_self_ce - tolerance
     if improved:
-        best_norm_return, best_residual_ent = norm_return, residual_ent
+        best_norm_return, best_self_ce = norm_return, self_ce
         chunks_since_best = 0
     else:
         chunks_since_best += 1
 
     if total_steps >= min_total \
        and norm_return >= threshold \
-       and residual_ent <= entropy_eps \
+       and self_ce <= self_ce_eps \
        and chunks_since_best >= patience:
         break   # converged
 
@@ -174,11 +185,11 @@ else:  # while-else: loop fell through without break
     raise RuntimeError(
         f"Expert for {env_name} failed to converge in {max_total} steps: "
         f"norm_return={norm_return:.3f} (threshold={threshold}), "
-        f"residual_ent={residual_ent:.3f} (eps={entropy_eps})"
+        f"self_ce={self_ce:.3f} (eps={self_ce_eps})"
     )
 ```
 
-**Convergence is hybrid AND strict:** normalized return must pass threshold, residual entropy (softmax sharpness) must pass entropy_eps, and both must have plateaued for `patience` chunks. Satisfying one is not enough. Hitting `max_total` without convergence **raises an error** — the whole point is that silent under-training is the original bug.
+**Convergence is hybrid AND strict:** normalized return must pass threshold, self-CE (softmax sharpness at own argmax, sampled-action form) must pass self_ce_eps, and both must have plateaued for `patience` chunks. Satisfying one is not enough. Hitting `max_total` without convergence **raises an error** — the whole point is that silent under-training is the original bug.
 
 **New per-env config fields in `ENV_CONFIGS`** (all optional with module-level defaults):
 
@@ -189,7 +200,7 @@ DEFAULT_CONVERGENCE = {
     "max_timesteps": 5_000_000,
     "threshold":          0.95,
     "patience":              5,
-    "entropy_eps":        0.05,
+    "self_ce_eps":        0.05,
 }
 
 ENV_CONFIGS["MountainCar-v0"] = {
@@ -202,7 +213,7 @@ ENV_CONFIGS["Blackjack-v1"] = {
     ...existing...
     "convergence": {
         "threshold": 0.85,   # below default 0.95; reference expert_score is -0.06
-        "entropy_eps": 0.15,  # Blackjack's optimal policy is multi-modal at edge states
+        "self_ce_eps": 0.15,  # Blackjack's optimal policy is multi-modal at edge states
         "_note": "Blackjack stochastic optimum; 0.95/0.05 physically unreachable.",
     },
 }
@@ -245,8 +256,8 @@ def test_expert_converged(env_name, tmp_cache_dir):
     assert normalized >= cfg["threshold"] - 0.05, (
         f"{env_name}: normalized return {normalized:.3f} < threshold {cfg['threshold']}"
     )
-    assert res.rollout_cross_entropy <= cfg["entropy_eps"] + 0.02, (
-        f"{env_name}: residual entropy {res.rollout_cross_entropy:.3f} too high "
+    assert res.rollout_cross_entropy <= cfg["self_ce_eps"] + 0.02, (
+        f"{env_name}: self-CE {res.rollout_cross_entropy:.3f} too high "
         f"(softmax not sharp enough; argmax pathology risk)"
     )
 
@@ -336,7 +347,10 @@ def _run_bc_dagger(config, venv, expert_policy, rng, baselines):
 
 **Cross-entropy storage.** Two CE columns in the JSON:
 - `train_cross_entropy`: CE of learner on its own training data (expert data for BC/BC+DAgger, aggregated DAgger data for FTL/FTRL). Kept for debugging; not plotted.
-- `rollout_cross_entropy`: CE of learner on fresh transitions from its own rollout, with expert's action as target. This is the plotted metric for all "dynamic" algos (FTL+DAgger, FTRL+DAgger, BC+DAgger).
+- `rollout_cross_entropy`: CE of learner on fresh transitions from its own rollout, with expert's argmax action as target. Sampled-action form:
+  $-\tfrac{1}{|D^t|}\sum_{s\in D^t} \log \pi^t(a^*(s)\mid s)$, where $a^*(s) = \arg\max_a \pi^*(a\mid s)$ and $D^t$ is a set of states from **fresh rollouts of the current learner at eval time**. This is the plotted metric for all three "dynamic" algos (FTL+DAgger, FTRL+DAgger, BC+DAgger).
+
+**Symmetric fresh-rollout eval for FTL/FTRL+DAgger (option (ii) — strict apples-to-apples).** The current `_run_dagger_variant` reports `m.cross_entropy` from the BC trainer's training step, which is computed on the *aggregated* DAgger dataset (a mixture of rollout states from all past rounds weighted by the beta schedule). That's biased toward older rollout distributions. To be strictly fair against BC+DAgger — whose `rollout_cross_entropy` comes from fresh rollouts of only the *current* policy — FTL+DAgger and FTRL+DAgger will ALSO compute `rollout_cross_entropy` from fresh rollouts at each eval point, using the same `eval_policy_rollout(learner, venv, n_episodes=20, expert_policy=expert)` call that already drives their return metric. This adds ~0 cost beyond what's already happening, since return eval already rolls out the learner; we're just recording one extra scalar from the same transitions. The old `train_cross_entropy` is kept in the JSON for debugging and shows the "aggregated training loss" for comparison.
 
 ### 3.5 Plot relabeling + new rollout-CE metric — `plot_results.py`
 
@@ -348,15 +362,15 @@ def _run_bc_dagger(config, venv, expert_policy, rng, baselines):
 | `ftrl` | FTRL+DAgger | solid | #d62728 red | ✓ | ✓ | ✓ |
 | `bc_dagger` | BC+DAgger | solid | #2ca02c green | ✓ | ✓ | ✓ |
 | `bc` | BC (fixed) | **dashed** | #17a663 dark green | — | ✓ (reference) | ✓ |
-| `expert` | Expert | **dashed** | gray | — | ✓ (reference at y=1.0) | — |
+| `expert` | Expert | **dashed** | gray | ✓ (debug only, toggleable) | ✓ (reference at y=1.0) | — |
 
-**Loss subplot metric:** switch from `cross_entropy` (which was inconsistent across algos) to `rollout_cross_entropy` for all three plotted algos. The old `cross_entropy`/`total_loss` fields remain in the JSONs as `train_cross_entropy` for debugging.
+**Loss subplot metric:** switch from `cross_entropy` (which was inconsistent across algos) to `rollout_cross_entropy` for all three plotted algos plus Expert (debug). The old `cross_entropy`/`total_loss` fields remain in the JSONs as `train_cross_entropy` for debugging.
+
+**Expert on the loss subplot (debug mode).** A CLI flag `--show-expert-on-loss` (default **ON** for now) controls whether the Expert dashed line appears on the loss subplot. Its value at each round is the expert's **self-CE**, computed the same way as the convergence trainer: roll out the expert and record $-\tfrac{1}{|D|}\sum_{s \in D} \log \pi^*(\arg\max_a \pi^*(a\mid s) \mid s)$. This equals $-\tfrac{1}{|D|}\sum \log p_{\max}(s)$ and is a direct sharpness gauge of the expert's softmax. After P3 is fixed this line should sit near 0 everywhere and can be turned off for publication-ready figures. While we're still debugging, it's the most direct visual confirmation that the argmax pathology is gone. Since the expert policy is fixed (not re-trained per round), one round's worth of rollouts is enough and the value is broadcast to all rounds as a horizontal dashed line. Fixed BC remains NOT on the loss subplot — it's a pure reference on return/disagreement, and adding it to the loss subplot would conflate "loss benchmark" with "static reference line" without adding information.
 
 **Figure subtitle** (added):
 
-> *Loss subplot: cross-entropy of learner on its own rollout distribution (expert's action as target). Return subplot: mean deterministic rollout return, normalized to [random=0, expert=1]. BC trains on a fixed expert dataset; BC+DAgger trains on an expert-data prefix that grows with round to match DAgger's observation budget; FTL/FTRL+DAgger train on DAgger-aggregated rollout transitions. All returns are evaluated by rolling out the learner being plotted.*
-
-Expert is NOT shown on the loss subplot (its rollout CE against itself is the same residual entropy already monitored in the convergence trainer; dashed horizontal line would be a misleading noisy constant). Fixed BC is also not shown on the loss subplot — it's a reference, not a subject of distribution-shift comparison.
+> *Loss subplot: sampled-action cross-entropy, $-\tfrac{1}{|D^t|}\sum_{s \in D^t} \log \pi^t(a^*(s) \mid s)$ where $a^*(s) = \arg\max_a \pi^*(a\mid s)$ and $D^t$ is a set of states freshly rolled out by the learner $\pi^t$ at the current eval point. This matches the training loss form used by the imitation library's BC/DAgger trainer (`bc.py:130-144`); only the state distribution $D^t$ differs from training. Return subplot: mean deterministic rollout return, normalized to [random=0, expert=1]. Data sources: BC trains on a fixed expert dataset; BC+DAgger trains on an expert-data prefix that grows with round to match DAgger's observation budget and is evaluated on its own rollouts; FTL/FTRL+DAgger train on DAgger-aggregated rollout transitions and are also evaluated on fresh rollouts of the current policy (strictly apples-to-apples with BC+DAgger).*
 
 ---
 
@@ -391,8 +405,8 @@ Before merge, all must hold:
 2. `pytest -m expensive tests/experiments/test_expert_quality.py` passes on all 8 classical envs — every expert converged and every expert ≥ 0.95 × BC return.
 3. All classical experts' cached `baselines.json` shows `expert_return` within reach of `REFERENCE_BASELINES[env]["expert_score"]` (≥ 0.90).
 4. `run_experiment.py --env-group classical --algos ftl ftrl bc bc_dagger --seeds 3` completes without errors.
-5. `plot_results.py` generates per-env figures with: solid lines for FTL+DAgger / FTRL+DAgger / BC+DAgger, dashed lines for BC and Expert, correct legend, subtitle rendered, loss subplot using `rollout_cross_entropy`, expert line at y=1.0 on the return subplot.
-6. Every classical env's expert_cross_entropy on its own rollouts (= residual entropy) is ≤ 0.05, ruling out argmax pathology visually.
+5. `plot_results.py` generates per-env figures with: solid lines for FTL+DAgger / FTRL+DAgger / BC+DAgger, dashed lines for BC (return subplot) and Expert (return subplot + loss subplot when `--show-expert-on-loss` is set, which is the default), correct legend, subtitle rendered with the sampled-action CE formula, loss subplot using `rollout_cross_entropy`, expert line at y=1.0 on the return subplot.
+6. Every classical env's expert self-CE (sampled-action form, `−log π*(argmax | s)` averaged over expert rollout states) is ≤ `self_ce_eps` for that env (default 0.05; Blackjack 0.15 per §3.2 D1 fallback). This is the direct argmax-pathology gauge and should be visibly near zero on the loss subplot after retraining.
 7. Full test suite (`pytest -n auto tests/ -m "not expensive"`) green.
 8. No regression on Atari results — Atari experts and JSONs unchanged; if anyone reruns Atari, results should be identical within noise.
 
@@ -400,61 +414,63 @@ Before merge, all must hold:
 
 ## 6. Local execution plan
 
-Server is down. We run classical retraining + experiments locally.
+Server is down. We run classical retraining + experiments locally, in two staggered passes so we can iterate quickly on the 6 fast envs before paying for the 2 slow ones (MountainCar, Taxi). The resume logic in `run_experiment.py` (`_is_already_done`) + the per-env expert-caching in `experts.get_or_train_expert` guarantee that nothing is re-run when the second pass adds the slow envs.
 
-**Pre-run cleanup (from worktree root):**
+**Fast envs (Pass 1):** `CartPole-v1`, `FrozenLake-v1`, `CliffWalking-v0`, `Acrobot-v1`, `Blackjack-v1`, `LunarLander-v2`.
+**Slow envs (Pass 2):** `MountainCar-v0`, `Taxi-v3`.
+
+**Pre-run cleanup (once, from worktree root):**
 
 ```bash
 cd /Users/thangduong/Desktop/imitation/.worktrees/ftrl-expert-fix
-rm -rf experiments/expert_cache/CartPole-v1 \
-       experiments/expert_cache/FrozenLake-v1 \
-       experiments/expert_cache/CliffWalking-v0 \
-       experiments/expert_cache/Acrobot-v1 \
-       experiments/expert_cache/MountainCar-v0 \
-       experiments/expert_cache/Taxi-v3 \
-       experiments/expert_cache/Blackjack-v1 \
-       experiments/expert_cache/LunarLander-v2
-rm -rf experiments/results/CartPole-v1 \
-       experiments/results/FrozenLake-v1 \
-       experiments/results/CliffWalking-v0 \
-       experiments/results/Acrobot-v1 \
-       experiments/results/MountainCar-v0 \
-       experiments/results/Taxi-v3 \
-       experiments/results/Blackjack-v1 \
-       experiments/results/LunarLander-v2
+for env in CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
+           MountainCar-v0 Taxi-v3 Blackjack-v1 LunarLander-v2; do
+    rm -rf "experiments/expert_cache/$env" "experiments/results/$env"
+done
 ```
 
 (Atari caches preserved.)
 
-**Retrain experts (will happen automatically on first experiment run, but can be pre-warmed):**
+**Pass 1 — fast envs (run first, inside tmux):**
 
 ```bash
 python -m imitation.experiments.ftrl.run_experiment \
-    --env-group classical --algos ftl --seeds 1 --n-rounds 2 --n-workers 1
-```
-
-This triggers expert training for all 8 classical envs sequentially via the pre-training pass in `main()`. Training may take hours on CPU for MountainCar / Taxi — run in tmux.
-
-**Full experiment run:**
-
-```bash
-python -m imitation.experiments.ftrl.run_experiment \
-    --env-group classical \
+    --envs CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
+           Blackjack-v1 LunarLander-v2 \
     --algos ftl ftrl bc bc_dagger \
-    --seeds 5 \
-    --n-workers 4
+    --seeds 5 --n-workers 4
 ```
 
-Local CPU count dictates `--n-workers`. Classical experts are fast enough after convergence that this should complete overnight.
-
-**Plots:**
+This pre-trains experts only for the 6 fast envs (the pre-training loop in `run_experiment.main()` iterates over `args.envs`, not over the whole `ENV_CONFIGS`). MountainCar and Taxi are not touched. Plot immediately with:
 
 ```bash
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir experiments/results/ \
     --envs CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
-           MountainCar-v0 Taxi-v3 Blackjack-v1 LunarLander-v2
+           Blackjack-v1 LunarLander-v2
 ```
+
+Iterate on any issues surfaced by Pass 1 before paying for Pass 2.
+
+**Pass 2 — slow envs (run after Pass 1 looks good):**
+
+```bash
+python -m imitation.experiments.ftrl.run_experiment \
+    --envs MountainCar-v0 Taxi-v3 \
+    --algos ftl ftrl bc bc_dagger \
+    --seeds 5 --n-workers 2
+```
+
+Nothing from Pass 1 re-runs. Only the MountainCar / Taxi experts get trained (which dominates wall-clock), and only MountainCar / Taxi result JSONs get written. Then re-plot with all 8 envs:
+
+```bash
+python -m imitation.experiments.ftrl.plot_results \
+    --results-dir experiments/results/ \
+    --envs CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
+           Blackjack-v1 LunarLander-v2 MountainCar-v0 Taxi-v3
+```
+
+**Why this works without code changes:** `run_experiment.main()` line 772 builds the pre-train expert loop from `args.envs`; the experiment loop skips any `(algo, env, seed)` whose result JSON exists. Expert caches persist across passes. Both features are already in place (see `_is_already_done` and the expert pre-train block). The only thing I need to verify during implementation is that the new convergence-detecting trainer doesn't re-train an already-cached converged expert — it shouldn't, because `get_or_train_expert` still short-circuits on cache hit before calling the trainer.
 
 ---
 
