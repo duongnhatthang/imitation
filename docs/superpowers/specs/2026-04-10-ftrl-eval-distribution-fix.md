@@ -60,17 +60,19 @@ def eval_policy_rollout(
     """Roll out a policy for exactly n_episodes complete episodes and return metrics.
 
     If expert_policy is provided, at each step the expert's deterministic action
-    a*(s) = argmax_a π*(a|s) is queried at the current state and used to compute:
-      - disagreement_rate: fraction of steps where learner's argmax != expert's argmax
-      - rollout_cross_entropy: sampled-action form,
-            -1/|D| * sum_{s in D} log π^t(a*(s) | s)
-        where D is the set of states visited during this rollout and π^t is the
-        learner's policy. This is the SAME form the imitation library uses as its
-        BC/DAgger training loss (see src/imitation/algorithms/bc.py:130-144), so
-        it is apples-to-apples with the training objective — only the state
-        distribution (D) differs between training and evaluation.
-    No extra rollouts are performed for CE -- the same transitions that drive
-    return are reused.
+    a*(s) = argmax_a π*(a|s) is queried at the current state and STORED as part
+    of the returned EvalResult.rollout_batch. The caller is responsible for
+    aggregating rollout_batch into a running D_eval buffer across eval points
+    and computing the sampled-action CE on that aggregated buffer via the
+    separate helper `compute_sampled_action_ce(policy, rollout_batch)`.
+
+    This function does NOT itself compute the plotted `rollout_cross_entropy`
+    metric, because that metric is defined over an aggregated eval set (see
+    §3.4) whose state is owned by the experiment runner, not this helper.
+    The function does compute `current_round_ce` as a convenience — the CE
+    on the single current-round rollout — which is useful for the convergence
+    trainer's self-CE sharpness gauge (§3.2) but should NOT be plotted as the
+    apples-to-apples DAgger loss.
 
     Raises:
         RuntimeError: if safety_step_cap is hit before n_episodes complete.
@@ -82,12 +84,37 @@ def eval_policy_rollout(
 
 ```python
 @dataclasses.dataclass
+class RolloutBatch:
+    """Raw transitions collected during one eval call. Owned by the caller,
+    aggregated across eval points into D_eval^t."""
+    obs: np.ndarray                 # shape (n_steps, *obs_shape)
+    expert_actions: np.ndarray      # shape (n_steps,) — a*(s) = argmax π*(·|s)
+    learner_actions: np.ndarray     # shape (n_steps,) — for disagreement accounting
+
+@dataclasses.dataclass
 class EvalResult:
     mean_return: float
-    episode_returns: List[float]   # length == n_episodes exactly
-    disagreement_rate: Optional[float]          # None if expert_policy is None
-    rollout_cross_entropy: Optional[float]      # None if expert_policy is None
-    n_steps: int                                # total env steps used
+    episode_returns: List[float]              # length == n_episodes exactly
+    n_steps: int                              # total env steps used
+    rollout_batch: Optional[RolloutBatch]     # None if expert_policy is None
+    current_round_disagreement: Optional[float]   # None if no expert_policy
+    current_round_ce: Optional[float]             # None if no expert_policy
+                                                  # CE on THIS call's rollout only;
+                                                  # NOT the plotted metric
+```
+
+**Helper:**
+
+```python
+def compute_sampled_action_ce(
+    policy: BasePolicy,
+    obs: np.ndarray,            # aggregated state buffer
+    expert_actions: np.ndarray, # aggregated expert argmax actions
+    batch_size: int = 2048,
+) -> float:
+    """Compute -1/|D| * sum_{(s,a*) in D} log π(a*|s) on an arbitrary
+    (possibly large) aggregated buffer. Single forward pass batched over
+    the buffer; no autograd."""
 ```
 
 **Key properties:**
@@ -96,7 +123,7 @@ class EvalResult:
 - `safety_step_cap` is a hard ceiling to prevent infinite loops from buggy envs; hitting it raises `RuntimeError` with a diagnostic message. Default 100k, overridable.
 - When a SB3 `Monitor` is present in the venv wrapper chain (which it always is via `util.make_vec_env`), the per-episode return is pulled from `info["episode"]["r"]` to exactly match SB3's convention. Otherwise falls back to accumulated `rewards[i]`. This is the same selection logic SB3 uses in `evaluation.py`.
 - `deterministic=True` selects the policy's argmax (categorical) or mean (Gaussian) action, matching SB3.
-- `rollout_cross_entropy` is computed from the same transitions collected during the rollout. No extra rollouts.
+- `current_round_ce` and `current_round_disagreement` are computed from this call's rollout only. They are NOT the plotted `rollout_cross_entropy` — that one is computed by the caller on the aggregated D_eval^t buffer via `compute_sampled_action_ce()`.
 
 **Call sites that collapse to this function:**
 
@@ -160,12 +187,14 @@ while total_steps < max_total:
                                       deterministic=True, expert_policy=ppo.policy)
     norm_return = normalize(eval_result.mean_return, ref_random, ref_expert)
 
-    # self_ce = -mean log π^ppo(argmax(π^ppo(·|s)) | s) averaged over ppo's own rollout
-    # states. For a sharp (nearly deterministic) softmax, log-prob of the argmax → 0,
-    # so self_ce → 0. For a diffuse softmax, self_ce is positive. This is the direct
-    # argmax-pathology gauge: if it is large, the policy's deterministic mode is
-    # unreliable and PPO needs to keep training.
-    self_ce = eval_result.rollout_cross_entropy
+    # self_ce = -mean log π^ppo(argmax(π^ppo(·|s)) | s) averaged over ppo's own
+    # single-round rollout. No aggregation across chunks — this is a snapshot
+    # sharpness gauge of the CURRENT ppo policy, not a DAgger-style running loss.
+    # For a sharp (nearly deterministic) softmax, log-prob of the argmax → 0,
+    # so self_ce → 0. For a diffuse softmax, self_ce is positive. This is the
+    # direct argmax-pathology gauge: if it is large, the policy's deterministic
+    # mode is unreliable and PPO needs to keep training.
+    self_ce = eval_result.current_round_ce
 
     improved = norm_return > best_norm_return + tolerance \
             or self_ce < best_self_ce - tolerance
@@ -256,8 +285,8 @@ def test_expert_converged(env_name, tmp_cache_dir):
     assert normalized >= cfg["threshold"] - 0.05, (
         f"{env_name}: normalized return {normalized:.3f} < threshold {cfg['threshold']}"
     )
-    assert res.rollout_cross_entropy <= cfg["self_ce_eps"] + 0.02, (
-        f"{env_name}: self-CE {res.rollout_cross_entropy:.3f} too high "
+    assert res.current_round_ce <= cfg["self_ce_eps"] + 0.02, (
+        f"{env_name}: self-CE {res.current_round_ce:.3f} too high "
         f"(softmax not sharp enough; argmax pathology risk)"
     )
 
@@ -281,9 +310,20 @@ def test_expert_beats_bc(env_name, tmp_cache_dir):
 
 Tests are marked `@pytest.mark.expensive` so the fast CI loop doesn't pay for them on every commit. They run in the final validation phase before merge.
 
-### 3.4 BC+DAgger baseline — `algo="bc_dagger"` in `run_experiment.py`
+### 3.4 BC+DAgger baseline + aggregated D_eval buffer — `algo="bc_dagger"` in `run_experiment.py`
 
-**Algorithm:**
+**Core datasets and semantics.** At every eval point $t$ we maintain two parallel growing buffers per run. They preserve DAgger's aggregation-is-the-point narrative while making the loss metric apples-to-apples across the three dynamic algos.
+
+| Dataset | Definition | Used for |
+|---|---|---|
+| $D_{\text{train}}^t$ | FTL/FTRL+DAgger: aggregated mixture rollouts (states labeled with expert argmax) across rounds 1..t, per the standard DAgger protocol. BC+DAgger: prefix $[0 : t \cdot \text{samples\_per\_round}]$ of the pre-collected expert dataset. | Training objective that the ERM minimizes each round. Loss on it is reported as `train_cross_entropy` for debugging — still per-algo quantity, not apples-to-apples. |
+| $D_{\text{eval}}^t$ | Aggregated across eval points. At each eval point, roll out the **current** learner policy for `n_episodes=20` complete episodes, label each state with $a^*(s) = \arg\max \pi^*(\cdot \mid s)$, and append `(obs, a*)` to the running buffer. Never touched for training. | Source of the plotted `rollout_cross_entropy`: $-\tfrac{1}{\lvert D_{\text{eval}}^t\rvert}\sum_{(s, a^*) \in D_{\text{eval}}^t} \log \pi^t(a^* \mid s)$, where $\pi^t$ is the **current** (round-$t$) policy re-scored on the entire aggregated eval buffer. |
+
+**Critical semantic.** $D_{\text{eval}}^t$ is built incrementally: each eval point contributes rollouts from **that round's** policy, but every eval point's `rollout_cross_entropy` is the **current round's** policy scored on the **entire accumulated** buffer. So at round $t$, we score $\pi^t$ on states from $\{\pi^1, \pi^{e}, \pi^{2e}, \ldots, \pi^{t}\}$ (where $e = \text{eval\_interval}$). This mirrors the DAgger regret bound on the training side and is identical in structure for FTL+DAgger, FTRL+DAgger, and BC+DAgger.
+
+**The only algorithmic difference between BC+DAgger and FTL+DAgger** is the $D_{\text{train}}^t$ source: BC+DAgger trains on the expert-data prefix, FTL+DAgger trains on aggregated mixture rollouts. Everything else — policy class, BC trainer, eval protocol, eval buffer, plotted metric — is identical.
+
+**BC+DAgger algorithm:**
 
 ```python
 def _run_bc_dagger(config, venv, expert_policy, rng, baselines):
@@ -293,9 +333,12 @@ def _run_bc_dagger(config, venv, expert_policy, rng, baselines):
     all_transitions = collect_expert_transitions(expert_policy, venv, total_timesteps, rng)
     assert len(all_transitions) >= total_timesteps
 
-    # Persistent policy for warm-start mode; re-created per round for from-scratch.
     warm_start = should_warm_start_bc_dagger(config.env_name)   # Atari -> True, classical -> False
     policy = None
+
+    # D_eval buffer — grows across eval points, never reset.
+    d_eval_obs: List[np.ndarray] = []
+    d_eval_expert_acts: List[np.ndarray] = []
 
     per_round = []
     for round_num in range(1, config.n_rounds + 1):
@@ -319,25 +362,35 @@ def _run_bc_dagger(config, venv, expert_policy, rng, baselines):
         round_data = {
             "round": round_num,
             "n_observations": k,
-            "train_cross_entropy": _compute_train_ce(policy, prefix),
+            "train_cross_entropy": _compute_train_ce(policy, prefix),  # on D_train^t
             "l2_norm": _compute_l2_norm(policy),
             "total_loss": _compute_train_ce(policy, prefix),
-            "rollout_cross_entropy": None,
+            "rollout_cross_entropy": None,     # computed on aggregated D_eval^t below
             "normalized_return": None,
             "disagreement_rate": None,
+            "d_eval_size": len(d_eval_obs),
         }
         if is_first or is_interval or is_final:
             eval_res = eval_policy_rollout(policy, venv, n_episodes=20,
                                            deterministic=True,
                                            expert_policy=expert_policy)
+            # Append this round's contribution to the growing D_eval buffer.
+            d_eval_obs.append(eval_res.rollout_batch.obs)
+            d_eval_expert_acts.append(eval_res.rollout_batch.expert_actions)
+            agg_obs = np.concatenate(d_eval_obs, axis=0)
+            agg_acts = np.concatenate(d_eval_expert_acts, axis=0)
+            # Score the CURRENT policy on the entire aggregated eval set.
+            round_data["rollout_cross_entropy"] = compute_sampled_action_ce(
+                policy, agg_obs, agg_acts,
+            )
             round_data["normalized_return"] = normalize(eval_res.mean_return, baselines)
-            round_data["disagreement_rate"] = eval_res.disagreement_rate
-            round_data["rollout_cross_entropy"] = eval_res.rollout_cross_entropy
+            round_data["disagreement_rate"] = eval_res.current_round_disagreement
+            round_data["d_eval_size"] = len(agg_obs)
         per_round.append(round_data)
     return per_round
 ```
 
-**Data budget invariant.** At round k, BC+DAgger has exactly `k × samples_per_round` training observations, which equals the total number of transitions aggregated by FTL+DAgger / FTRL+DAgger at the same round (since each DAgger round collects `samples_per_round` transitions and the aggregated dataset grows by exactly that amount). The `assert k == _expected_ftl_ftrl_data_budget(...)` line pins the invariant at runtime. A unit test asserts the same thing.
+**Data budget invariant.** At round $k$, BC+DAgger's training set has exactly `k × samples_per_round` observations, which equals the total number of transitions aggregated by FTL+DAgger / FTRL+DAgger at the same round. The `assert k == _expected_ftl_ftrl_data_budget(...)` line pins this at runtime. A unit test asserts the same invariant.
 
 **Warm-start vs from-scratch decision:**
 
@@ -345,12 +398,20 @@ def _run_bc_dagger(config, venv, expert_policy, rng, baselines):
 - **Atari envs**: warm-start (initialize from previous round's weights, continue training on the new prefix for `bc_n_epochs` epochs). Cheaper by roughly `n_eval_points`× on Atari where BC-CNN training is the expensive step.
 - Controlled by `should_warm_start_bc_dagger()` which defaults to `is_atari(env_name)`. Can be overridden per env in `ENV_CONFIGS["<env>"]["bc_dagger_warm_start"]`. A CLI flag `--bc-dagger-warm-start / --bc-dagger-from-scratch` forces one mode for ad-hoc experiments.
 
-**Cross-entropy storage.** Two CE columns in the JSON:
-- `train_cross_entropy`: CE of learner on its own training data (expert data for BC/BC+DAgger, aggregated DAgger data for FTL/FTRL). Kept for debugging; not plotted.
-- `rollout_cross_entropy`: CE of learner on fresh transitions from its own rollout, with expert's argmax action as target. Sampled-action form:
-  $-\tfrac{1}{|D^t|}\sum_{s\in D^t} \log \pi^t(a^*(s)\mid s)$, where $a^*(s) = \arg\max_a \pi^*(a\mid s)$ and $D^t$ is a set of states from **fresh rollouts of the current learner at eval time**. This is the plotted metric for all three "dynamic" algos (FTL+DAgger, FTRL+DAgger, BC+DAgger).
+**FTL+DAgger / FTRL+DAgger parallel change in `_run_dagger_variant`.** Apply the same `D_eval^t` aggregation:
 
-**Symmetric fresh-rollout eval for FTL/FTRL+DAgger (option (ii) — strict apples-to-apples).** The current `_run_dagger_variant` reports `m.cross_entropy` from the BC trainer's training step, which is computed on the *aggregated* DAgger dataset (a mixture of rollout states from all past rounds weighted by the beta schedule). That's biased toward older rollout distributions. To be strictly fair against BC+DAgger — whose `rollout_cross_entropy` comes from fresh rollouts of only the *current* policy — FTL+DAgger and FTRL+DAgger will ALSO compute `rollout_cross_entropy` from fresh rollouts at each eval point, using the same `eval_policy_rollout(learner, venv, n_episodes=20, expert_policy=expert)` call that already drives their return metric. This adds ~0 cost beyond what's already happening, since return eval already rolls out the learner; we're just recording one extra scalar from the same transitions. The old `train_cross_entropy` is kept in the JSON for debugging and shows the "aggregated training loss" for comparison.
+- Add two `d_eval_obs` / `d_eval_expert_acts` lists outside the per-round loop.
+- At each eval point, call `eval_policy_rollout(bc_trainer.policy, venv, n_episodes=20, expert_policy=expert_policy)`, append `rollout_batch.obs` / `.expert_actions` to the D_eval buffers, and compute `rollout_cross_entropy = compute_sampled_action_ce(bc_trainer.policy, agg_obs, agg_acts)` on the **full** aggregated buffer.
+- Continue to record `train_cross_entropy = m.cross_entropy` (the DAgger training loss on $D_{\text{train}}^t$) in the JSON for debugging.
+- The per-round `normalized_return` and `disagreement_rate` still come from the current round's rollout only (returns are intrinsically per-rollout; disagreement on the eval buffer would also work but the current round's rollout is cleaner).
+
+**Why the aggregated eval buffer is the right object.** The DAgger regret bound says FTL minimizes the total loss over $D_{\text{train}}^t$ (the cumulative training objective). The natural eval analog is: the total loss of the *current* policy over $D_{\text{eval}}^t$, built by the same aggregation rule but from fresh rollouts held out from training. This is the DAgger "online learning" quantity, translated to the eval side. It is structurally identical for all three dynamic algos, with the only difference being where the training data came from — which is exactly the comparison we want to show.
+
+**JSON schema addition:** each per-round dict now carries `"d_eval_size"` so we can sanity-check aggregation and reproduce CE from the raw buffer if needed. (Buffers themselves are not serialized — they can get large on Atari.)
+
+**Cross-entropy storage — summary of what's in each JSON column:**
+- `train_cross_entropy`: learner's loss on its own $D_{\text{train}}^t$. Different quantity per algo. **Not plotted.** Kept for debugging.
+- `rollout_cross_entropy`: current learner's loss on aggregated $D_{\text{eval}}^t$. Apples-to-apples across FTL+DAgger / FTRL+DAgger / BC+DAgger. **This is the plotted loss metric.**
 
 ### 3.5 Plot relabeling + new rollout-CE metric — `plot_results.py`
 
@@ -366,11 +427,13 @@ def _run_bc_dagger(config, venv, expert_policy, rng, baselines):
 
 **Loss subplot metric:** switch from `cross_entropy` (which was inconsistent across algos) to `rollout_cross_entropy` for all three plotted algos plus Expert (debug). The old `cross_entropy`/`total_loss` fields remain in the JSONs as `train_cross_entropy` for debugging.
 
-**Expert on the loss subplot (debug mode).** A CLI flag `--show-expert-on-loss` (default **ON** for now) controls whether the Expert dashed line appears on the loss subplot. Its value at each round is the expert's **self-CE**, computed the same way as the convergence trainer: roll out the expert and record $-\tfrac{1}{|D|}\sum_{s \in D} \log \pi^*(\arg\max_a \pi^*(a\mid s) \mid s)$. This equals $-\tfrac{1}{|D|}\sum \log p_{\max}(s)$ and is a direct sharpness gauge of the expert's softmax. After P3 is fixed this line should sit near 0 everywhere and can be turned off for publication-ready figures. While we're still debugging, it's the most direct visual confirmation that the argmax pathology is gone. Since the expert policy is fixed (not re-trained per round), one round's worth of rollouts is enough and the value is broadcast to all rounds as a horizontal dashed line. Fixed BC remains NOT on the loss subplot — it's a pure reference on return/disagreement, and adding it to the loss subplot would conflate "loss benchmark" with "static reference line" without adding information.
+**Expert on the loss subplot (debug mode).** A CLI flag `--show-expert-on-loss` (default **ON** for now) controls whether the Expert dashed line appears on the loss subplot. Its value is the expert's **self-CE** as a horizontal dashed line — computed once on a single standalone expert rollout of `n_episodes=20` (the expert policy is fixed, so aggregating across rounds would add nothing). Formula: $-\tfrac{1}{|D|}\sum_{s \in D} \log \pi^*(\arg\max_a \pi^*(a\mid s) \mid s)$ where $D$ is the states visited during that one rollout. This is a direct sharpness gauge of the expert's softmax. After P3 is fixed, this horizontal line sits near 0; pre-fix it sits visibly above 0. It's the most direct visual confirmation that the argmax pathology is gone. Fixed BC remains NOT on the loss subplot — it's a pure reference on return/disagreement, and adding it to the loss subplot would conflate "loss benchmark" with "static reference line" without adding information.
 
 **Figure subtitle** (added):
 
-> *Loss subplot: sampled-action cross-entropy, $-\tfrac{1}{|D^t|}\sum_{s \in D^t} \log \pi^t(a^*(s) \mid s)$ where $a^*(s) = \arg\max_a \pi^*(a\mid s)$ and $D^t$ is a set of states freshly rolled out by the learner $\pi^t$ at the current eval point. This matches the training loss form used by the imitation library's BC/DAgger trainer (`bc.py:130-144`); only the state distribution $D^t$ differs from training. Return subplot: mean deterministic rollout return, normalized to [random=0, expert=1]. Data sources: BC trains on a fixed expert dataset; BC+DAgger trains on an expert-data prefix that grows with round to match DAgger's observation budget and is evaluated on its own rollouts; FTL/FTRL+DAgger train on DAgger-aggregated rollout transitions and are also evaluated on fresh rollouts of the current policy (strictly apples-to-apples with BC+DAgger).*
+> *Loss subplot: sampled-action cross-entropy of the current-round learner $\pi^t$ on the aggregated evaluation buffer,*
+> $-\tfrac{1}{\lvert D_{\text{eval}}^t\rvert}\sum_{(s, a^*) \in D_{\text{eval}}^t} \log \pi^t(a^* \mid s), \quad a^*(s) = \arg\max_a \pi^*(a\mid s).$
+> *$D_{\text{eval}}^t$ is built by appending, at each eval point, a fresh `n_episodes=20` rollout of the then-current learner, labeled with the expert's argmax action. This is the eval-side analog of DAgger's aggregated training loss and uses exactly the form the imitation library minimizes at training time (`bc.py:130-144`). Return subplot: mean deterministic rollout return (current round only, not aggregated), normalized to [random=0, expert=1]. Data sources for training: BC (fixed) — full expert dataset; BC+DAgger — growing expert-data prefix matched to DAgger's observation budget; FTL/FTRL+DAgger — aggregated mixture rollouts (standard DAgger). All three dynamic algos share the same $D_{\text{eval}}^t$ construction, so their loss curves are strictly apples-to-apples.*
 
 ---
 
