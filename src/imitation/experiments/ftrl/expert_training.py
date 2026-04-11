@@ -6,6 +6,7 @@ gauge) is below a tightness bound. Raises RuntimeError if the max step
 budget is exhausted before convergence.
 """
 
+import collections
 import logging
 import pathlib
 from typing import Dict, Optional
@@ -92,22 +93,29 @@ def train_classical_expert_until_converged(
     total_steps = 0
     last_norm = -float("inf")
     last_self_ce = float("inf")
+    # Window of recent normalized returns. We require EVERY entry in the
+    # window to pass `threshold` before converging — this guards against
+    # a single lucky noisy chunk false-converging at the boundary.
+    return_window: "collections.deque[float]" = collections.deque(maxlen=patience)
 
     try:
         while total_steps < max_total:
             model.learn(chunk_size, reset_num_timesteps=False)
             total_steps += chunk_size
 
+            # 50 episodes (vs 20 default) tightens convergence stderr by
+            # ~sqrt(2.5). PPO chunk time dominates eval time, so ~negligible.
             eval_res = eval_policy_rollout(
                 model.policy,
                 eval_venv,
-                n_episodes=20,
+                n_episodes=50,
                 deterministic=True,
                 expert_policy=model.policy,
             )
             norm_ret = _normalize(eval_res.mean_return, env_name)
             self_ce = float(eval_res.current_round_ce)
             last_norm, last_self_ce = norm_ret, self_ce
+            return_window.append(norm_ret)
 
             improved = (
                 norm_ret > best_norm + tolerance
@@ -120,16 +128,23 @@ def train_classical_expert_until_converged(
             else:
                 chunks_since_best += 1
 
+            window_min = min(return_window) if return_window else -float("inf")
             logger.info(
                 f"[{env_name}] step={total_steps}/{max_total} "
                 f"norm_ret={norm_ret:.3f} self_ce={self_ce:.3f} "
                 f"(best norm={best_norm:.3f} ce={best_self_ce:.3f}, "
+                f"window_min={window_min:.3f}, "
                 f"patience {chunks_since_best}/{patience})"
             )
 
+            # Strict convergence: require EVERY chunk in the patience window
+            # to clear the return threshold, not just the current one. This
+            # closes the gap where noisy PPO returns oscillate across the
+            # threshold and a lucky final chunk triggers early termination.
             if (
                 total_steps >= min_total
-                and norm_ret >= threshold
+                and len(return_window) >= patience
+                and window_min >= threshold
                 and self_ce <= self_ce_eps
                 and chunks_since_best >= patience
             ):
