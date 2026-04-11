@@ -130,6 +130,30 @@ class TestResolveEnvs:
             resolve_envs(env_group="classical", envs=["CartPole-v1"])
 
 
+def test_run_bc_dagger_cartpole(tmp_path):
+    """bc_dagger smoke test on CartPole."""
+    config = _make_config(
+        "bc_dagger",
+        tmp_path,
+        env_name="CartPole-v1",
+        policy_mode="end_to_end",
+        n_rounds=3,
+        samples_per_round=200,
+        eval_interval=1,
+    )
+    result = run_single(config)
+    assert result["algo"] == "bc_dagger"
+    assert len(result["per_round"]) == 3
+    # Data budget invariant: round k has exactly k * samples_per_round obs
+    for i, r in enumerate(result["per_round"]):
+        assert r["n_observations"] == (i + 1) * 200
+    # rollout_cross_entropy populated on every eval-point round
+    # (with eval_interval=1, every round is an eval point)
+    for r in result["per_round"]:
+        assert r["rollout_cross_entropy"] is not None
+        assert r["d_eval_size"] > 0
+
+
 @pytest.mark.expensive
 def test_run_ftrl_lunarlander(tmp_path):
     """FTRL smoke test on LunarLander-v2 (new classical MDP).

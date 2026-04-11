@@ -28,7 +28,7 @@ from imitation.util import logger as imit_logger
 
 logger = logging.getLogger(__name__)
 
-ALL_ALGOS = ["ftl", "ftrl", "bc"]
+ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_dagger"]
 
 
 def resolve_envs(
@@ -180,6 +180,10 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         )
     elif config.algo == "bc":
         result["per_round"] = _run_bc(config, venv, expert_policy, rng, baselines)
+    elif config.algo == "bc_dagger":
+        result["per_round"] = _run_bc_dagger(
+            config, venv, expert_policy, rng, baselines
+        )
     else:
         raise ValueError(f"Unknown algo: {config.algo}")
 
@@ -454,6 +458,133 @@ def _run_bc(
 
         per_round.append(round_data)
 
+    return per_round
+
+
+def _run_bc_dagger(
+    config: ExperimentConfig,
+    venv,
+    expert_policy,
+    rng: np.random.Generator,
+    baselines: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    """BC+DAgger baseline.
+
+    Per-round ERM on a growing PREFIX of the expert dataset, sized to
+    match DAgger's aggregated observation budget. Eval uses the same
+    aggregated D_eval^t buffer construction as FTL/FTRL+DAgger (spec §3.4).
+    """
+    from imitation.experiments.ftrl.eval_utils import (
+        compute_sampled_action_ce,
+        eval_policy_rollout,
+    )
+
+    total_timesteps = config.n_rounds * config.samples_per_round
+
+    sample_until = rollout.make_sample_until(
+        min_timesteps=total_timesteps, min_episodes=1
+    )
+    trajs = rollout.generate_trajectories(
+        policy=expert_policy,
+        venv=venv,
+        sample_until=sample_until,
+        deterministic_policy=True,
+        rng=rng,
+    )
+    all_transitions = rollout.flatten_trajectories(list(trajs))
+    if len(all_transitions) < total_timesteps:
+        raise RuntimeError(
+            f"BC+DAgger: collected {len(all_transitions)} transitions, "
+            f"need {total_timesteps}"
+        )
+    all_transitions = all_transitions[:total_timesteps]
+
+    warm_start = env_utils.is_atari(config.env_name)
+    policy = None
+
+    d_eval_obs: List[np.ndarray] = []
+    d_eval_expert_acts: List[np.ndarray] = []
+
+    per_round: List[Dict[str, Any]] = []
+    for round_num in range(1, config.n_rounds + 1):
+        k = round_num * config.samples_per_round
+        prefix = all_transitions[:k]
+
+        if policy is None or not warm_start:
+            if config.policy_mode == "linear":
+                policy = policy_utils.create_linear_policy(expert_policy)
+            else:
+                policy = policy_utils.create_end_to_end_policy(
+                    venv.observation_space, venv.action_space
+                )
+
+        custom_logger = imit_logger.configure(
+            str(
+                config.output_dir
+                / "tb"
+                / f"bc_dagger_{config.env_name}_{config.seed}_r{round_num}"
+            ),
+            format_strs=[],
+        )
+        bc_trainer = bc.BC(
+            observation_space=venv.observation_space,
+            action_space=venv.action_space,
+            rng=rng,
+            policy=policy,
+            demonstrations=prefix,
+            batch_size=min(32, len(prefix)),
+            custom_logger=custom_logger,
+        )
+        bc_trainer.train(n_epochs=config.bc_n_epochs)
+        policy = bc_trainer.policy  # warm-start reuses this next round
+
+        l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
+        l2_norm = sum(l2_norms) / 2
+
+        round_data: Dict[str, Any] = {
+            "round": round_num,
+            "n_observations": k,
+            "train_cross_entropy": None,
+            "l2_norm": round(l2_norm, 6),
+            "total_loss": None,
+            "rollout_cross_entropy": None,
+            "normalized_return": None,
+            "disagreement_rate": None,
+            "d_eval_size": sum(a.shape[0] for a in d_eval_obs),
+        }
+
+        is_first = round_num == 1
+        is_interval = round_num % config.eval_interval == 0
+        is_final = round_num == config.n_rounds
+        if is_first or is_interval or is_final:
+            eval_res = eval_policy_rollout(
+                policy,
+                venv,
+                n_episodes=20,
+                deterministic=True,
+                expert_policy=expert_policy,
+            )
+            d_eval_obs.append(eval_res.rollout_batch.obs)
+            d_eval_expert_acts.append(eval_res.rollout_batch.expert_actions)
+            agg_obs = np.concatenate(d_eval_obs, axis=0)
+            agg_acts = np.concatenate(d_eval_expert_acts, axis=0)
+            round_data["rollout_cross_entropy"] = round(
+                compute_sampled_action_ce(policy, agg_obs, agg_acts), 6
+            )
+            expert_ret = baselines["expert_return"]
+            random_ret = baselines["random_return"]
+            score_range = expert_ret - random_ret
+            if abs(score_range) < 1e-8:
+                norm_ret = 0.0
+            else:
+                norm_ret = (eval_res.mean_return - random_ret) / score_range
+            round_data["normalized_return"] = round(norm_ret, 6)
+            round_data["disagreement_rate"] = round(
+                eval_res.current_round_disagreement, 6
+            )
+            round_data["d_eval_size"] = int(agg_obs.shape[0])
+
+        per_round.append(round_data)
     return per_round
 
 
