@@ -61,9 +61,11 @@ def test_run_ftrl_cartpole(tmp_path):
     assert result["algo"] == "ftrl"
     assert len(result["per_round"]) >= 2
     for m in result["per_round"]:
-        assert "cross_entropy" in m
+        assert "train_cross_entropy" in m
         assert "l2_norm" in m
         assert "round" in m
+        assert "d_eval_size" in m
+        assert isinstance(m["d_eval_size"], int)
 
 
 def test_run_bc_cartpole(tmp_path):
@@ -122,8 +124,14 @@ class TestResolveEnvs:
             resolve_envs(env_group="classical", envs=["CartPole-v1"])
 
 
+@pytest.mark.expensive
 def test_run_ftrl_lunarlander(tmp_path):
-    """FTRL smoke test on LunarLander-v2 (new classical MDP)."""
+    """FTRL smoke test on LunarLander-v2 (new classical MDP).
+
+    Marked expensive: the convergence-detecting expert trainer (Task 3)
+    requires several million PPO steps to clear LunarLander's 95% return
+    threshold — no longer fast enough for the default test loop.
+    """
     config = _make_config(
         "ftrl",
         tmp_path,
@@ -138,8 +146,13 @@ def test_run_ftrl_lunarlander(tmp_path):
     assert len(result["per_round"]) >= 1
 
 
+@pytest.mark.expensive
 def test_run_bc_taxi(tmp_path):
-    """BC smoke test on Taxi-v3 (discrete obs, one-hot encoded)."""
+    """BC smoke test on Taxi-v3 (discrete obs, one-hot encoded).
+
+    Marked expensive: same reason as test_run_ftrl_lunarlander — Taxi's
+    expert now requires >500k PPO steps to clear the convergence gate.
+    """
     config = _make_config(
         "bc",
         tmp_path,

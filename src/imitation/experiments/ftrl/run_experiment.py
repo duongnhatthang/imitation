@@ -356,13 +356,20 @@ def _run_dagger_variant(
         rollout_round_min_timesteps=config.samples_per_round,
     )
 
-    # Extract metrics and compute expert baseline CE per round
+    # Extract metrics and compute rollout CE on an aggregated D_eval buffer
     from imitation.data import serialize
+    from imitation.experiments.ftrl.eval_utils import (
+        compute_sampled_action_ce,
+        eval_policy_rollout,
+    )
 
     metrics = list(trainer.get_metrics())
     total_rounds = len(metrics)
 
-    per_round = []
+    d_eval_obs: List[np.ndarray] = []
+    d_eval_expert_acts: List[np.ndarray] = []
+
+    per_round: List[Dict[str, Any]] = []
     cum_obs = 0
     for m in metrics:
         # m.round_num is post-increment (1-indexed); demo dirs are 0-indexed
@@ -373,21 +380,21 @@ def _run_dagger_variant(
         for p in demo_paths:
             round_demos.extend(serialize.load(p))
         round_transitions = rollout.flatten_trajectories(round_demos)
-        expert_ce = _evaluate_policy_cross_entropy(expert_policy, round_transitions)
         cum_obs += len(round_transitions)
 
-        round_data = {
+        round_data: Dict[str, Any] = {
             "round": m.round_num,
             "n_observations": cum_obs,
-            "cross_entropy": round(m.cross_entropy, 6),
+            "train_cross_entropy": round(m.cross_entropy, 6),
             "l2_norm": round(m.l2_norm, 6),
             "total_loss": round(m.total_loss, 6),
-            "expert_cross_entropy": round(expert_ce, 6),
+            "rollout_cross_entropy": None,
             "normalized_return": None,
             "disagreement_rate": None,
+            "d_eval_size": sum(a.shape[0] for a in d_eval_obs),
         }
 
-        # Evaluate at intervals: round 1, every eval_interval, and final round
+        # Evaluate at intervals: round 1, every eval_interval, and final round.
         # NOTE: For DAgger, bc_trainer.policy is the *final* trained policy at
         # this point (trainer.train() runs all rounds). Per-round evaluation
         # during training would be more informative but requires a bigger
@@ -396,13 +403,33 @@ def _run_dagger_variant(
         is_interval = m.round_num % config.eval_interval == 0
         is_final = m.round_num == total_rounds
         if is_first or is_interval or is_final:
-            eval_metrics = _evaluate_learner_metrics(
+            eval_res = eval_policy_rollout(
                 bc_trainer.policy,
-                expert_policy,
                 venv,
-                baselines,
+                n_episodes=20,
+                deterministic=True,
+                expert_policy=expert_policy,
             )
-            round_data.update(eval_metrics)
+            d_eval_obs.append(eval_res.rollout_batch.obs)
+            d_eval_expert_acts.append(eval_res.rollout_batch.expert_actions)
+            agg_obs = np.concatenate(d_eval_obs, axis=0)
+            agg_acts = np.concatenate(d_eval_expert_acts, axis=0)
+            round_data["rollout_cross_entropy"] = round(
+                compute_sampled_action_ce(bc_trainer.policy, agg_obs, agg_acts),
+                6,
+            )
+            expert_ret = baselines["expert_return"]
+            random_ret = baselines["random_return"]
+            score_range = expert_ret - random_ret
+            if abs(score_range) < 1e-8:
+                norm_ret = 0.0
+            else:
+                norm_ret = (eval_res.mean_return - random_ret) / score_range
+            round_data["normalized_return"] = round(norm_ret, 6)
+            round_data["disagreement_rate"] = round(
+                eval_res.current_round_disagreement, 6
+            )
+            round_data["d_eval_size"] = int(agg_obs.shape[0])
 
         per_round.append(round_data)
 
