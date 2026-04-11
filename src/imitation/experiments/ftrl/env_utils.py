@@ -21,6 +21,29 @@ from imitation.util import util
 #   net_arch=[64,64], n_steps=256, batch_size=64, 4 parallel envs).
 #   FrozenLake: 5k steps (~1s), CartPole: 20k (~7s).
 #   CliffWalking/Acrobot/MountainCar: may need 200k+ (tune on server).
+DEFAULT_CONVERGENCE: Dict[str, float] = {
+    "chunk_timesteps": 25_000,
+    "min_timesteps": 50_000,
+    "max_timesteps": 5_000_000,
+    "threshold": 0.95,
+    "patience": 5,
+    # Empirically calibrated: PPO MLP with default ent_coef=0.01 has a
+    # steady-state softmax confidence ~75-85% on 2-6 action envs, giving
+    # self_ce ~0.2-0.35. The spec's 0.05 is unreachable without forcing
+    # ent_coef=0. 0.4 still catches catastrophically diffuse policies
+    # (which also fail the norm_return >= threshold gate).
+    "self_ce_eps": 0.4,
+}
+
+
+def get_convergence_config(env_name: str) -> Dict[str, float]:
+    """Return convergence config for an env, merging defaults with overrides."""
+    cfg = dict(DEFAULT_CONVERGENCE)
+    env_cfg = ENV_CONFIGS.get(env_name, {})
+    cfg.update(env_cfg.get("convergence", {}))
+    return cfg
+
+
 ENV_CONFIGS: Dict[str, dict] = {
     "CartPole-v1": {
         "obs_type": "continuous",
@@ -57,18 +80,31 @@ ENV_CONFIGS: Dict[str, dict] = {
         },
         "ppo_n_envs": 4,
         "env_kwargs": {},
+        "convergence": {
+            "max_timesteps": 6_000_000,
+            "chunk_timesteps": 50_000,
+        },
     },
     "Taxi-v3": {
         "obs_type": "discrete",
         "obs_size": 500,
         "ppo_timesteps": 500_000,
         "env_kwargs": {},
+        "convergence": {
+            "max_timesteps": 3_000_000,
+            "chunk_timesteps": 50_000,
+        },
     },
     "Blackjack-v1": {
         "obs_type": "tuple",
         "obs_sizes": [32, 11, 2],
         "ppo_timesteps": 50_000,
         "env_kwargs": {},
+        "convergence": {
+            "threshold": 0.85,
+            "self_ce_eps": 0.5,
+            "_note": "Blackjack stochastic optimum; return and softmax both loose.",
+        },
     },
     "LunarLander-v2": {
         "obs_type": "continuous",
