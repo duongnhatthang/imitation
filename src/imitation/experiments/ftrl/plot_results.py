@@ -58,25 +58,25 @@ LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger"}  # fixed BC excluded
 
 LOSS_SUBTITLE_LINES = [
     (
-        r"Loss: $-\frac{1}{|D_{\mathrm{eval}}^t|}"
-        r"\sum_{(s,a^*)\in D_{\mathrm{eval}}^t}\log\pi^t(a^*|s),$  "
-        r"$a^*(s)=\arg\max_a \pi^*(a|s)$"
+        r"Loss: $\ell_t(\pi^t) = -\frac{1}{|D_{\mathrm{eval}}^t|}"
+        r"\sum_{(s,a^*)\in D_{\mathrm{eval}}^t}\log\pi^t(a^*|s),$   "
+        r"$a^*(s)=\arg\max_a \pi^*(a|s).$"
     ),
     (
-        r"$D_{\mathrm{eval}}^t$ = aggregated fresh rollouts of the current "
-        r"learner. BC+DAgger train set = expert-data prefix matching DAgger's "
-        r"cumulative observation count."
+        r"$D_{\mathrm{eval}}^t$: aggregated fresh rollouts of the current "
+        r"learner (labeled with expert argmax)."
     ),
     (
-        "Note: FTL/FTRL use episode-aligned DAgger collection, so their "
-        "per-round observation counts vary slightly by env/seed. "
-        "BC and BC+DAgger use fixed-step chunks of the expert dataset; "
-        "their x-positions may differ from the DAgger variants by < 5%."
+        r"Cum. regret: $\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
+        r"where $\ell_t(\pi^*)$ is the expert's CE on the same $D_{\mathrm{eval}}^t$."
     ),
     (
-        "Cumulative regret: "
-        r"$\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$, "
-        r"with $\ell_t(\pi^*)$ = expert CE on the same $D_{\mathrm{eval}}^t$."
+        "BC+DAgger train set = expert-data prefix matched to DAgger's "
+        "cumulative observation count."
+    ),
+    (
+        "Note: FTL/FTRL use episode-aligned DAgger collection, so obs "
+        "counts vary slightly by env/seed (<5% vs fixed-step BC)."
     ),
 ]
 
@@ -351,26 +351,42 @@ def plot_env(
     policy_modes = env_df["policy_mode"].unique()
     mode_str = policy_modes[0] if len(policy_modes) == 1 else "mixed"
 
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(9, 16), sharex=True)
-    # Reserve the top of the figure for the title + subtitle so they never
-    # collide with subplot 1.
+    # Wider figure so the subtitle has room to breathe and long formulas
+    # don't overflow. Room at top is controlled via subplots_adjust;
+    # bbox_inches="tight" is intentionally NOT used so the layout isn't
+    # recropped out from under us.
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+        4,
+        1,
+        figsize=(11, 17),
+        sharex=True,
+    )
     subtitle_text = "\n".join(LOSS_SUBTITLE_LINES)
-    n_subtitle_lines = len(LOSS_SUBTITLE_LINES)
-    top_reserve = 0.86 - 0.01 * n_subtitle_lines
-    plt.subplots_adjust(top=top_reserve)
+    # Reserve 17% of the figure for title + subtitle. Subplot 1 top lands
+    # at y=0.83, leaving y=0.83..1.00 for text. The extra headroom avoids
+    # any overlap between the bottom of the multi-line subtitle and the
+    # top spine of subplot 1.
+    plt.subplots_adjust(
+        top=0.83,
+        left=0.09,
+        right=0.97,
+        bottom=0.05,
+        hspace=0.25,
+    )
     fig.suptitle(
         f"{env_name}  ({mode_str})",
-        fontsize=14,
+        fontsize=15,
         fontweight="bold",
-        y=0.995,
+        y=0.98,
     )
     fig.text(
         0.5,
-        top_reserve + 0.005,
+        0.955,
         subtitle_text,
         ha="center",
         va="top",
-        fontsize=7.5,
+        fontsize=10,
+        linespacing=1.4,
     )
 
     # Subplot 1: rollout_cross_entropy on the aggregated D_eval^t buffer
@@ -436,7 +452,10 @@ def plot_env(
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    # No bbox_inches="tight" — we deliberately reserved the top 12% for
+    # title + subtitle via subplots_adjust, and tight-cropping would
+    # claw back exactly that space.
+    fig.savefig(output_path, dpi=150)
     plt.close(fig)
     logger.info(f"Saved plot: {output_path}")
 
