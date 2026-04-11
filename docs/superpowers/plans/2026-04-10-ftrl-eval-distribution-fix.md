@@ -1652,11 +1652,16 @@ git commit -m "feat(ftrl): new plot layout with BC+DAgger + aggregated rollout C
 
 ---
 
-## Task 10: Cache wipe + Pass 1 local run + plot smoke
+## Task 10: Cache wipe + Pass 1 on server + local plot
 
 **Files:** (no code changes)
 
-- [ ] **Step 1: Wipe classical caches and results**
+Execution target is the remote compute server. The gitignored
+`./experiments/sync_results.sh` script handles all code push / result pull.
+Do NOT hardcode server hostname, paths, or hardware details in any tracked
+file — this is a public repo.
+
+- [ ] **Step 1: Wipe classical caches and results locally**
 
 ```bash
 cd /Users/thangduong/Desktop/imitation/.worktrees/ftrl-expert-fix
@@ -1666,34 +1671,67 @@ for env in CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
 done
 ```
 
-Atari caches are preserved (check: `ls experiments/expert_cache/ | grep NoFrameskip`).
+Atari caches preserved (verify: `ls experiments/expert_cache/ | grep NoFrameskip`).
 
-- [ ] **Step 2: Run full fast-path test suite to confirm green**
+- [ ] **Step 2: Run full fast-path test suite locally to confirm green**
 
 Run: `pytest -n auto tests/ -m "not expensive"`
 Expected: PASS across the board.
 
-- [ ] **Step 3: Run the expensive expert_quality test on CartPole only**
-
-Run: `pytest tests/experiments/test_expert_quality.py -m expensive -k CartPole -v`
-Expected: PASS. CartPole expert is retrained from scratch with convergence detection.
-
-- [ ] **Step 4: Pass 1 — experiments on 6 fast envs (in a tmux session)**
+- [ ] **Step 3: Push the branch to the server**
 
 ```bash
-tmux new -d -s ftrl_pass1 \
-  "python -m imitation.experiments.ftrl.run_experiment \
-     --envs CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
-            Blackjack-v1 LunarLander-v2 \
-     --algos ftl ftrl bc bc_dagger \
-     --seeds 5 --n-workers 4 2>&1 | tee experiments/logs/pass1.log"
+git push -u origin feature/ftrl-expert-fix-bcdagger
+./experiments/sync_results.sh push
 ```
 
-Attach with `tmux attach -t ftrl_pass1` to monitor progress. When complete, confirm exit code 0 and that every `experiments/results/<env>/*.json` exists.
+- [ ] **Step 4: On server — checkout branch, activate env, wipe classical caches**
 
-- [ ] **Step 5: Generate Pass 1 plots**
+Ask the user to paste this into an interactive shell on the server (the assistant should not drive remote shells directly for auth/tmux lifecycle reasons):
 
 ```bash
+# In an ssh session on the compute server, inside tmux:
+cd ~/imitation   # or wherever the repo lives on the server
+git fetch
+git checkout feature/ftrl-expert-fix-bcdagger
+git pull
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate <env-name>
+pip install -e ".[dev]"   # only if deps changed
+for env in CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
+           MountainCar-v0 Taxi-v3 Blackjack-v1 LunarLander-v2; do
+    rm -rf "experiments/expert_cache/$env" "experiments/results/$env"
+done
+```
+
+- [ ] **Step 5: On server — run expert_quality smoke (CartPole only) before the full pass**
+
+```bash
+pytest tests/experiments/test_expert_quality.py -m expensive -k CartPole -v
+```
+Expected: PASS.
+
+- [ ] **Step 6: On server — Pass 1 (6 fast envs) in tmux**
+
+```bash
+tmux new -s ftrl_pass1
+# inside tmux, after conda activate:
+python -m imitation.experiments.ftrl.run_experiment \
+  --envs CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
+         Blackjack-v1 LunarLander-v2 \
+  --algos ftl ftrl bc bc_dagger \
+  --seeds 5 --n-workers 8 2>&1 | tee experiments/logs/pass1.log
+# Ctrl-b d to detach.  tmux attach -t ftrl_pass1 to reattach.
+```
+
+Wait for the run to finish. Confirm exit code 0 and that every
+`experiments/results/<env>/*.json` exists.
+
+- [ ] **Step 7: Pull results back locally and generate Pass 1 plots**
+
+```bash
+# Local worktree:
+./experiments/sync_results.sh pull
 python -m imitation.experiments.ftrl.plot_results \
   --results-dir experiments/results/ \
   --envs CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
@@ -1706,7 +1744,7 @@ Inspect `experiments/plots/*.png`. Acceptance criteria (spec §5 items 5-6):
 - Expert is dashed on return subplot at y=1.0 AND on loss subplot (horizontal dashed near 0).
 - Expert beats BC on the return subplot for all 6 fast envs.
 
-- [ ] **Step 6: Run expensive expert_quality tests on all 6 fast envs**
+- [ ] **Step 8: On server — run expensive expert_quality tests on all 6 fast envs**
 
 ```bash
 pytest tests/experiments/test_expert_quality.py -m expensive \
@@ -1715,7 +1753,7 @@ pytest tests/experiments/test_expert_quality.py -m expensive \
 
 Expected: all 12 parametrized cases PASS.
 
-- [ ] **Step 7: Commit any tuning adjustments**
+- [ ] **Step 9: Commit any tuning adjustments**
 
 If any env fails convergence and requires tuning `ppo_kwargs` or `convergence` in `env_utils.py`:
 
@@ -1730,17 +1768,18 @@ git commit -m "tune(ftrl): adjust <env> PPO/convergence config to hit threshold"
 
 **Files:** (no code changes)
 
-- [ ] **Step 1: Run Pass 2 in tmux**
+- [ ] **Step 1: On server — run Pass 2 in tmux**
 
 ```bash
-tmux new -d -s ftrl_pass2 \
-  "python -m imitation.experiments.ftrl.run_experiment \
-     --envs MountainCar-v0 Taxi-v3 \
-     --algos ftl ftrl bc bc_dagger \
-     --seeds 5 --n-workers 2 2>&1 | tee experiments/logs/pass2.log"
+tmux new -s ftrl_pass2
+# inside tmux, after conda activate:
+python -m imitation.experiments.ftrl.run_experiment \
+  --envs MountainCar-v0 Taxi-v3 \
+  --algos ftl ftrl bc bc_dagger \
+  --seeds 5 --n-workers 4 2>&1 | tee experiments/logs/pass2.log
 ```
 
-- [ ] **Step 2: Run expensive tests on MountainCar + Taxi**
+- [ ] **Step 2: On server — run expensive tests on MountainCar + Taxi**
 
 ```bash
 pytest tests/experiments/test_expert_quality.py -m expensive \
@@ -1749,9 +1788,10 @@ pytest tests/experiments/test_expert_quality.py -m expensive \
 
 Expected: all 4 cases PASS.
 
-- [ ] **Step 3: Regenerate plots for all 8 envs**
+- [ ] **Step 3: Pull results locally and regenerate plots for all 8 envs**
 
 ```bash
+./experiments/sync_results.sh pull
 python -m imitation.experiments.ftrl.plot_results \
   --results-dir experiments/results/ \
   --envs CartPole-v1 FrozenLake-v1 CliffWalking-v0 Acrobot-v1 \
