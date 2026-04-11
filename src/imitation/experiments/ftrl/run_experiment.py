@@ -82,6 +82,95 @@ class ExperimentConfig:
     eval_interval: int
     output_dir: pathlib.Path
     expert_cache_dir: pathlib.Path
+    # Early-stop on rollout_cross_entropy plateau. Stops the per-round
+    # training loop when the best rollout_ce across the last ``patience``
+    # eval points has not decreased by more than ``min_delta``. Both
+    # values are small-ish defaults so easy MDPs short-circuit after a
+    # few rounds while hard MDPs use most of the n_rounds budget.
+    early_stop_patience: int = 5
+    early_stop_min_delta: float = 0.005
+
+
+def _compute_round_eval(
+    policy,
+    expert_policy,
+    venv,
+    baselines: Dict[str, float],
+    d_eval_obs: List[np.ndarray],
+    d_eval_expert_acts: List[np.ndarray],
+) -> Dict[str, Any]:
+    """Run one eval rollout, append to the running D_eval buffer, and compute
+    the shared per-eval-point metrics.
+
+    Mutates ``d_eval_obs`` and ``d_eval_expert_acts`` in place by appending
+    the fresh rollout batch.
+
+    Returns a dict with ``rollout_cross_entropy``,
+    ``expert_rollout_cross_entropy``, ``normalized_return``,
+    ``disagreement_rate``, ``d_eval_size``.
+    """
+    from imitation.experiments.ftrl.eval_utils import (
+        compute_sampled_action_ce,
+        eval_policy_rollout,
+    )
+
+    eval_res = eval_policy_rollout(
+        policy,
+        venv,
+        n_episodes=20,
+        deterministic=True,
+        expert_policy=expert_policy,
+    )
+    d_eval_obs.append(eval_res.rollout_batch.obs)
+    d_eval_expert_acts.append(eval_res.rollout_batch.expert_actions)
+    agg_obs = np.concatenate(d_eval_obs, axis=0)
+    agg_acts = np.concatenate(d_eval_expert_acts, axis=0)
+    rollout_ce = compute_sampled_action_ce(policy, agg_obs, agg_acts)
+    # Expert's loss on the SAME aggregated D_eval^t. When the learner is
+    # close to the expert (e.g. linear mode on easy MDPs), this is close
+    # to the env-level expert_self_ce. When the learner is far from
+    # expert, it can be higher because learner states are harder for the
+    # expert's own softmax.
+    expert_rollout_ce = compute_sampled_action_ce(
+        expert_policy, agg_obs, agg_acts
+    )
+
+    expert_ret = baselines["expert_return"]
+    random_ret = baselines["random_return"]
+    score_range = expert_ret - random_ret
+    if abs(score_range) < 1e-8:
+        norm_ret = 0.0
+    else:
+        norm_ret = (eval_res.mean_return - random_ret) / score_range
+
+    return {
+        "rollout_cross_entropy": round(float(rollout_ce), 6),
+        "expert_rollout_cross_entropy": round(float(expert_rollout_ce), 6),
+        "normalized_return": round(float(norm_ret), 6),
+        "disagreement_rate": round(
+            float(eval_res.current_round_disagreement), 6
+        ),
+        "d_eval_size": int(agg_obs.shape[0]),
+    }
+
+
+def _should_early_stop(
+    rce_history: List[float],
+    patience: int,
+    min_delta: float,
+) -> bool:
+    """Return True if rollout_ce has plateaued.
+
+    Criterion: the best rollout_ce observed in the last ``patience`` eval
+    points (inclusive) is within ``min_delta`` of the best observed in the
+    history BEFORE that window. Equivalently, no improvement by > min_delta
+    across ``patience`` consecutive eval points.
+    """
+    if patience < 1 or len(rce_history) <= patience:
+        return False
+    best_before_window = min(rce_history[: -patience])
+    best_in_window = min(rce_history[-patience:])
+    return (best_before_window - best_in_window) < min_delta
 
 
 def run_single(config: ExperimentConfig) -> Dict[str, Any]:
@@ -266,32 +355,53 @@ def _run_dagger_variant(
         custom_logger=custom_logger,
     )
 
-    # Train
-    total_timesteps = config.n_rounds * config.samples_per_round
-    trainer.train(
-        total_timesteps=total_timesteps,
-        rollout_round_min_episodes=1,
-        rollout_round_min_timesteps=config.samples_per_round,
-    )
-
-    # Extract metrics and compute rollout CE on an aggregated D_eval buffer
     from imitation.data import serialize
-    from imitation.experiments.ftrl.eval_utils import (
-        compute_sampled_action_ce,
-        eval_policy_rollout,
-    )
-
-    metrics = list(trainer.get_metrics())
-    total_rounds = len(metrics)
 
     d_eval_obs: List[np.ndarray] = []
     d_eval_expert_acts: List[np.ndarray] = []
+    rce_history: List[float] = []
 
     per_round: List[Dict[str, Any]] = []
+
+    # Round 0: evaluate the fresh (Xavier-init linear head, or default-init
+    # end-to-end policy) BEFORE any training. Gives the learning curve a
+    # real "from-scratch" starting point.
+    round0_eval = _compute_round_eval(
+        bc_trainer.policy,
+        expert_policy,
+        venv,
+        baselines,
+        d_eval_obs,
+        d_eval_expert_acts,
+    )
+    rce_history.append(round0_eval["rollout_cross_entropy"])
+    per_round.append(
+        {
+            "round": 0,
+            "n_observations": 0,
+            "train_cross_entropy": None,
+            "l2_norm": None,
+            "total_loss": None,
+            **round0_eval,
+        }
+    )
+
+    # Train one round at a time so we can eval + early-stop between rounds.
+    # SB3 SimpleDAggerTrainer.train runs the collect-and-update loop while
+    # total_timestep_count (local to the call) is below total_timesteps, so
+    # calling with total_timesteps=samples_per_round runs exactly one round
+    # per call while preserving self.round_num across calls.
     cum_obs = 0
-    for m in metrics:
-        # m.round_num is post-increment (1-indexed); demo dirs are 0-indexed
-        demo_round = m.round_num - 1
+    stopped_early = False
+    for round_num in range(1, config.n_rounds + 1):
+        trainer.train(
+            total_timesteps=config.samples_per_round,
+            rollout_round_min_episodes=1,
+            rollout_round_min_timesteps=config.samples_per_round,
+        )
+
+        # Reconstruct the just-collected round's obs count from demo files.
+        demo_round = trainer.round_num - 1
         round_dir = trainer._demo_dir_path_for_round(demo_round)
         demo_paths = trainer._get_demo_paths(round_dir)
         round_demos = []
@@ -300,56 +410,52 @@ def _run_dagger_variant(
         round_transitions = rollout.flatten_trajectories(round_demos)
         cum_obs += len(round_transitions)
 
+        metrics = list(trainer.get_metrics())
+        m = metrics[-1]
         round_data: Dict[str, Any] = {
-            "round": m.round_num,
+            "round": round_num,
             "n_observations": cum_obs,
             "train_cross_entropy": round(m.cross_entropy, 6),
             "l2_norm": round(m.l2_norm, 6),
             "total_loss": round(m.total_loss, 6),
             "rollout_cross_entropy": None,
+            "expert_rollout_cross_entropy": None,
             "normalized_return": None,
             "disagreement_rate": None,
             "d_eval_size": sum(a.shape[0] for a in d_eval_obs),
         }
 
-        # Evaluate at intervals: round 1, every eval_interval, and final round.
-        # NOTE: For DAgger, bc_trainer.policy is the *final* trained policy at
-        # this point (trainer.train() runs all rounds). Per-round evaluation
-        # during training would be more informative but requires a bigger
-        # refactor. This is acceptable for the first version.
-        is_first = m.round_num == 1
-        is_interval = m.round_num % config.eval_interval == 0
-        is_final = m.round_num == total_rounds
+        is_first = round_num == 1
+        is_interval = round_num % config.eval_interval == 0
+        is_final = round_num == config.n_rounds
         if is_first or is_interval or is_final:
-            eval_res = eval_policy_rollout(
+            eval_data = _compute_round_eval(
                 bc_trainer.policy,
+                expert_policy,
                 venv,
-                n_episodes=20,
-                deterministic=True,
-                expert_policy=expert_policy,
+                baselines,
+                d_eval_obs,
+                d_eval_expert_acts,
             )
-            d_eval_obs.append(eval_res.rollout_batch.obs)
-            d_eval_expert_acts.append(eval_res.rollout_batch.expert_actions)
-            agg_obs = np.concatenate(d_eval_obs, axis=0)
-            agg_acts = np.concatenate(d_eval_expert_acts, axis=0)
-            round_data["rollout_cross_entropy"] = round(
-                compute_sampled_action_ce(bc_trainer.policy, agg_obs, agg_acts),
-                6,
-            )
-            expert_ret = baselines["expert_return"]
-            random_ret = baselines["random_return"]
-            score_range = expert_ret - random_ret
-            if abs(score_range) < 1e-8:
-                norm_ret = 0.0
-            else:
-                norm_ret = (eval_res.mean_return - random_ret) / score_range
-            round_data["normalized_return"] = round(norm_ret, 6)
-            round_data["disagreement_rate"] = round(
-                eval_res.current_round_disagreement, 6
-            )
-            round_data["d_eval_size"] = int(agg_obs.shape[0])
+            round_data.update(eval_data)
+            rce_history.append(eval_data["rollout_cross_entropy"])
+
+            if _should_early_stop(
+                rce_history,
+                config.early_stop_patience,
+                config.early_stop_min_delta,
+            ):
+                stopped_early = True
+                logger.info(
+                    f"{config.algo}/{config.env_name}/seed{config.seed}: "
+                    f"early stop at round {round_num} "
+                    f"(rollout_ce plateau over "
+                    f"{config.early_stop_patience} eval points)"
+                )
 
         per_round.append(round_data)
+        if stopped_early:
+            break
 
     return per_round
 
@@ -363,12 +469,61 @@ def _run_bc(
 ) -> List[Dict[str, Any]]:
     """Fixed BC baseline: train once on the full expert dataset, then eval.
 
-    No D_eval aggregation -- fixed BC is a static reference line on the
-    return subplot and does NOT appear on the loss subplot (spec §3.5).
+    Fixed BC is trained once on the full expert dataset and stays fixed.
+    It appears on the return/disagreement subplots only (static reference
+    line), not on the loss/regret subplots. Rounds 1..n_rounds are pseudo
+    x-positions for the reference line; the policy does not change.
+
+    A round-0 eval (fresh policy, before any training) is also emitted.
     """
     from imitation.experiments.ftrl.eval_utils import eval_policy_rollout
 
     total_timesteps = config.n_rounds * config.samples_per_round
+
+    if config.policy_mode == "linear":
+        policy = policy_utils.create_linear_policy(expert_policy)
+    else:
+        policy = policy_utils.create_end_to_end_policy(
+            venv.observation_space, venv.action_space
+        )
+
+    def _eval_only(pol) -> Dict[str, Any]:
+        """Return/disagreement-only eval for fixed BC (no D_eval aggregation)."""
+        res = eval_policy_rollout(
+            pol,
+            venv,
+            n_episodes=20,
+            deterministic=True,
+            expert_policy=expert_policy,
+        )
+        expert_ret = baselines["expert_return"]
+        random_ret = baselines["random_return"]
+        score_range = expert_ret - random_ret
+        norm_ret = (
+            0.0
+            if abs(score_range) < 1e-8
+            else (res.mean_return - random_ret) / score_range
+        )
+        return {
+            "normalized_return": round(float(norm_ret), 6),
+            "disagreement_rate": round(float(res.current_round_disagreement), 6),
+        }
+
+    per_round: List[Dict[str, Any]] = []
+    # Round 0: fresh policy before training.
+    round0_eval = _eval_only(policy)
+    per_round.append(
+        {
+            "round": 0,
+            "n_observations": 0,
+            "train_cross_entropy": None,
+            "l2_norm": None,
+            "total_loss": None,
+            "rollout_cross_entropy": None,
+            "expert_rollout_cross_entropy": None,
+            **round0_eval,
+        }
+    )
 
     sample_until = rollout.make_sample_until(
         min_timesteps=total_timesteps, min_episodes=1
@@ -383,13 +538,6 @@ def _run_bc(
     all_transitions = rollout.flatten_trajectories(list(trajs))
     if len(all_transitions) > total_timesteps:
         all_transitions = all_transitions[:total_timesteps]
-
-    if config.policy_mode == "linear":
-        policy = policy_utils.create_linear_policy(expert_policy)
-    else:
-        policy = policy_utils.create_end_to_end_policy(
-            venv.observation_space, venv.action_space
-        )
 
     custom_logger = imit_logger.configure(
         str(config.output_dir / "tb" / f"bc_{config.env_name}_{config.seed}"),
@@ -406,7 +554,6 @@ def _run_bc(
     )
     bc_trainer.train(n_epochs=config.bc_n_epochs)
 
-    per_round: List[Dict[str, Any]] = []
     chunk_size = config.samples_per_round
     cum_obs = 0
     for round_num in range(config.n_rounds):
@@ -414,8 +561,7 @@ def _run_bc(
         end_idx = min(start_idx + chunk_size, len(all_transitions))
         if start_idx >= len(all_transitions):
             break
-        chunk_len = end_idx - start_idx
-        cum_obs += chunk_len
+        cum_obs += end_idx - start_idx
 
         l2_norms = [
             th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()
@@ -425,10 +571,11 @@ def _run_bc(
         round_data: Dict[str, Any] = {
             "round": round_num + 1,
             "n_observations": cum_obs,
-            "train_cross_entropy": None,  # not tracked for fixed BC
+            "train_cross_entropy": None,
             "l2_norm": round(l2_norm, 6),
             "total_loss": None,
-            "rollout_cross_entropy": None,  # fixed BC does not appear on loss subplot
+            "rollout_cross_entropy": None,
+            "expert_rollout_cross_entropy": None,
             "normalized_return": None,
             "disagreement_rate": None,
         }
@@ -437,24 +584,7 @@ def _run_bc(
         is_interval = (round_num + 1) % config.eval_interval == 0
         is_final = round_num == config.n_rounds - 1
         if is_first or is_interval or is_final:
-            eval_res = eval_policy_rollout(
-                bc_trainer.policy,
-                venv,
-                n_episodes=20,
-                deterministic=True,
-                expert_policy=expert_policy,
-            )
-            expert_ret = baselines["expert_return"]
-            random_ret = baselines["random_return"]
-            score_range = expert_ret - random_ret
-            if abs(score_range) < 1e-8:
-                norm_ret = 0.0
-            else:
-                norm_ret = (eval_res.mean_return - random_ret) / score_range
-            round_data["normalized_return"] = round(norm_ret, 6)
-            round_data["disagreement_rate"] = round(
-                eval_res.current_round_disagreement, 6
-            )
+            round_data.update(_eval_only(bc_trainer.policy))
 
         per_round.append(round_data)
 
@@ -473,12 +603,10 @@ def _run_bc_dagger(
     Per-round ERM on a growing PREFIX of the expert dataset, sized to
     match DAgger's aggregated observation budget. Eval uses the same
     aggregated D_eval^t buffer construction as FTL/FTRL+DAgger (spec §3.4).
-    """
-    from imitation.experiments.ftrl.eval_utils import (
-        compute_sampled_action_ce,
-        eval_policy_rollout,
-    )
 
+    A round-0 eval (fresh policy, before any training) is also emitted,
+    and the outer round loop early-stops when rollout_ce plateaus.
+    """
     total_timesteps = config.n_rounds * config.samples_per_round
 
     sample_until = rollout.make_sample_until(
@@ -500,17 +628,46 @@ def _run_bc_dagger(
     all_transitions = all_transitions[:total_timesteps]
 
     warm_start = env_utils.is_atari(config.env_name)
-    policy = None
+
+    # Build the initial fresh policy for round 0.
+    if config.policy_mode == "linear":
+        policy = policy_utils.create_linear_policy(expert_policy)
+    else:
+        policy = policy_utils.create_end_to_end_policy(
+            venv.observation_space, venv.action_space
+        )
 
     d_eval_obs: List[np.ndarray] = []
     d_eval_expert_acts: List[np.ndarray] = []
+    rce_history: List[float] = []
 
     per_round: List[Dict[str, Any]] = []
+    round0_eval = _compute_round_eval(
+        policy,
+        expert_policy,
+        venv,
+        baselines,
+        d_eval_obs,
+        d_eval_expert_acts,
+    )
+    rce_history.append(round0_eval["rollout_cross_entropy"])
+    per_round.append(
+        {
+            "round": 0,
+            "n_observations": 0,
+            "train_cross_entropy": None,
+            "l2_norm": None,
+            "total_loss": None,
+            **round0_eval,
+        }
+    )
+
+    stopped_early = False
     for round_num in range(1, config.n_rounds + 1):
         k = round_num * config.samples_per_round
         prefix = all_transitions[:k]
 
-        if policy is None or not warm_start:
+        if not warm_start:
             if config.policy_mode == "linear":
                 policy = policy_utils.create_linear_policy(expert_policy)
             else:
@@ -536,7 +693,7 @@ def _run_bc_dagger(
             custom_logger=custom_logger,
         )
         bc_trainer.train(n_epochs=config.bc_n_epochs)
-        policy = bc_trainer.policy  # warm-start reuses this next round
+        policy = bc_trainer.policy
 
         l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
         l2_norm = sum(l2_norms) / 2
@@ -548,6 +705,7 @@ def _run_bc_dagger(
             "l2_norm": round(l2_norm, 6),
             "total_loss": None,
             "rollout_cross_entropy": None,
+            "expert_rollout_cross_entropy": None,
             "normalized_return": None,
             "disagreement_rate": None,
             "d_eval_size": sum(a.shape[0] for a in d_eval_obs),
@@ -557,34 +715,34 @@ def _run_bc_dagger(
         is_interval = round_num % config.eval_interval == 0
         is_final = round_num == config.n_rounds
         if is_first or is_interval or is_final:
-            eval_res = eval_policy_rollout(
+            eval_data = _compute_round_eval(
                 policy,
+                expert_policy,
                 venv,
-                n_episodes=20,
-                deterministic=True,
-                expert_policy=expert_policy,
+                baselines,
+                d_eval_obs,
+                d_eval_expert_acts,
             )
-            d_eval_obs.append(eval_res.rollout_batch.obs)
-            d_eval_expert_acts.append(eval_res.rollout_batch.expert_actions)
-            agg_obs = np.concatenate(d_eval_obs, axis=0)
-            agg_acts = np.concatenate(d_eval_expert_acts, axis=0)
-            round_data["rollout_cross_entropy"] = round(
-                compute_sampled_action_ce(policy, agg_obs, agg_acts), 6
-            )
-            expert_ret = baselines["expert_return"]
-            random_ret = baselines["random_return"]
-            score_range = expert_ret - random_ret
-            if abs(score_range) < 1e-8:
-                norm_ret = 0.0
-            else:
-                norm_ret = (eval_res.mean_return - random_ret) / score_range
-            round_data["normalized_return"] = round(norm_ret, 6)
-            round_data["disagreement_rate"] = round(
-                eval_res.current_round_disagreement, 6
-            )
-            round_data["d_eval_size"] = int(agg_obs.shape[0])
+            round_data.update(eval_data)
+            rce_history.append(eval_data["rollout_cross_entropy"])
+
+            if _should_early_stop(
+                rce_history,
+                config.early_stop_patience,
+                config.early_stop_min_delta,
+            ):
+                stopped_early = True
+                logger.info(
+                    f"bc_dagger/{config.env_name}/seed{config.seed}: "
+                    f"early stop at round {round_num} "
+                    f"(rollout_ce plateau over "
+                    f"{config.early_stop_patience} eval points)"
+                )
 
         per_round.append(round_data)
+        if stopped_early:
+            break
+
     return per_round
 
 
@@ -670,6 +828,8 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         eval_interval=args.eval_interval,
                         output_dir=pathlib.Path(args.output_dir),
                         expert_cache_dir=pathlib.Path(args.expert_cache_dir),
+                        early_stop_patience=args.early_stop_patience,
+                        early_stop_min_delta=args.early_stop_min_delta,
                     )
                 )
     return configs
@@ -696,13 +856,31 @@ def main():
     )
     parser.add_argument("--seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument(
-        "--n-rounds", type=int, default=20, help="Number of DAgger rounds"
+        "--n-rounds",
+        type=int,
+        default=200,
+        help="Max number of DAgger rounds (subject to early-stop)",
     )
     parser.add_argument(
         "--samples-per-round",
         type=int,
-        default=500,
+        default=50,
         help="Min timesteps per DAgger round",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=5,
+        help=(
+            "Stop training when rollout_ce has not improved by "
+            "--early-stop-min-delta over this many consecutive eval points."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.005,
+        help="Minimum improvement in rollout_ce to count as progress",
     )
     parser.add_argument(
         "--policy-mode",
@@ -743,7 +921,7 @@ def main():
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=5,
+        default=2,
         help="Evaluate learner every N rounds (also first and last)",
     )
     parser.add_argument(

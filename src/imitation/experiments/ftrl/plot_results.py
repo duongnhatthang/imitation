@@ -56,12 +56,29 @@ ALGO_LINESTYLES: Dict[str, str] = {
 
 LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger"}  # fixed BC excluded
 
-LOSS_SUBTITLE = (
-    r"Loss: $-\frac{1}{|D_{\mathrm{eval}}^t|}\sum_{(s,a^*)\in D_{\mathrm{eval}}^t}"
-    r"\log\pi^t(a^*|s),\;a^*(s)=\arg\max_a \pi^*(a|s).$  "
-    r"$D_{\mathrm{eval}}^t$ = aggregated fresh rollouts of the current learner. "
-    r"BC+DAgger train set = expert-data prefix sized to DAgger's observation budget."
-)
+LOSS_SUBTITLE_LINES = [
+    (
+        r"Loss: $-\frac{1}{|D_{\mathrm{eval}}^t|}"
+        r"\sum_{(s,a^*)\in D_{\mathrm{eval}}^t}\log\pi^t(a^*|s),$  "
+        r"$a^*(s)=\arg\max_a \pi^*(a|s)$"
+    ),
+    (
+        r"$D_{\mathrm{eval}}^t$ = aggregated fresh rollouts of the current "
+        r"learner. BC+DAgger train set = expert-data prefix matching DAgger's "
+        r"cumulative observation count."
+    ),
+    (
+        "Note: FTL/FTRL use episode-aligned DAgger collection, so their "
+        "per-round observation counts vary slightly by env/seed. "
+        "BC and BC+DAgger use fixed-step chunks of the expert dataset; "
+        "their x-positions may differ from the DAgger variants by < 5%."
+    ),
+    (
+        "Cumulative regret: "
+        r"$\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$, "
+        r"with $\ell_t(\pi^*)$ = expert CE on the same $D_{\mathrm{eval}}^t$."
+    ),
+]
 
 
 def _compute_iqm_and_ci(
@@ -127,6 +144,9 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
                 "n_observations": m.get("n_observations", 0),
                 "train_cross_entropy": m.get("train_cross_entropy"),
                 "rollout_cross_entropy": m.get("rollout_cross_entropy"),
+                "expert_rollout_cross_entropy": m.get(
+                    "expert_rollout_cross_entropy"
+                ),
                 "l2_norm": m.get("l2_norm"),
                 "total_loss": m.get("total_loss"),
                 "normalized_return": (
@@ -159,26 +179,53 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
 def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
     """Compute cumulative rollout cross-entropy per (algo, env, seed).
 
+    Also computes cumulative expert rollout cross-entropy on the same
+    aggregated D_eval^t buffer (if the field is present).
+
     Args:
         df: DataFrame from load_results.
 
     Returns:
-        Same DataFrame with added ``cum_loss`` column.
+        Same DataFrame with added ``cum_loss`` and ``cum_expert_loss``
+        columns. Rows with missing ``rollout_cross_entropy`` contribute
+        nothing to the cumulative sum.
     """
     df = df.sort_values(["algo", "env", "seed", "round"]).copy()
-    df["cum_loss"] = df.groupby(["algo", "env", "seed"])[
-        "rollout_cross_entropy"
-    ].cumsum()
+    # cumsum over eval points; skipna=False would propagate NaN into every
+    # subsequent row, so we fill with 0 for the cumsum and restore NaN on
+    # rows where rollout_cross_entropy was originally missing (so the plot
+    # dots still skip those rounds).
+    df["cum_loss"] = (
+        df.groupby(["algo", "env", "seed"])["rollout_cross_entropy"]
+        .apply(lambda s: s.fillna(0).cumsum())
+        .reset_index(level=[0, 1, 2], drop=True)
+    )
+    df.loc[df["rollout_cross_entropy"].isna(), "cum_loss"] = np.nan
+
+    if "expert_rollout_cross_entropy" in df.columns:
+        df["cum_expert_loss"] = (
+            df.groupby(["algo", "env", "seed"])["expert_rollout_cross_entropy"]
+            .apply(lambda s: s.fillna(0).cumsum())
+            .reset_index(level=[0, 1, 2], drop=True)
+        )
+        df.loc[
+            df["expert_rollout_cross_entropy"].isna(), "cum_expert_loss"
+        ] = np.nan
     return df
 
 
 def compute_cumulative_regret(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute cumulative regret relative to the best dynamic algo's cum loss.
+    """Compute cumulative regret vs the expert on the same D_eval^t buffer.
 
-    The baseline at each (env, seed, round) is the minimum ``cum_loss``
-    across the dynamic algos (FTL, FTRL, BC+DAgger). Fixed BC is excluded
-    from the baseline computation but still receives a regret value via the
-    left merge.
+    Formula matches the DAgger regret bound:
+    :math:`\\sum_{t=1}^T [\\ell_t(\\pi^t) - \\ell_t(\\pi^*)]`
+    where :math:`\\ell_t` is the sampled-action CE on the aggregated eval
+    buffer. The expert's loss on that buffer is stored per-round as
+    ``expert_rollout_cross_entropy``.
+
+    If ``expert_rollout_cross_entropy`` is missing (e.g. older JSONs),
+    falls back to using the env-level ``expert_self_ce`` constant, which
+    approximates expert loss when the learner is near-expert.
 
     Args:
         df: DataFrame with ``cum_loss`` column (from compute_cumulative_loss).
@@ -189,15 +236,17 @@ def compute_cumulative_regret(df: pd.DataFrame) -> pd.DataFrame:
     if "cum_loss" not in df.columns:
         df = compute_cumulative_loss(df)
 
-    loss_df = df[df["algo"].isin({"ftl", "ftrl", "bc_dagger"})]
-    baseline = (
-        loss_df.groupby(["env", "seed", "round"])["cum_loss"]
-        .min()
-        .rename("baseline_cum_loss")
-    )
-    df = df.merge(baseline, on=["env", "seed", "round"], how="left")
-    df["cum_regret"] = df["cum_loss"] - df["baseline_cum_loss"]
-    df.drop(columns=["baseline_cum_loss"], inplace=True)
+    if "cum_expert_loss" in df.columns and df["cum_expert_loss"].notna().any():
+        df["cum_regret"] = df["cum_loss"] - df["cum_expert_loss"]
+    else:
+        # Fallback: treat expert loss as constant expert_self_ce per round.
+        # Count how many eval points we've seen within each run so far.
+        eval_count = (
+            df.groupby(["algo", "env", "seed"])["rollout_cross_entropy"]
+            .apply(lambda s: s.notna().cumsum())
+            .reset_index(level=[0, 1, 2], drop=True)
+        )
+        df["cum_regret"] = df["cum_loss"] - eval_count * df["expert_self_ce"]
     return df
 
 
@@ -232,7 +281,15 @@ def _plot_metric(
         if valid_df.empty:
             continue
 
-        rounds = sorted(valid_df["round"].unique())
+        # Drop rounds not present in every seed for this algo — otherwise
+        # single-seed rounds pull the per-round mean(n_observations) to
+        # whatever that lone seed happens to have, causing the line plot
+        # to jump left/right on the x-axis.
+        n_seeds = valid_df["seed"].nunique()
+        seed_counts = valid_df.groupby("round")["seed"].nunique()
+        complete_rounds = set(seed_counts[seed_counts == n_seeds].index)
+        rounds = sorted(r for r in valid_df["round"].unique() if r in complete_rounds)
+
         x_vals, iqm_vals, ci_lows, ci_highs = [], [], [], []
         for rnd in rounds:
             rnd_df = valid_df[valid_df["round"] == rnd]
@@ -297,9 +354,27 @@ def plot_env(
     policy_modes = env_df["policy_mode"].unique()
     mode_str = policy_modes[0] if len(policy_modes) == 1 else "mixed"
 
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(8, 15), sharex=True)
-    fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
-    fig.text(0.5, 0.955, LOSS_SUBTITLE, ha="center", fontsize=8, wrap=True)
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(9, 16), sharex=True)
+    # Reserve the top of the figure for the title + subtitle so they never
+    # collide with subplot 1.
+    subtitle_text = "\n".join(LOSS_SUBTITLE_LINES)
+    n_subtitle_lines = len(LOSS_SUBTITLE_LINES)
+    top_reserve = 0.86 - 0.01 * n_subtitle_lines
+    plt.subplots_adjust(top=top_reserve)
+    fig.suptitle(
+        f"{env_name}  ({mode_str})",
+        fontsize=14,
+        fontweight="bold",
+        y=0.995,
+    )
+    fig.text(
+        0.5,
+        top_reserve + 0.005,
+        subtitle_text,
+        ha="center",
+        va="top",
+        fontsize=7.5,
+    )
 
     # Subplot 1: rollout_cross_entropy on the aggregated D_eval^t buffer
     _plot_metric(
@@ -354,16 +429,15 @@ def plot_env(
     )
     ax3.set_ylim(-0.05, 1.05)
 
-    # Subplot 4: Cumulative regret vs best dynamic algo
+    # Subplot 4: Cumulative regret vs expert
     _plot_metric(
         ax4,
         env_df,
         "cum_regret",
-        "Cumulative Regret (vs best dynamic algo)",
+        r"Cumulative Regret (vs Expert $\pi^*$)",
         allowed_algos=LOSS_SUBPLOT_ALGOS,
     )
 
-    plt.tight_layout(rect=(0, 0, 1, 0.94))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
