@@ -18,12 +18,25 @@ from stable_baselines3.common.vec_env import VecEnv
 from imitation.data import types
 from imitation.util import util
 
+__all__ = [
+    "RolloutBatch",
+    "EvalResult",
+    "eval_policy_rollout",
+    "compute_sampled_action_ce",
+]
+
 
 @dataclasses.dataclass
 class RolloutBatch:
     """Raw transitions collected during one eval call.
 
     Owned by the caller; aggregated across eval points into D_eval^t.
+
+    Note:
+        `obs` is assumed to be an ndarray (Box or one-hot-encoded Discrete
+        observation spaces used by the 8 classical MDPs in this PR's scope).
+        Dict observation spaces are not supported here — extend this class
+        if/when that becomes necessary.
     """
 
     obs: np.ndarray  # shape (n_steps, *obs_shape)
@@ -161,6 +174,13 @@ def compute_sampled_action_ce(
 
     Returns:
         Mean sampled-action cross-entropy (scalar float).
+
+    Note:
+        Assumes the policy has a uniform train/eval mode across all
+        submodules (true for the MLP ActorCritic policies used by the
+        classical FTRL pipeline). Callers with policies that have
+        independently-toggled submodules (e.g. frozen BatchNorm) should
+        snapshot mode per-submodule themselves.
     """
     was_training = policy.training
     policy.eval()
