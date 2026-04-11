@@ -142,63 +142,31 @@ def _train_classical_expert(
     rng: np.random.Generator,
     seed: int,
 ) -> BasePolicy:
-    """Train a classical MDP expert with PPO MlpPolicy [64,64]."""
-    config = env_utils.ENV_CONFIGS.get(env_name, {})
-    ppo_timesteps = config.get("ppo_timesteps", 100_000)
-    ppo_kwargs = config.get("ppo_kwargs", {})
-    ppo_n_envs = config.get("ppo_n_envs", None)
-    logger.info(
-        f"Training PPO expert for {env_name} ({ppo_timesteps} timesteps)",
-    )
+    """Train a classical MDP expert via chunked PPO + convergence detection."""
+    from .expert_training import train_classical_expert_until_converged
 
-    if ppo_n_envs and ppo_n_envs > 1:
-        train_venv = env_utils.make_env(env_name, n_envs=ppo_n_envs, rng=rng)
-    else:
-        train_venv = venv
-
-    model = PPO(
-        "MlpPolicy",
-        train_venv,
-        policy_kwargs=dict(net_arch=[64, 64]),
+    policy = train_classical_expert_until_converged(
+        env_name=env_name,
+        cache_dir=cache_dir,
+        rng=rng,
         seed=seed,
-        verbose=0,
-        **ppo_kwargs,
-    )
-    model.learn(total_timesteps=ppo_timesteps)
-
-    if ppo_n_envs and ppo_n_envs > 1:
-        train_venv.close()
-
-    from stable_baselines3.common.evaluation import evaluate_policy
-
-    mean_reward, std_reward = evaluate_policy(
-        model.policy,
-        venv,
-        n_eval_episodes=20,
-        deterministic=True,
-    )
-    logger.info(
-        f"Expert quality for {env_name}: "
-        f"reward={mean_reward:.1f}±{std_reward:.1f} "
-        f"(trained {ppo_timesteps} steps)",
     )
 
-    cache_path = cache_dir / env_name.replace("/", "_")
-    cache_path.mkdir(parents=True, exist_ok=True)
-    model.save(cache_path / "model.zip")
-    logger.info(f"Saved expert to {cache_path / 'model.zip'}")
-
+    # Compute and cache baselines on the caller's venv so downstream code
+    # sees a consistent cache.
     from .env_baselines import load_or_compute_baselines, validate_expert_quality
+    from .eval_utils import eval_policy_rollout
 
-    # Compute and cache baselines
-    load_or_compute_baselines(env_name, venv, model.policy, cache_dir, rng)
-
-    # Warn if expert quality is below reference
-    is_ok, msg = validate_expert_quality(env_name, mean_reward)
+    baselines = load_or_compute_baselines(env_name, venv, policy, cache_dir, rng)
+    res = eval_policy_rollout(policy, venv, n_episodes=20, deterministic=True)
+    logger.info(
+        f"Expert quality for {env_name}: reward={res.mean_return:.1f} "
+        f"(baseline expert_return={baselines['expert_return']:.1f})"
+    )
+    is_ok, msg = validate_expert_quality(env_name, res.mean_return)
     if not is_ok:
         logger.warning(f"WARNING: {msg}")
-
-    return model.policy
+    return policy
 
 
 def make_expert_trajectories(
