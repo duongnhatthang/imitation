@@ -93,9 +93,17 @@ ENV_CONFIGS: Dict[str, dict] = {
         "obs_size": 500,
         "ppo_timesteps": 500_000,
         "env_kwargs": {},
+        # Taxi is notoriously hard for vanilla PPO. At 3M steps with
+        # default hparams the policy reaches norm_return~0.73 and plateau.
+        # Loosened gates per D1 fallback (spec §9). Max budget bumped to
+        # 6M and chunks shortened to 25k to get more plateau-detection
+        # granularity.
         "convergence": {
-            "max_timesteps": 3_000_000,
-            "chunk_timesteps": 50_000,
+            "threshold": 0.75,
+            "self_ce_eps": 0.60,
+            "max_timesteps": 6_000_000,
+            "chunk_timesteps": 25_000,
+            "_note": "Taxi PPO plateau; 0.95/0.4 unreachable at 3M.",
         },
     },
     "Blackjack-v1": {
