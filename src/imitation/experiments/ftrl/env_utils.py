@@ -85,15 +85,19 @@ def is_atari(env_name: str) -> bool:
 
 ENV_GROUPS: Dict[str, list] = {
     "classical": list(ENV_CONFIGS.keys()),
+    # Ordered fastest-to-slowest by expected wall-clock time per experiment.
+    # Pong/Breakout have short episodes and converge quickly (SimPLe reached
+    # max Pong/Freeway in 100k interactions). Enduro/MsPacman have long
+    # episodes (thousands of steps) which makes policy eval expensive.
     "atari-zoo": [
         "PongNoFrameskip-v4",
         "BreakoutNoFrameskip-v4",
         "SpaceInvadersNoFrameskip-v4",
         "BeamRiderNoFrameskip-v4",
         "QbertNoFrameskip-v4",
+        "SeaquestNoFrameskip-v4",
         "MsPacmanNoFrameskip-v4",
         "EnduroNoFrameskip-v4",
-        "SeaquestNoFrameskip-v4",
     ],
     "atari-fast": [
         "FreewayNoFrameskip-v4",

@@ -10,11 +10,13 @@ Usage:
 
 import argparse
 import dataclasses
+import gc
 import json
 import logging
 import multiprocessing
 import os
 import pathlib
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +30,13 @@ from imitation.experiments.ftrl import env_utils, experts, policy_utils
 from imitation.util import logger as imit_logger
 
 logger = logging.getLogger(__name__)
+
+
+def _free_memory() -> None:
+    """Run GC and drop PyTorch's CUDA cache to keep RSS bounded across rounds."""
+    gc.collect()
+    if th.cuda.is_available():
+        th.cuda.empty_cache()
 
 ALL_ALGOS = ["ftl", "ftrl", "bc"]
 
@@ -88,21 +97,40 @@ class ExperimentConfig:
 def _evaluate_policy_cross_entropy(
     policy: sb3_policies.ActorCriticPolicy,
     transitions: types.Transitions,
+    batch_size: int = 256,
 ) -> float:
-    """Compute mean negative log-prob of expert actions under the policy."""
+    """Compute mean negative log-prob of expert actions under the policy.
+
+    Processes transitions in ``batch_size`` chunks so Atari rounds with
+    thousands of frame-stacked observations do not OOM the GPU when passed
+    through a CNN feature extractor in a single forward pass.
+    """
     from imitation.util import util
 
+    device = policy.device
     policy.eval()
+    obs_all = types.maybe_unwrap_dictobs(transitions.obs)
+    acts_all = transitions.acts
+    total_n = len(acts_all)
+    total_log_prob_sum = 0.0
+    total_count = 0
     with th.no_grad():
-        tensor_obs = types.map_maybe_dict(
-            util.safe_to_tensor,
-            types.maybe_unwrap_dictobs(transitions.obs),
-        )
-        acts = util.safe_to_tensor(transitions.acts)
-        _, log_prob, _ = policy.evaluate_actions(tensor_obs, acts)
-        cross_entropy = -log_prob.mean().item()
+        for start in range(0, total_n, batch_size):
+            end = min(start + batch_size, total_n)
+            obs_chunk = types.map_maybe_dict(lambda x: x[start:end], obs_all)
+            tensor_obs = types.map_maybe_dict(
+                lambda x: util.safe_to_tensor(x).to(device),
+                obs_chunk,
+            )
+            acts_chunk = util.safe_to_tensor(acts_all[start:end]).to(device)
+            _, log_prob, _ = policy.evaluate_actions(tensor_obs, acts_chunk)
+            total_log_prob_sum += float(log_prob.sum().item())
+            total_count += int(log_prob.numel())
+            del tensor_obs, acts_chunk, log_prob
     policy.train()
-    return cross_entropy
+    if total_count == 0:
+        return 0.0
+    return -total_log_prob_sum / total_count
 
 
 def _evaluate_learner_metrics(
@@ -110,8 +138,8 @@ def _evaluate_learner_metrics(
     expert_policy,
     venv,
     baselines: Dict[str, float],
-    n_episodes: int = 10,
-    max_steps: int = 10000,
+    n_episodes: int = 5,
+    max_steps: int = 50000,
 ) -> Dict[str, Optional[float]]:
     """Evaluate normalized return and on-policy disagreement rate.
 
@@ -119,14 +147,21 @@ def _evaluate_learner_metrics(
     step also querying the expert to compute disagreement. Returns normalized
     return (0=random, 1=expert) and disagreement rate (fraction of steps
     where actions differ).
+
+    Episode returns are read from Monitor's ``info['episode']['r']`` field.
+    This matches the methodology used by ``evaluate_policy`` to measure the
+    baseline ``expert_return``. It is essential for Atari: SB3's make_vec_env
+    wraps the raw gym env with Monitor first, then ``AtariWrapper``, which
+    means Monitor observes real game-over transitions (full-game returns),
+    whereas ``dones[0]`` at the outer venv fires on every life loss via
+    ``EpisodicLifeEnv``. Reading ``dones[0]`` would give per-life returns and
+    underestimate normalized return by a factor of n_lives.
     """
     learner_policy.eval()
 
     episode_returns: List[float] = []
     total_steps = 0
     total_disagreements = 0
-    current_return = 0.0
-    current_episode_steps = 0
 
     obs = venv.reset()
     while len(episode_returns) < n_episodes and total_steps < max_steps:
@@ -134,23 +169,28 @@ def _evaluate_learner_metrics(
         expert_action = expert_policy.predict(obs, deterministic=True)[0]
 
         total_steps += 1
-        current_episode_steps += 1
         if learner_action[0] != expert_action[0]:
             total_disagreements += 1
 
         obs, rewards, dones, infos = venv.step(learner_action)
-        current_return += rewards[0]
 
-        if dones[0]:
-            episode_returns.append(current_return)
-            current_return = 0.0
-            current_episode_steps = 0
-
-    # If we hit max_steps mid-episode, count the partial return as an episode
-    if not episode_returns:
-        episode_returns.append(current_return)
+        # Monitor populates info['episode'] only on real episode end (real
+        # env done). For Atari this filters out EpisodicLifeEnv's life-loss
+        # terminations; for classical MDPs it coincides with dones[0].
+        ep_info = infos[0].get("episode") if infos and len(infos) > 0 else None
+        if ep_info is not None:
+            episode_returns.append(float(ep_info["r"]))
 
     learner_policy.train()
+
+    disagreement_rate = total_disagreements / max(total_steps, 1)
+
+    if not episode_returns:
+        # No complete episode within the budget. Return disagreement only.
+        return {
+            "normalized_return": None,
+            "disagreement_rate": round(disagreement_rate, 6),
+        }
 
     mean_return = float(np.mean(episode_returns))
     expert_ret = baselines["expert_return"]
@@ -161,8 +201,6 @@ def _evaluate_learner_metrics(
         normalized_return = 0.0
     else:
         normalized_return = (mean_return - random_ret) / score_range
-
-    disagreement_rate = total_disagreements / max(total_steps, 1)
 
     return {
         "normalized_return": round(normalized_return, 6),
@@ -211,6 +249,15 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         rng=rng,
         seed=config.seed,
     )
+
+    # Seed torch's global RNG AFTER loading the expert. ``PPO.load`` resets
+    # torch's RNG state (via ``torch.load``), which would clobber any manual
+    # seeding done earlier and make linear-policy ``action_net`` init identical
+    # across seeds. Seeding here ensures that ``create_linear_policy``'s
+    # ``xavier_uniform_`` init and the BC dataloader shuffle differ per seed.
+    th.manual_seed(config.seed)
+    if th.cuda.is_available():
+        th.cuda.manual_seed_all(config.seed)
 
     # Load or compute baselines for normalized return
     from imitation.experiments.ftrl.env_baselines import (
@@ -328,12 +375,18 @@ def _run_dagger_variant(
         custom_logger=custom_logger,
     )
 
-    # Create scratch dir for this run
+    # Create scratch dir for this run. Clear any stale contents from a
+    # previous partial run so DAgger doesn't refuse to overwrite its demos.
     scratch_dir = (
         config.output_dir / "scratch" / f"{config.algo}_{config.env_name}_{config.seed}"
     )
+    if scratch_dir.exists():
+        shutil.rmtree(scratch_dir)
 
-    # Create FTRL trainer
+    # Create FTRL trainer. track_per_round_loss=False because FTRLTrainer's
+    # internal _compute_round_loss does an unbatched forward pass on the
+    # entire round's transitions, which OOMs on Atari. We compute round CE
+    # ourselves below via the batched _evaluate_policy_cross_entropy.
     trainer = ftrl.FTRLTrainer(
         venv=venv,
         scratch_dir=scratch_dir,
@@ -342,59 +395,82 @@ def _run_dagger_variant(
         rng=rng,
         l2_schedule=l2_schedule,
         warm_start=config.warm_start,
-        track_per_round_loss=True,
+        track_per_round_loss=False,
         use_trainable_params_loss=use_trainable_params_loss,
         beta_schedule=LinearBetaSchedule(config.beta_rampdown),
         custom_logger=custom_logger,
     )
 
-    # Train
-    total_timesteps = config.n_rounds * config.samples_per_round
-    trainer.train(
-        total_timesteps=total_timesteps,
-        rollout_round_min_episodes=1,
-        rollout_round_min_timesteps=config.samples_per_round,
-    )
-
-    # Extract metrics and compute expert baseline CE per round
+    # Per-round training loop. Replaces ``trainer.train(total_timesteps=...)``
+    # with an explicit loop of (collect one round of demos -> extend_and_update
+    # -> evaluate learner on-policy) so that:
+    #   1. Per-round learner eval reflects the learner *at that round*, not the
+    #      final post-training policy.
+    #   2. Reported ``n_observations`` is nominal (round_num * samples_per_round)
+    #      so BC and DAgger share the same x-axis even when DAgger's
+    #      per-round rollout overshoots ``samples_per_round`` because
+    #      ``rollout_round_min_episodes=1`` forces at least one full episode.
     from imitation.data import serialize
 
-    metrics = list(trainer.get_metrics())
-    total_rounds = len(metrics)
-
     per_round = []
-    cum_obs = 0
-    for m in metrics:
-        # m.round_num is post-increment (1-indexed); demo dirs are 0-indexed
-        demo_round = m.round_num - 1
-        round_dir = trainer._demo_dir_path_for_round(demo_round)
+    for round_idx in range(config.n_rounds):
+        round_num = round_idx + 1  # 1-indexed
+
+        # Collect one round of demos via the trainer's beta-mixture collector.
+        collector = trainer.create_trajectory_collector()
+        sample_until = rollout.make_sample_until(
+            min_timesteps=max(config.samples_per_round, trainer.batch_size),
+            min_episodes=1,
+        )
+        rollout.generate_trajectories(
+            policy=expert_policy,
+            venv=collector,
+            sample_until=sample_until,
+            deterministic_policy=True,
+            rng=collector.rng,
+        )
+
+        # Train BC on all demos collected so far (dataset aggregation).
+        # FTRLTrainer.extend_and_update updates the L2 weight and runs BC.
+        trainer.extend_and_update(bc_train_kwargs=None)
+
+        # Compute learner CE and expert CE on this round's freshly collected
+        # demos. Both use the batched helper to avoid OOM on Atari.
+        round_dir = trainer._demo_dir_path_for_round(round_idx)
         demo_paths = trainer._get_demo_paths(round_dir)
         round_demos = []
         for p in demo_paths:
             round_demos.extend(serialize.load(p))
         round_transitions = rollout.flatten_trajectories(round_demos)
+        learner_ce = _evaluate_policy_cross_entropy(
+            bc_trainer.policy, round_transitions
+        )
         expert_ce = _evaluate_policy_cross_entropy(expert_policy, round_transitions)
-        cum_obs += len(round_transitions)
+
+        # L2 norm of trainable params (matches FTRLTrainer.use_trainable_params_loss).
+        l2_norms = [
+            th.sum(th.square(w)).item()
+            for w in bc_trainer.policy.parameters()
+            if w.requires_grad
+        ]
+        l2_norm = sum(l2_norms) / 2
+        total_loss = learner_ce + config.l2_lambda * l2_norm
 
         round_data = {
-            "round": m.round_num,
-            "n_observations": cum_obs,
-            "cross_entropy": round(m.cross_entropy, 6),
-            "l2_norm": round(m.l2_norm, 6),
-            "total_loss": round(m.total_loss, 6),
+            "round": round_num,
+            "n_observations": round_num * config.samples_per_round,
+            "cross_entropy": round(learner_ce, 6),
+            "l2_norm": round(l2_norm, 6),
+            "total_loss": round(total_loss, 6),
             "expert_cross_entropy": round(expert_ce, 6),
             "normalized_return": None,
             "disagreement_rate": None,
         }
 
-        # Evaluate at intervals: round 1, every eval_interval, and final round
-        # NOTE: For DAgger, bc_trainer.policy is the *final* trained policy at
-        # this point (trainer.train() runs all rounds). Per-round evaluation
-        # during training would be more informative but requires a bigger
-        # refactor. This is acceptable for the first version.
-        is_first = m.round_num == 1
-        is_interval = m.round_num % config.eval_interval == 0
-        is_final = m.round_num == total_rounds
+        # Evaluate the learner at round 1, every eval_interval, and final round.
+        is_first = round_num == 1
+        is_interval = round_num % config.eval_interval == 0
+        is_final = round_num == config.n_rounds
         if is_first or is_interval or is_final:
             eval_metrics = _evaluate_learner_metrics(
                 bc_trainer.policy,
@@ -405,6 +481,13 @@ def _run_dagger_variant(
             round_data.update(eval_metrics)
 
         per_round.append(round_data)
+
+        # Drop references and flush caches so RSS does not accumulate across
+        # rounds. Cached torch allocations and stale ``round_demos`` /
+        # ``round_transitions`` are freed each round; the DAgger dataset
+        # inside the trainer grows cumulatively by design.
+        del round_demos, round_transitions
+        _free_memory()
 
     return per_round
 
@@ -418,7 +501,11 @@ def _run_bc(
 ) -> List[Dict[str, Any]]:
     """Run BC baseline.
 
-    Collects total data upfront, trains BC, then evaluates on round-sized chunks.
+    Collects ``n_rounds * samples_per_round`` transitions upfront, then trains
+    BC incrementally on growing prefixes: at round k the trainer is fit on the
+    first ``k * samples_per_round`` transitions. This makes the BC per-round
+    curve meaningful (learner at round k reflects training on k chunks of data)
+    and comparable to DAgger's per-round curve on an identical x-axis.
     """
     total_timesteps = config.n_rounds * config.samples_per_round
 
@@ -454,40 +541,42 @@ def _run_bc(
         format_strs=[],
     )
 
+    # We'll call set_demonstrations() per round with growing prefixes; the
+    # initial dataset just satisfies BC's required constructor argument.
     bc_trainer = bc.BC(
         observation_space=venv.observation_space,
         action_space=venv.action_space,
         rng=rng,
         policy=policy,
-        demonstrations=all_transitions,
-        batch_size=min(32, len(all_transitions)),
+        demonstrations=all_transitions[: config.samples_per_round],
+        batch_size=min(32, config.samples_per_round),
         custom_logger=custom_logger,
     )
 
-    # Train on all data
-    bc_trainer.train(n_epochs=config.bc_n_epochs)
-
-    # Evaluate on round-sized chunks
-    per_round = []
     chunk_size = config.samples_per_round
-    cum_obs = 0
-    for round_num in range(config.n_rounds):
-        start_idx = round_num * chunk_size
-        end_idx = min(start_idx + chunk_size, len(all_transitions))
-        if start_idx >= len(all_transitions):
-            break
-        chunk = all_transitions[start_idx:end_idx]
-        cum_obs += len(chunk)
+    per_round = []
+    for round_idx in range(config.n_rounds):
+        round_num = round_idx + 1
+        prefix_end = min(round_num * chunk_size, len(all_transitions))
+        prefix = all_transitions[:prefix_end]
+
+        # Incremental BC: fit on growing prefix. Warm-start from the previous
+        # round's weights (matches FTL/FTRL warm-start semantics).
+        bc_trainer.set_demonstrations(prefix)
+        bc_trainer.train(n_epochs=config.bc_n_epochs)
+
+        # Evaluate CE on the most recent chunk (last samples_per_round).
+        chunk_start = max(0, prefix_end - chunk_size)
+        chunk = all_transitions[chunk_start:prefix_end]
         ce = _evaluate_policy_cross_entropy(bc_trainer.policy, chunk)
         expert_ce = _evaluate_policy_cross_entropy(expert_policy, chunk)
 
-        # Compute L2 norm for consistency
         l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
         l2_norm = sum(l2_norms) / 2
 
         round_data = {
-            "round": round_num + 1,
-            "n_observations": cum_obs,
+            "round": round_num,
+            "n_observations": round_num * chunk_size,
             "cross_entropy": round(ce, 6),
             "l2_norm": round(l2_norm, 6),
             "total_loss": round(ce, 6),  # BC has no L2 penalty in loss
@@ -496,9 +585,9 @@ def _run_bc(
             "disagreement_rate": None,
         }
 
-        is_first = round_num == 0
-        is_interval = (round_num + 1) % config.eval_interval == 0
-        is_final = round_num == config.n_rounds - 1
+        is_first = round_num == 1
+        is_interval = round_num % config.eval_interval == 0
+        is_final = round_num == config.n_rounds
         if is_first or is_interval or is_final:
             eval_metrics = _evaluate_learner_metrics(
                 bc_trainer.policy,
@@ -509,6 +598,9 @@ def _run_bc(
             round_data.update(eval_metrics)
 
         per_round.append(round_data)
+
+        # Keep RSS bounded across rounds.
+        _free_memory()
 
     return per_round
 
@@ -700,6 +792,18 @@ def main():
         action="store_true",
         help="Re-run experiments even if result JSON already exists",
     )
+    parser.add_argument(
+        "--shard-idx",
+        type=int,
+        default=0,
+        help="Shard index (0-based) for splitting work across processes",
+    )
+    parser.add_argument(
+        "--n-shards",
+        type=int,
+        default=1,
+        help="Total number of shards. Each process runs configs[shard_idx::n_shards]",
+    )
     args = parser.parse_args()
     args.envs = resolve_envs(env_group=args.env_group, envs=args.envs)
 
@@ -712,6 +816,16 @@ def main():
     os.environ["FTRL_N_GPUS"] = str(args.n_gpus)
 
     all_configs = build_configs(args)
+
+    # Shard support: split work across independent processes (e.g., one per GPU).
+    # Each shard sees its slice and skips the rest entirely.
+    if args.n_shards > 1:
+        all_configs = all_configs[args.shard_idx :: args.n_shards]
+        logger.info(
+            f"Shard {args.shard_idx}/{args.n_shards}: "
+            f"processing {len(all_configs)} of the total configs",
+        )
+
     total_requested = len(all_configs)
 
     # Resume support: skip configs whose result JSON already exists

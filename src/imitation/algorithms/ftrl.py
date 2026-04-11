@@ -96,11 +96,12 @@ class TrainableParamsLossCalculator(bc.BehaviorCloningLossCalculator):
         """
         from imitation.util import util
 
+        device = policy.device
         tensor_obs = types.map_maybe_dict(
-            util.safe_to_tensor,
+            lambda x: util.safe_to_tensor(x).to(device),
             types.maybe_unwrap_dictobs(obs),
         )
-        acts = util.safe_to_tensor(acts)
+        acts = util.safe_to_tensor(acts).to(device)
 
         (_, log_prob, entropy) = policy.evaluate_actions(
             tensor_obs,

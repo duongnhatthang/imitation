@@ -325,16 +325,26 @@ def plot_env(
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(8, 14), sharex=True)
     fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
 
-    # Get expert baselines if available (as DataFrames with mean_obs column)
+    # Get expert baselines if available (as DataFrames with mean_obs column).
+    # We group per (algo, round) first so mean_obs is not polluted by
+    # differing round schedules across algos. The resulting curve is the mean
+    # across algos at each round; since expert CE is a property of the
+    # expert+state-distribution (not the learner algo), it should be
+    # near-identical across algos when sharing the same x-grid.
     expert_ce = None
     if "expert_cross_entropy" in env_df.columns:
+        per_algo_round = env_df.groupby(["algo", "round"]).agg(
+            metric=("expert_cross_entropy", "mean"),
+            obs=("n_observations", "mean"),
+        ).reset_index()
         expert_ce = (
-            env_df.groupby("round")
+            per_algo_round.groupby("round")
             .agg(
-                mean_metric=("expert_cross_entropy", "mean"),
-                mean_obs=("n_observations", "mean"),
+                mean_metric=("metric", "mean"),
+                mean_obs=("obs", "mean"),
             )
             .reset_index()
+            .sort_values("mean_obs")
         )
 
     # Subplot 1: Per-round imitation loss (log scale)
