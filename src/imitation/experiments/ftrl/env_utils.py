@@ -61,6 +61,9 @@ ENV_CONFIGS: Dict[str, dict] = {
         "obs_size": 48,
         "ppo_timesteps": 200_000,
         "env_kwargs": {},
+        # gymnasium ships CliffWalking with max_episode_steps=None;
+        # a random-init policy can loop indefinitely.
+        "fallback_max_episode_steps": 200,
     },
     "Acrobot-v1": {
         "obs_type": "continuous",
@@ -100,6 +103,8 @@ ENV_CONFIGS: Dict[str, dict] = {
         "obs_sizes": [32, 11, 2],
         "ppo_timesteps": 50_000,
         "env_kwargs": {},
+        # gymnasium Blackjack has no default time limit.
+        "fallback_max_episode_steps": 20,
         "convergence": {
             "threshold": 0.85,
             "self_ce_eps": 0.5,
@@ -275,7 +280,20 @@ def make_env(
     if env_kwargs is None:
         env_kwargs = config.get("env_kwargs", {})
 
+    # Some gymnasium envs (CliffWalking-v0, Blackjack-v1) have
+    # max_episode_steps=None, so a random-walk policy can run forever.
+    # Wrap them in TimeLimit so every episode is guaranteed to terminate.
+    fallback_max_steps = config.get("fallback_max_episode_steps", 500)
+    spec_has_limit: Dict[str, bool] = {}
+    try:
+        spec = gym.spec(env_name)
+        spec_has_limit[env_name] = spec.max_episode_steps is not None
+    except Exception:
+        spec_has_limit[env_name] = True  # assume yes if probe fails
+
     def post_wrapper(env, _):
+        if not spec_has_limit.get(env_name, True):
+            env = gym.wrappers.TimeLimit(env, max_episode_steps=fallback_max_steps)
         if obs_type == "discrete":
             env = OneHotObsWrapper(env)
         elif obs_type == "tuple":

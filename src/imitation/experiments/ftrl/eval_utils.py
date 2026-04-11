@@ -62,7 +62,7 @@ def eval_policy_rollout(
     n_episodes: int,
     deterministic: bool = True,
     expert_policy: Optional[BasePolicy] = None,
-    safety_step_cap: int = 100_000,
+    safety_step_cap: int = 1_000_000,
 ) -> EvalResult:
     """Roll out `policy` for exactly `n_episodes` complete episodes.
 
