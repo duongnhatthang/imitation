@@ -387,10 +387,10 @@ def plot_env(
     # top spine of subplot 1.
     plt.subplots_adjust(
         top=0.83,
-        left=0.09,
+        left=0.10,
         right=0.97,
         bottom=0.05,
-        hspace=0.25,
+        hspace=0.38,
     )
     fig.suptitle(
         f"{env_name}  ({mode_str})",
@@ -414,7 +414,7 @@ def plot_env(
         ax1,
         env_df,
         "rollout_cross_entropy",
-        r"Rollout CE on $D_{\mathrm{eval}}^t$ (log y)",
+        r"Rollout CE on $D_{\mathrm{eval}}^t$",
         log_scale=True,
         log_x=True,
         allowed_algos=LOSS_SUBPLOT_ALGOS,
@@ -440,7 +440,7 @@ def plot_env(
         ax2,
         env_df,
         "normalized_return",
-        "Normalized Expected Return (log y, clipped to 1e-3)",
+        "Normalized Return",
         log_scale=True,
         log_x=True,
         y_clip_floor=1e-3,
@@ -461,7 +461,7 @@ def plot_env(
         ax3,
         env_df,
         "disagreement_rate",
-        "On-Policy Disagreement Rate (log y, clipped to 1e-3)",
+        "Disagreement Rate",
         log_scale=True,
         log_x=True,
         y_clip_floor=1e-3,
