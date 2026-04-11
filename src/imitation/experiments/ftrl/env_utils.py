@@ -115,6 +115,15 @@ ENV_CONFIGS: Dict[str, dict] = {
         "obs_type": "continuous",
         "ppo_timesteps": 300_000,
         "env_kwargs": {},
+        # Vanilla PPO with MLP [64,64] plateaus around norm_return ~0.25 on
+        # LunarLander — full 0.95 requires bigger nets / tuned hparams.
+        # 0.70 (~reward 122) still represents a competent lander and keeps
+        # Expert >> BC. D1 fallback per spec §3.2.
+        "convergence": {
+            "threshold": 0.70,
+            "max_timesteps": 1_500_000,
+            "_note": "LunarLander PPO plateau; 0.95/5M exhausts budget.",
+        },
     },
 }
 
