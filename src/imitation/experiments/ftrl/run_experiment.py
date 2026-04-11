@@ -20,10 +20,9 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch as th
-from stable_baselines3.common import policies as sb3_policies
 
 from imitation.algorithms import bc, ftrl
-from imitation.data import rollout, types
+from imitation.data import rollout
 from imitation.experiments.ftrl import env_utils, experts, policy_utils
 from imitation.util import logger as imit_logger
 
@@ -83,91 +82,6 @@ class ExperimentConfig:
     eval_interval: int
     output_dir: pathlib.Path
     expert_cache_dir: pathlib.Path
-
-
-def _evaluate_policy_cross_entropy(
-    policy: sb3_policies.ActorCriticPolicy,
-    transitions: types.Transitions,
-) -> float:
-    """Compute mean negative log-prob of expert actions under the policy."""
-    from imitation.util import util
-
-    policy.eval()
-    with th.no_grad():
-        tensor_obs = types.map_maybe_dict(
-            util.safe_to_tensor,
-            types.maybe_unwrap_dictobs(transitions.obs),
-        )
-        acts = util.safe_to_tensor(transitions.acts)
-        _, log_prob, _ = policy.evaluate_actions(tensor_obs, acts)
-        cross_entropy = -log_prob.mean().item()
-    policy.train()
-    return cross_entropy
-
-
-def _evaluate_learner_metrics(
-    learner_policy,
-    expert_policy,
-    venv,
-    baselines: Dict[str, float],
-    n_episodes: int = 10,
-    max_steps: int = 10000,
-) -> Dict[str, Optional[float]]:
-    """Evaluate normalized return and on-policy disagreement rate.
-
-    Rolls out the learner policy for n_episodes (or until max_steps), at each
-    step also querying the expert to compute disagreement. Returns normalized
-    return (0=random, 1=expert) and disagreement rate (fraction of steps
-    where actions differ).
-    """
-    learner_policy.eval()
-
-    episode_returns: List[float] = []
-    total_steps = 0
-    total_disagreements = 0
-    current_return = 0.0
-    current_episode_steps = 0
-
-    obs = venv.reset()
-    while len(episode_returns) < n_episodes and total_steps < max_steps:
-        learner_action = learner_policy.predict(obs, deterministic=True)[0]
-        expert_action = expert_policy.predict(obs, deterministic=True)[0]
-
-        total_steps += 1
-        current_episode_steps += 1
-        if learner_action[0] != expert_action[0]:
-            total_disagreements += 1
-
-        obs, rewards, dones, infos = venv.step(learner_action)
-        current_return += rewards[0]
-
-        if dones[0]:
-            episode_returns.append(current_return)
-            current_return = 0.0
-            current_episode_steps = 0
-
-    # If we hit max_steps mid-episode, count the partial return as an episode
-    if not episode_returns:
-        episode_returns.append(current_return)
-
-    learner_policy.train()
-
-    mean_return = float(np.mean(episode_returns))
-    expert_ret = baselines["expert_return"]
-    random_ret = baselines["random_return"]
-    score_range = expert_ret - random_ret
-
-    if abs(score_range) < 1e-8:
-        normalized_return = 0.0
-    else:
-        normalized_return = (mean_return - random_ret) / score_range
-
-    disagreement_rate = total_disagreements / max(total_steps, 1)
-
-    return {
-        "normalized_return": round(normalized_return, 6),
-        "disagreement_rate": round(disagreement_rate, 6),
-    }
 
 
 def run_single(config: ExperimentConfig) -> Dict[str, Any]:
@@ -443,16 +357,17 @@ def _run_bc(
     rng: np.random.Generator,
     baselines: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    """Run BC baseline.
+    """Fixed BC baseline: train once on the full expert dataset, then eval.
 
-    Collects total data upfront, trains BC, then evaluates on round-sized chunks.
+    No D_eval aggregation -- fixed BC is a static reference line on the
+    return subplot and does NOT appear on the loss subplot (spec §3.5).
     """
+    from imitation.experiments.ftrl.eval_utils import eval_policy_rollout
+
     total_timesteps = config.n_rounds * config.samples_per_round
 
-    # Collect expert trajectories with min_timesteps to guarantee enough data
     sample_until = rollout.make_sample_until(
-        min_timesteps=total_timesteps,
-        min_episodes=1,
+        min_timesteps=total_timesteps, min_episodes=1
     )
     trajs = rollout.generate_trajectories(
         policy=expert_policy,
@@ -462,25 +377,20 @@ def _run_bc(
         rng=rng,
     )
     all_transitions = rollout.flatten_trajectories(list(trajs))
-
-    # Trim to exact total_timesteps if we got more
     if len(all_transitions) > total_timesteps:
         all_transitions = all_transitions[:total_timesteps]
 
-    # Create policy
     if config.policy_mode == "linear":
         policy = policy_utils.create_linear_policy(expert_policy)
     else:
         policy = policy_utils.create_end_to_end_policy(
-            venv.observation_space,
-            venv.action_space,
+            venv.observation_space, venv.action_space
         )
 
     custom_logger = imit_logger.configure(
         str(config.output_dir / "tb" / f"bc_{config.env_name}_{config.seed}"),
         format_strs=[],
     )
-
     bc_trainer = bc.BC(
         observation_space=venv.observation_space,
         action_space=venv.action_space,
@@ -490,12 +400,9 @@ def _run_bc(
         batch_size=min(32, len(all_transitions)),
         custom_logger=custom_logger,
     )
-
-    # Train on all data
     bc_trainer.train(n_epochs=config.bc_n_epochs)
 
-    # Evaluate on round-sized chunks
-    per_round = []
+    per_round: List[Dict[str, Any]] = []
     chunk_size = config.samples_per_round
     cum_obs = 0
     for round_num in range(config.n_rounds):
@@ -503,22 +410,21 @@ def _run_bc(
         end_idx = min(start_idx + chunk_size, len(all_transitions))
         if start_idx >= len(all_transitions):
             break
-        chunk = all_transitions[start_idx:end_idx]
-        cum_obs += len(chunk)
-        ce = _evaluate_policy_cross_entropy(bc_trainer.policy, chunk)
-        expert_ce = _evaluate_policy_cross_entropy(expert_policy, chunk)
+        chunk_len = end_idx - start_idx
+        cum_obs += chunk_len
 
-        # Compute L2 norm for consistency
-        l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
+        l2_norms = [
+            th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()
+        ]
         l2_norm = sum(l2_norms) / 2
 
-        round_data = {
+        round_data: Dict[str, Any] = {
             "round": round_num + 1,
             "n_observations": cum_obs,
-            "cross_entropy": round(ce, 6),
+            "train_cross_entropy": None,  # not tracked for fixed BC
             "l2_norm": round(l2_norm, 6),
-            "total_loss": round(ce, 6),  # BC has no L2 penalty in loss
-            "expert_cross_entropy": round(expert_ce, 6),
+            "total_loss": None,
+            "rollout_cross_entropy": None,  # fixed BC does not appear on loss subplot
             "normalized_return": None,
             "disagreement_rate": None,
         }
@@ -527,13 +433,24 @@ def _run_bc(
         is_interval = (round_num + 1) % config.eval_interval == 0
         is_final = round_num == config.n_rounds - 1
         if is_first or is_interval or is_final:
-            eval_metrics = _evaluate_learner_metrics(
+            eval_res = eval_policy_rollout(
                 bc_trainer.policy,
-                expert_policy,
                 venv,
-                baselines,
+                n_episodes=20,
+                deterministic=True,
+                expert_policy=expert_policy,
             )
-            round_data.update(eval_metrics)
+            expert_ret = baselines["expert_return"]
+            random_ret = baselines["random_return"]
+            score_range = expert_ret - random_ret
+            if abs(score_range) < 1e-8:
+                norm_ret = 0.0
+            else:
+                norm_ret = (eval_res.mean_return - random_ret) / score_range
+            round_data["normalized_return"] = round(norm_ret, 6)
+            round_data["disagreement_rate"] = round(
+                eval_res.current_round_disagreement, 6
+            )
 
         per_round.append(round_data)
 

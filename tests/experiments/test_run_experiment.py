@@ -76,7 +76,13 @@ def test_run_bc_cartpole(tmp_path):
     assert result["algo"] == "bc"
     assert len(result["per_round"]) >= 2
     for m in result["per_round"]:
-        assert m["cross_entropy"] >= 0
+        # Fixed BC does not track per-round train cross-entropy or rollout CE;
+        # these fields are present but None (static reference line in plots).
+        assert "train_cross_entropy" in m
+        assert m["train_cross_entropy"] is None
+        assert "rollout_cross_entropy" in m
+        assert m["rollout_cross_entropy"] is None
+        assert "l2_norm" in m
 
 
 def test_run_ftrl_linear_mode(tmp_path):
