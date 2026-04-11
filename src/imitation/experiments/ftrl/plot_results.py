@@ -254,6 +254,8 @@ def _plot_metric(
     ylabel: str,
     log_scale: bool = False,
     allowed_algos: Optional[set] = None,
+    log_x: bool = False,
+    y_clip_floor: Optional[float] = None,
 ):
     """Plot a metric with IQM and 95% bootstrap CI bands across seeds.
 
@@ -265,6 +267,11 @@ def _plot_metric(
         log_scale: Whether to use log scale on y-axis.
         allowed_algos: Optional filter on algo set; if given, only those
             algos are drawn on this subplot.
+        log_x: Whether to use log scale on x-axis. Rounds with
+            ``n_observations == 0`` are dropped (can't render at log(0)).
+        y_clip_floor: If set, values below this floor are clipped up to
+            the floor before plotting. Useful for log-y plots where the
+            natural metric can be zero or slightly negative.
     """
     algos = sorted(
         df["algo"].unique(),
@@ -293,8 +300,14 @@ def _plot_metric(
             values = rnd_df[metric].values
             if len(values) == 0:
                 continue
+            if y_clip_floor is not None:
+                values = np.maximum(values, y_clip_floor)
             iqm, ci_lo, ci_hi = _compute_iqm_and_ci(values)
-            x_vals.append(rnd_df["n_observations"].mean())
+            mean_obs = rnd_df["n_observations"].mean()
+            if log_x and mean_obs <= 0:
+                # Drop round 0 from log-x plots (log(0) is -inf).
+                continue
+            x_vals.append(mean_obs)
             iqm_vals.append(iqm)
             ci_lows.append(ci_lo)
             ci_highs.append(ci_hi)
@@ -303,6 +316,10 @@ def _plot_metric(
         color = ALGO_COLORS.get(algo, "#888888")
         linestyle = ALGO_LINESTYLES.get(algo, "-")
         label = ALGO_LABELS.get(algo, algo)
+        if y_clip_floor is not None:
+            iqm_vals = [max(v, y_clip_floor) for v in iqm_vals]
+            ci_lows = [max(v, y_clip_floor) for v in ci_lows]
+            ci_highs = [max(v, y_clip_floor) for v in ci_highs]
         ax.plot(
             x_vals,
             iqm_vals,
@@ -317,10 +334,12 @@ def _plot_metric(
 
     if log_scale:
         ax.set_yscale("log")
-    ax.set_xlabel("Number of Observations")
+    if log_x:
+        ax.set_xscale("log")
+    ax.set_xlabel("Number of Observations" + (" (log)" if log_x else ""))
     ax.set_ylabel(ylabel)
     ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which="both")
 
 
 def plot_env(
@@ -389,13 +408,15 @@ def plot_env(
         linespacing=1.4,
     )
 
-    # Subplot 1: rollout_cross_entropy on the aggregated D_eval^t buffer
+    # Subplot 1: rollout_cross_entropy on the aggregated D_eval^t buffer.
+    # Log x-axis to zoom in on early learning.
     _plot_metric(
         ax1,
         env_df,
         "rollout_cross_entropy",
-        "Rollout CE on $D_{\\mathrm{eval}}^t$ (log)",
+        r"Rollout CE on $D_{\mathrm{eval}}^t$ (log y)",
         log_scale=True,
+        log_x=True,
         allowed_algos=LOSS_SUBPLOT_ALGOS,
     )
     if show_expert_on_loss:
@@ -408,16 +429,21 @@ def plot_env(
                 linestyle=ALGO_LINESTYLES["expert"],
                 linewidth=1.2,
                 alpha=0.7,
-                label=f"{ALGO_LABELS['expert']} self-CE = {y:.3f}",
+                label=rf"{ALGO_LABELS['expert']} $\pi^*$ self-CE = {y:.3f}",
             )
             ax1.legend(fontsize=9)
 
-    # Subplot 2: Normalized expected return
+    # Subplot 2: Normalized expected return.
+    # Log y-axis (clipped to a small floor since round 0 can be slightly
+    # negative and the random baseline is exactly 0). Log x-axis as well.
     _plot_metric(
         ax2,
         env_df,
         "normalized_return",
-        "Normalized Expected Return",
+        "Normalized Expected Return (log y, clipped to 1e-3)",
+        log_scale=True,
+        log_x=True,
+        y_clip_floor=1e-3,
     )
     ax2.axhline(
         y=1.0,
@@ -425,29 +451,31 @@ def plot_env(
         linestyle=ALGO_LINESTYLES["expert"],
         linewidth=1.2,
         alpha=0.7,
-        label=ALGO_LABELS["expert"] + " (1.0)",
-    )
-    ax2.axhline(
-        y=0.0, color="gray", linestyle=":", linewidth=1, alpha=0.5, label="Random (0.0)"
+        label=rf"{ALGO_LABELS['expert']} $\pi^*$",
     )
     ax2.legend(fontsize=9)
 
-    # Subplot 3: On-policy disagreement rate (dynamic algos + fixed BC)
+    # Subplot 3: On-policy disagreement rate (dynamic algos + fixed BC).
+    # Log y-axis (natural for a rate in [0, 1]) + log x.
     _plot_metric(
         ax3,
         env_df,
         "disagreement_rate",
-        "On-Policy Disagreement Rate",
+        "On-Policy Disagreement Rate (log y, clipped to 1e-3)",
+        log_scale=True,
+        log_x=True,
+        y_clip_floor=1e-3,
         allowed_algos={"ftl", "ftrl", "bc_dagger", "bc"},
     )
-    ax3.set_ylim(-0.05, 1.05)
 
-    # Subplot 4: Cumulative regret vs expert
+    # Subplot 4: Cumulative regret vs expert.
+    # Log x only (regret can be negative, so linear y).
     _plot_metric(
         ax4,
         env_df,
         "cum_regret",
         r"Cumulative Regret (vs Expert $\pi^*$)",
+        log_x=True,
         allowed_algos=LOSS_SUBPLOT_ALGOS,
     )
 

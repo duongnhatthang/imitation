@@ -158,19 +158,38 @@ def _should_early_stop(
     rce_history: List[float],
     patience: int,
     min_delta: float,
+    expert_ce_floor: Optional[float] = None,
 ) -> bool:
-    """Return True if rollout_ce has plateaued.
+    """Return True if rollout_ce has plateaued AND is near expert-level.
 
-    Criterion: the best rollout_ce observed in the last ``patience`` eval
-    points (inclusive) is within ``min_delta`` of the best observed in the
-    history BEFORE that window. Equivalently, no improvement by > min_delta
-    across ``patience`` consecutive eval points.
+    Two-criterion stop, both must hold:
+
+    1. **Rolling-mean plateau.** Compare the mean of the last ``patience``
+       eval points against the mean of the ``patience`` eval points
+       immediately before that window. If the improvement is less than
+       ``min_delta``, the signal has plateaued. Requires at least
+       ``2 * patience`` eval points before the first check.
+       Using means rather than mins makes the check noise-robust — a
+       single lucky-low early eval no longer pins a false "best ever".
+
+    2. **Absolute sanity gate.** If ``expert_ce_floor`` is provided, also
+       require the current rolling mean to be within ``2 * expert_ce_floor``
+       of zero. Prevents early-stopping while rollout_ce is still
+       clearly far from expert-level (as happened on noisy LunarLander
+       BC+DAgger runs with the old min-based criterion).
     """
-    if patience < 1 or len(rce_history) <= patience:
+    if patience < 1 or len(rce_history) < 2 * patience:
         return False
-    best_before_window = min(rce_history[: -patience])
-    best_in_window = min(rce_history[-patience:])
-    return (best_before_window - best_in_window) < min_delta
+    window = rce_history[-patience:]
+    prior = rce_history[-2 * patience : -patience]
+    current_mean = float(np.mean(window))
+    prior_mean = float(np.mean(prior))
+    plateau = (prior_mean - current_mean) < min_delta
+    if not plateau:
+        return False
+    if expert_ce_floor is not None and current_mean > 2.0 * expert_ce_floor:
+        return False
+    return True
 
 
 def run_single(config: ExperimentConfig) -> Dict[str, Any]:
@@ -444,6 +463,7 @@ def _run_dagger_variant(
                 rce_history,
                 config.early_stop_patience,
                 config.early_stop_min_delta,
+                expert_ce_floor=baselines.get("expert_self_ce"),
             ):
                 stopped_early = True
                 logger.info(
@@ -730,6 +750,7 @@ def _run_bc_dagger(
                 rce_history,
                 config.early_stop_patience,
                 config.early_stop_min_delta,
+                expert_ce_floor=baselines.get("expert_self_ce"),
             ):
                 stopped_early = True
                 logger.info(
@@ -858,7 +879,7 @@ def main():
     parser.add_argument(
         "--n-rounds",
         type=int,
-        default=200,
+        default=60,
         help="Max number of DAgger rounds (subject to early-stop)",
     )
     parser.add_argument(
