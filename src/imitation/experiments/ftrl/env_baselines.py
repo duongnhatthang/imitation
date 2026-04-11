@@ -163,10 +163,11 @@ def compute_baselines(
     r"""Compute expert return, random return, and expert self-CE baselines.
 
     ``expert_self_ce`` is
-    $-\tfrac{1}{|D|}\sum_s \log \pi^*(\arg\max \pi^*(\cdot|s)|s)$
-    -- the residual softmax entropy of the expert at its own argmax, a
-    direct argmax-pathology gauge used as the Expert line on the loss
-    subplot.
+    $-\tfrac{1}{|D|}\sum_s \log \pi^*(\arg\max_a \pi^*(a|s)|s)$
+    -- the expert's own negative log-probability at its greedy action,
+    averaged over states visited in the expert rollout. Sharp softmax
+    -> near zero; diffuse softmax -> positive. Direct gauge of the
+    argmax pathology, used as the Expert line on the loss subplot.
 
     Args:
         expert_policy: A policy with a ``predict(obs, deterministic=True)``
