@@ -283,3 +283,22 @@ def test_train_classical_expert_raises_on_non_convergence(tmp_path):
                 "patience": 1,
             },
         )
+
+
+def test_get_or_train_expert_uses_new_trainer(tmp_path):
+    """get_or_train_expert routes classical envs through the convergence trainer."""
+    import numpy as np
+    from imitation.experiments.ftrl import env_utils, experts
+    from imitation.experiments.ftrl.eval_utils import eval_policy_rollout
+
+    rng = np.random.default_rng(0)
+    venv = env_utils.make_env("CartPole-v1", n_envs=1, rng=rng)
+    policy = experts.get_or_train_expert(
+        "CartPole-v1", venv, cache_dir=tmp_path, rng=rng, seed=0
+    )
+    # Expert must be converged (argmax policy at ceiling).
+    res = eval_policy_rollout(policy, venv, n_episodes=20, deterministic=True)
+    normalized = (res.mean_return - 22.0) / (500.0 - 22.0)
+    assert normalized >= 0.90
+    # Cache file exists so a second call short-circuits.
+    assert (tmp_path / "CartPole-v1" / "model.zip").exists()
