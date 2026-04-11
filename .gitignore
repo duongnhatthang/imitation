@@ -169,3 +169,4 @@ experiments/setup_server.sh
 experiments/sync_results.sh
 
 .worktrees/
+experiments/expert_cache_ent_default/

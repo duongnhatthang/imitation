@@ -1,0 +1,41 @@
+[
+  {
+    "env": "CartPole-v1",
+    "default_ent_coef_0.01": {
+      "expert_return": 500.0,
+      "expert_self_ce": 0.2274298858642578
+    },
+    "ent_coef_0.0": {
+      "env": "CartPole-v1",
+      "mean_return": 500.0,
+      "normalized_return": 1.0,
+      "self_ce": 0.22824052459716798
+    }
+  },
+  {
+    "env": "LunarLander-v2",
+    "default_ent_coef_0.01": {
+      "expert_return": 175.62360555000004,
+      "expert_self_ce": 0.2697767129134607
+    },
+    "ent_coef_0.0": {
+      "env": "LunarLander-v2",
+      "mean_return": 160.4279228,
+      "normalized_return": 0.7897369079812208,
+      "self_ce": 0.18136327967173915
+    }
+  },
+  {
+    "env": "Taxi-v3",
+    "default_ent_coef_0.01": {
+      "expert_return": -200.0,
+      "expert_self_ce": 0.4997847137451172
+    },
+    "ent_coef_0.0": {
+      "env": "Taxi-v3",
+      "mean_return": -200.0,
+      "normalized_return": 0.7303152159813205,
+      "self_ce": 0.4625050720214844
+    }
+  }
+]
