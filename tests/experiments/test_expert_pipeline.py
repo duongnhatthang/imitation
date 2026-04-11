@@ -231,3 +231,74 @@ def test_create_linear_policy():
         expert.action_net.weight.data,
         linear_policy.action_net.weight.data,
     )
+
+
+def test_train_classical_expert_converges_cartpole(tmp_path):
+    """CartPole expert trainer must return a converged policy within the cap."""
+    import numpy as np
+    from imitation.experiments.ftrl import env_utils
+    from imitation.experiments.ftrl.expert_training import (
+        train_classical_expert_until_converged,
+    )
+    from imitation.experiments.ftrl.eval_utils import eval_policy_rollout
+
+    rng = np.random.default_rng(0)
+    venv = env_utils.make_env("CartPole-v1", n_envs=1, rng=rng)
+    policy = train_classical_expert_until_converged(
+        env_name="CartPole-v1",
+        cache_dir=tmp_path,
+        rng=rng,
+        seed=0,
+    )
+    res = eval_policy_rollout(
+        policy, venv, n_episodes=20, deterministic=True, expert_policy=policy
+    )
+    cfg = env_utils.get_convergence_config("CartPole-v1")
+    normalized = (res.mean_return - 22.0) / (500.0 - 22.0)
+    assert normalized >= cfg["threshold"] - 0.05
+    assert res.current_round_ce <= cfg["self_ce_eps"] + 0.02
+
+
+def test_train_classical_expert_raises_on_non_convergence(tmp_path):
+    """Unreachable threshold must raise RuntimeError."""
+    import numpy as np
+    import pytest
+    from imitation.experiments.ftrl.expert_training import (
+        train_classical_expert_until_converged,
+    )
+
+    rng = np.random.default_rng(0)
+    with pytest.raises(RuntimeError, match="failed to converge"):
+        train_classical_expert_until_converged(
+            env_name="CartPole-v1",
+            cache_dir=tmp_path,
+            rng=rng,
+            seed=0,
+            convergence_override={
+                "chunk_timesteps": 500,
+                "min_timesteps": 500,
+                "max_timesteps": 1000,
+                "threshold": 0.99,
+                "self_ce_eps": 0.001,
+                "patience": 1,
+            },
+        )
+
+
+def test_get_or_train_expert_uses_new_trainer(tmp_path):
+    """get_or_train_expert routes classical envs through the convergence trainer."""
+    import numpy as np
+    from imitation.experiments.ftrl import env_utils, experts
+    from imitation.experiments.ftrl.eval_utils import eval_policy_rollout
+
+    rng = np.random.default_rng(0)
+    venv = env_utils.make_env("CartPole-v1", n_envs=1, rng=rng)
+    policy = experts.get_or_train_expert(
+        "CartPole-v1", venv, cache_dir=tmp_path, rng=rng, seed=0
+    )
+    # Expert must be converged (argmax policy at ceiling).
+    res = eval_policy_rollout(policy, venv, n_episodes=20, deterministic=True)
+    normalized = (res.mean_return - 22.0) / (500.0 - 22.0)
+    assert normalized >= 0.90
+    # Cache file exists so a second call short-circuits.
+    assert (tmp_path / "CartPole-v1" / "model.zip").exists()

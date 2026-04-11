@@ -160,7 +160,14 @@ def compute_baselines(
     n_expert_episodes: int = 20,
     n_random_episodes: int = 100,
 ) -> Dict[str, float]:
-    """Compute expert and random return baselines for an environment.
+    r"""Compute expert return, random return, and expert self-CE baselines.
+
+    ``expert_self_ce`` is
+    $-\tfrac{1}{|D|}\sum_s \log \pi^*(\arg\max_a \pi^*(a|s)|s)$
+    -- the expert's own negative log-probability at its greedy action,
+    averaged over states visited in the expert rollout. Sharp softmax
+    -> near zero; diffuse softmax -> positive. Direct gauge of the
+    argmax pathology, used as the Expert line on the loss subplot.
 
     Args:
         expert_policy: A policy with a ``predict(obs, deterministic=True)``
@@ -171,24 +178,26 @@ def compute_baselines(
         n_random_episodes: Number of random rollout episodes.
 
     Returns:
-        Dict with keys ``"expert_return"`` and ``"random_return"``.
+        Dict with keys ``"expert_return"``, ``"random_return"``,
+        ``"expert_self_ce"``.
     """
-    from stable_baselines3.common.evaluation import evaluate_policy
+    from imitation.experiments.ftrl.eval_utils import eval_policy_rollout
 
-    # Expert return (using SB3's evaluate_policy which works with any VecEnv)
-    expert_return, _ = evaluate_policy(
+    expert_result = eval_policy_rollout(
         expert_policy,
         venv,
-        n_eval_episodes=n_expert_episodes,
+        n_episodes=n_expert_episodes,
         deterministic=True,
+        expert_policy=expert_policy,  # enables self-CE computation
     )
 
     # Random return
     random_return = compute_random_return(venv, n_episodes=n_random_episodes)
 
     return {
-        "expert_return": expert_return,
+        "expert_return": float(expert_result.mean_return),
         "random_return": random_return,
+        "expert_self_ce": float(expert_result.current_round_ce),
     }
 
 
@@ -211,14 +220,21 @@ def load_or_compute_baselines(
         rng: Random number generator.
 
     Returns:
-        Dict with keys ``"expert_return"`` and ``"random_return"``.
+        Dict with keys ``"expert_return"``, ``"random_return"``, and
+        ``"expert_self_ce"``.
     """
     cache_path = cache_dir / env_name / "baselines.json"
 
     if cache_path.exists():
         logger.info(f"Loading cached baselines from {cache_path}")
         with open(cache_path) as f:
-            return json.load(f)
+            cached = json.load(f)
+        if "expert_self_ce" in cached:
+            return cached
+        logger.info(
+            f"Baselines cache at {cache_path} missing expert_self_ce; "
+            f"recomputing"
+        )
 
     logger.info(f"Computing baselines for {env_name}...")
     baselines = compute_baselines(expert_policy, venv, rng)

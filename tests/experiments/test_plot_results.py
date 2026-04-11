@@ -36,7 +36,8 @@ def _write_fake_result(
         round_data = {
             "round": r + 1,
             "n_observations": (r + 1) * samples_per_round,
-            "cross_entropy": round(ce, 6),
+            "train_cross_entropy": round(ce, 6),
+            "rollout_cross_entropy": round(ce, 6),
             "l2_norm": round(rng.uniform(0.1, 1.0), 6),
             "total_loss": round(ce + 0.001, 6),
             # normalized_return and disagreement_rate present only at even rounds
@@ -52,7 +53,11 @@ def _write_fake_result(
         "policy_mode": "end_to_end",
         "config": {"n_rounds": n_rounds},
         "per_round": per_round,
-        "baselines": {"expert_return": 500.0, "random_return": 22.0},
+        "baselines": {
+            "expert_return": 500.0,
+            "random_return": 22.0,
+            "expert_self_ce": 0.05,
+        },
         "elapsed_seconds": 5.0,
     }
 
@@ -95,7 +100,7 @@ def test_load_results(tmp_path):
         "env",
         "seed",
         "round",
-        "cross_entropy",
+        "rollout_cross_entropy",
         "l2_norm",
         "normalized_return",
         "disagreement_rate",

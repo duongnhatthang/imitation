@@ -61,9 +61,11 @@ def test_run_ftrl_cartpole(tmp_path):
     assert result["algo"] == "ftrl"
     assert len(result["per_round"]) >= 2
     for m in result["per_round"]:
-        assert "cross_entropy" in m
+        assert "train_cross_entropy" in m
         assert "l2_norm" in m
         assert "round" in m
+        assert "d_eval_size" in m
+        assert isinstance(m["d_eval_size"], int)
 
 
 def test_run_bc_cartpole(tmp_path):
@@ -74,7 +76,13 @@ def test_run_bc_cartpole(tmp_path):
     assert result["algo"] == "bc"
     assert len(result["per_round"]) >= 2
     for m in result["per_round"]:
-        assert m["cross_entropy"] >= 0
+        # Fixed BC does not track per-round train cross-entropy or rollout CE;
+        # these fields are present but None (static reference line in plots).
+        assert "train_cross_entropy" in m
+        assert m["train_cross_entropy"] is None
+        assert "rollout_cross_entropy" in m
+        assert m["rollout_cross_entropy"] is None
+        assert "l2_norm" in m
 
 
 def test_run_ftrl_linear_mode(tmp_path):
@@ -122,8 +130,38 @@ class TestResolveEnvs:
             resolve_envs(env_group="classical", envs=["CartPole-v1"])
 
 
+def test_run_bc_dagger_cartpole(tmp_path):
+    """bc_dagger smoke test on CartPole."""
+    config = _make_config(
+        "bc_dagger",
+        tmp_path,
+        env_name="CartPole-v1",
+        policy_mode="end_to_end",
+        n_rounds=3,
+        samples_per_round=200,
+        eval_interval=1,
+    )
+    result = run_single(config)
+    assert result["algo"] == "bc_dagger"
+    assert len(result["per_round"]) == 3
+    # Data budget invariant: round k has exactly k * samples_per_round obs
+    for i, r in enumerate(result["per_round"]):
+        assert r["n_observations"] == (i + 1) * 200
+    # rollout_cross_entropy populated on every eval-point round
+    # (with eval_interval=1, every round is an eval point)
+    for r in result["per_round"]:
+        assert r["rollout_cross_entropy"] is not None
+        assert r["d_eval_size"] > 0
+
+
+@pytest.mark.expensive
 def test_run_ftrl_lunarlander(tmp_path):
-    """FTRL smoke test on LunarLander-v2 (new classical MDP)."""
+    """FTRL smoke test on LunarLander-v2 (new classical MDP).
+
+    Marked expensive: the convergence-detecting expert trainer (Task 3)
+    requires several million PPO steps to clear LunarLander's 95% return
+    threshold — no longer fast enough for the default test loop.
+    """
     config = _make_config(
         "ftrl",
         tmp_path,
@@ -138,8 +176,13 @@ def test_run_ftrl_lunarlander(tmp_path):
     assert len(result["per_round"]) >= 1
 
 
+@pytest.mark.expensive
 def test_run_bc_taxi(tmp_path):
-    """BC smoke test on Taxi-v3 (discrete obs, one-hot encoded)."""
+    """BC smoke test on Taxi-v3 (discrete obs, one-hot encoded).
+
+    Marked expensive: same reason as test_run_ftrl_lunarlander — Taxi's
+    expert now requires >500k PPO steps to clear the convergence gate.
+    """
     config = _make_config(
         "bc",
         tmp_path,
