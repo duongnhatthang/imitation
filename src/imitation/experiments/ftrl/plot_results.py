@@ -191,26 +191,23 @@ def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
         nothing to the cumulative sum.
     """
     df = df.sort_values(["algo", "env", "seed", "round"]).copy()
-    # cumsum over eval points; skipna=False would propagate NaN into every
-    # subsequent row, so we fill with 0 for the cumsum and restore NaN on
-    # rows where rollout_cross_entropy was originally missing (so the plot
-    # dots still skip those rounds).
-    df["cum_loss"] = (
-        df.groupby(["algo", "env", "seed"])["rollout_cross_entropy"]
-        .apply(lambda s: s.fillna(0).cumsum())
-        .reset_index(level=[0, 1, 2], drop=True)
-    )
+    # cumsum over eval points; NaN entries (non-eval rounds) contribute 0
+    # to the running sum but keep NaN in the cum_loss column so the line
+    # plot skips those rounds.
+    df["_rce_filled"] = df["rollout_cross_entropy"].fillna(0.0)
+    df["cum_loss"] = df.groupby(["algo", "env", "seed"])["_rce_filled"].cumsum()
     df.loc[df["rollout_cross_entropy"].isna(), "cum_loss"] = np.nan
+    df.drop(columns=["_rce_filled"], inplace=True)
 
     if "expert_rollout_cross_entropy" in df.columns:
-        df["cum_expert_loss"] = (
-            df.groupby(["algo", "env", "seed"])["expert_rollout_cross_entropy"]
-            .apply(lambda s: s.fillna(0).cumsum())
-            .reset_index(level=[0, 1, 2], drop=True)
-        )
+        df["_erce_filled"] = df["expert_rollout_cross_entropy"].fillna(0.0)
+        df["cum_expert_loss"] = df.groupby(["algo", "env", "seed"])[
+            "_erce_filled"
+        ].cumsum()
         df.loc[
             df["expert_rollout_cross_entropy"].isna(), "cum_expert_loss"
         ] = np.nan
+        df.drop(columns=["_erce_filled"], inplace=True)
     return df
 
 
@@ -239,14 +236,14 @@ def compute_cumulative_regret(df: pd.DataFrame) -> pd.DataFrame:
     if "cum_expert_loss" in df.columns and df["cum_expert_loss"].notna().any():
         df["cum_regret"] = df["cum_loss"] - df["cum_expert_loss"]
     else:
-        # Fallback: treat expert loss as constant expert_self_ce per round.
-        # Count how many eval points we've seen within each run so far.
-        eval_count = (
-            df.groupby(["algo", "env", "seed"])["rollout_cross_entropy"]
-            .apply(lambda s: s.notna().cumsum())
-            .reset_index(level=[0, 1, 2], drop=True)
-        )
-        df["cum_regret"] = df["cum_loss"] - eval_count * df["expert_self_ce"]
+        # Fallback: treat expert loss as constant expert_self_ce per eval
+        # point. Count eval points seen so far per run.
+        df["_is_eval"] = df["rollout_cross_entropy"].notna().astype(int)
+        df["_eval_count"] = df.groupby(["algo", "env", "seed"])[
+            "_is_eval"
+        ].cumsum()
+        df["cum_regret"] = df["cum_loss"] - df["_eval_count"] * df["expert_self_ce"]
+        df.drop(columns=["_is_eval", "_eval_count"], inplace=True)
     return df
 
 
