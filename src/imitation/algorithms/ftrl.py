@@ -231,29 +231,91 @@ class FTRLTrainer(dagger.SimpleDAggerTrainer):
     def _compute_round_loss(
         self,
         round_transitions: types.Transitions,
+        batch_size: int = 1024,
     ) -> RoundMetrics:
         """Evaluate the current policy on a set of transitions.
 
+        Processes ``round_transitions`` in ``batch_size`` chunks so that
+        Atari rounds with thousands of frame-stacked 84x84 observations do
+        not OOM the GPU on a single forward pass through a CNN feature
+        extractor. Classical MDP rounds typically have a few hundred low-
+        dimensional observations and fit in a single chunk, so this is a
+        no-op for classical runs (same numeric result as one big pass).
+
         Args:
             round_transitions: Transitions from the current round.
+            batch_size: Maximum number of transitions per forward pass.
+                Defaults to 1024; any value that fits a CNN forward pass
+                in GPU memory is fine.
 
         Returns:
             RoundMetrics with cross-entropy and L2 norm on the given data.
         """
+        from imitation.util import util
+
+        device = self.policy.device
+        obs_all = types.maybe_unwrap_dictobs(round_transitions.obs)
+        acts_all = round_transitions.acts
+        total_n = len(acts_all)
+
+        loss_calc = self.bc_trainer.loss_calculator
+        l2_weight = loss_calc.l2_weight
+        ent_weight = loss_calc.ent_weight
+
+        # L2 norm is data-independent; compute once. Match the loss
+        # calculator's choice of trainable vs all parameters.
+        if isinstance(loss_calc, TrainableParamsLossCalculator):
+            l2_norms = [
+                th.sum(th.square(w))
+                for w in self.policy.parameters()
+                if w.requires_grad
+            ]
+        else:
+            l2_norms = [th.sum(th.square(w)) for w in self.policy.parameters()]
+        l2_norm_t = sum(l2_norms) / 2
+        assert isinstance(l2_norm_t, th.Tensor)
+
+        # Aggregate log_prob and entropy as sums, convert to means at end.
+        log_prob_sum = 0.0
+        entropy_sum = 0.0
+        entropy_seen = False
+
         self.policy.eval()
         with th.no_grad():
-            metrics = self.bc_trainer.loss_calculator(
-                self.policy,
-                round_transitions.obs,
-                round_transitions.acts,
-            )
+            for start in range(0, total_n, batch_size):
+                end = min(start + batch_size, total_n)
+                obs_chunk = types.map_maybe_dict(lambda x: x[start:end], obs_all)
+                tensor_obs = types.map_maybe_dict(
+                    lambda x: util.safe_to_tensor(x).to(device),
+                    obs_chunk,
+                )
+                acts_chunk = util.safe_to_tensor(acts_all[start:end]).to(device)
+                _, log_prob, entropy = self.policy.evaluate_actions(
+                    tensor_obs, acts_chunk
+                )
+                log_prob_sum += float(log_prob.sum().item())
+                if entropy is not None:
+                    entropy_sum += float(entropy.sum().item())
+                    entropy_seen = True
+                del tensor_obs, acts_chunk, log_prob, entropy
         self.policy.train()
+
+        denom = max(total_n, 1)
+        neglogp_val = -log_prob_sum / denom
+        if entropy_seen:
+            mean_entropy = entropy_sum / denom
+            ent_loss_val = -ent_weight * mean_entropy
+        else:
+            ent_loss_val = 0.0
+        l2_norm_val = float(l2_norm_t.item())
+        l2_loss_val = l2_weight * l2_norm_val
+        total_loss_val = neglogp_val + ent_loss_val + l2_loss_val
 
         return RoundMetrics(
             round_num=self.round_num,
-            cross_entropy=metrics.neglogp.item(),
-            l2_norm=metrics.l2_norm.item(),
-            total_loss=metrics.loss.item(),
+            cross_entropy=neglogp_val,
+            l2_norm=l2_norm_val,
+            total_loss=total_loss_val,
         )
 
     def extend_and_update(
