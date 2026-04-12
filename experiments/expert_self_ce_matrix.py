@@ -71,6 +71,115 @@ ROWS: List[Dict[str, Any]] = [
 ]
 
 
+
+def _train_a2c_until_converged(
+    env_name: str,
+    rng: np.random.Generator,
+    seed: int,
+    ent_coef: float,
+    convergence_override: Dict[str, float],
+) -> Optional[object]:
+    """A2C analog of train_classical_expert_until_converged.
+
+    Chunked-learn + plateau convergence. Returns the trained
+    `model.policy` or None on failure-to-converge.
+    """
+    import collections
+
+    from stable_baselines3 import A2C
+
+    from imitation.experiments.ftrl.env_baselines import REFERENCE_BASELINES
+
+    conv = dict(convergence_override)
+    chunk_size = int(conv["chunk_timesteps"])
+    max_total = int(conv["max_timesteps"])
+    min_total = int(conv["min_timesteps"])
+    threshold = float(conv["threshold"])
+    patience = int(conv["patience"])
+    self_ce_eps = float(conv["self_ce_eps"])
+    tolerance = 0.02
+
+    train_venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
+    eval_venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
+
+    model = A2C(
+        "MlpPolicy",
+        train_venv,
+        policy_kwargs=dict(net_arch=[64, 64]),
+        seed=seed,
+        verbose=0,
+        ent_coef=ent_coef,
+    )
+
+    ref = REFERENCE_BASELINES[env_name]
+    score_range = ref["expert_score"] - ref["random_score"]
+
+    def _norm(mean_return: float) -> float:
+        if abs(score_range) < 1e-8:
+            return 0.0
+        return (mean_return - ref["random_score"]) / score_range
+
+    best_norm = -float("inf")
+    best_self_ce = float("inf")
+    chunks_since_best = 0
+    total_steps = 0
+    return_window: "collections.deque[float]" = collections.deque(maxlen=patience)
+
+    try:
+        while total_steps < max_total:
+            model.learn(chunk_size, reset_num_timesteps=False)
+            total_steps += chunk_size
+
+            eval_res = eval_policy_rollout(
+                model.policy,
+                eval_venv,
+                n_episodes=50,
+                deterministic=True,
+                expert_policy=model.policy,
+            )
+            norm_ret = _norm(eval_res.mean_return)
+            self_ce = float(eval_res.current_round_ce)
+            return_window.append(norm_ret)
+
+            improved = (
+                norm_ret > best_norm + tolerance
+                or self_ce < best_self_ce - tolerance
+            )
+            if improved:
+                best_norm = max(best_norm, norm_ret)
+                best_self_ce = min(best_self_ce, self_ce)
+                chunks_since_best = 0
+            else:
+                chunks_since_best += 1
+
+            window_min = min(return_window) if return_window else -float("inf")
+            logger.info(
+                f"[A2C {env_name}] step={total_steps}/{max_total} "
+                f"norm_ret={norm_ret:.3f} self_ce={self_ce:.3f} "
+                f"(best norm={best_norm:.3f} ce={best_self_ce:.3f}, "
+                f"window_min={window_min:.3f}, "
+                f"patience {chunks_since_best}/{patience})"
+            )
+
+            if (
+                total_steps >= min_total
+                and len(return_window) >= patience
+                and window_min >= threshold
+                and self_ce <= self_ce_eps
+                and chunks_since_best >= patience
+            ):
+                return model.policy
+    finally:
+        train_venv.close()
+        eval_venv.close()
+
+    logger.warning(
+        f"A2C {env_name} did not converge in {max_total} steps "
+        f"(norm_ret={norm_ret:.3f} threshold={threshold})"
+    )
+    return None
+
+
 def _run_ppo_cell(
     env_name: str,
     row: Dict[str, Any],
@@ -148,6 +257,55 @@ def _run_ppo_cell(
     }
 
 
+def _run_a2c_cell(
+    env_name: str,
+    row: Dict[str, Any],
+    seed: int,
+) -> Optional[Dict[str, Any]]:
+    """Train one A2C cell and return {normalized_return, self_ce_on_Doffline}."""
+    conv = env_utils.get_convergence_config(env_name)
+    conv.update(NO_SELF_CE_GATE)
+
+    policy = _train_a2c_until_converged(
+        env_name=env_name,
+        rng=np.random.default_rng(seed),
+        seed=seed,
+        ent_coef=row["kwargs"]["ent_coef"],
+        convergence_override=conv,
+    )
+    if policy is None:
+        return None
+
+    venv = env_utils.make_env(
+        env_name, n_envs=1, rng=np.random.default_rng(seed + 10_000)
+    )
+    try:
+        res = eval_policy_rollout(
+            policy,
+            venv,
+            n_episodes=50,
+            deterministic=True,
+            expert_policy=policy,
+        )
+    finally:
+        venv.close()
+
+    from imitation.experiments.ftrl.env_baselines import REFERENCE_BASELINES
+    ref = REFERENCE_BASELINES[env_name]
+    score_range = ref["expert_score"] - ref["random_score"]
+    norm_ret = (
+        0.0
+        if abs(score_range) < 1e-8
+        else (res.mean_return - ref["random_score"]) / score_range
+    )
+
+    return {
+        "normalized_return": float(norm_ret),
+        "mean_return": float(res.mean_return),
+        "self_ce_on_Doffline": float(res.current_round_ce),
+    }
+
+
 def main() -> None:
     logger.info("expert_self_ce_matrix: starting")
     results: List[Dict[str, Any]] = []
@@ -170,7 +328,7 @@ def main() -> None:
                 if row["trainer"] == "PPO":
                     metrics = _run_ppo_cell(env_name, row, seed)
                 elif row["trainer"] == "A2C":
-                    metrics = None  # implemented in Task 3
+                    metrics = _run_a2c_cell(env_name, row, seed)
                 else:
                     raise ValueError(f"unknown trainer {row['trainer']!r}")
 
