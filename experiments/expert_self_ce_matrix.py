@@ -71,6 +71,83 @@ ROWS: List[Dict[str, Any]] = [
 ]
 
 
+def _run_ppo_cell(
+    env_name: str,
+    row: Dict[str, Any],
+    seed: int,
+) -> Optional[Dict[str, Any]]:
+    """Train one PPO cell and return {normalized_return, self_ce_on_Doffline}.
+
+    Temporarily patches `env_utils.ENV_CONFIGS[env_name]['ppo_kwargs']`
+    with the row's overrides, reuses
+    `expert_training.train_classical_expert_until_converged` with the
+    `NO_SELF_CE_GATE` convergence override, then restores the config.
+
+    Returns None if the cell failed to converge (caller logs a warning
+    and skips).
+    """
+    cfg = env_utils.ENV_CONFIGS[env_name]
+    orig_ppo_kwargs = dict(cfg.get("ppo_kwargs", {}))
+    new_ppo_kwargs = dict(orig_ppo_kwargs)
+    new_ppo_kwargs.update(row["kwargs"])
+    cfg["ppo_kwargs"] = new_ppo_kwargs
+
+    # Build convergence override: inherit env defaults, then disable
+    # the self_ce gate so we can MEASURE the floor without gating on it.
+    conv = env_utils.get_convergence_config(env_name)
+    conv.update(NO_SELF_CE_GATE)
+
+    cache_dir = CACHE_ROOT / row["label"]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        try:
+            policy = expert_training.train_classical_expert_until_converged(
+                env_name=env_name,
+                cache_dir=cache_dir,
+                rng=np.random.default_rng(seed),
+                seed=seed,
+                convergence_override=conv,
+            )
+        except RuntimeError as e:
+            logger.warning(
+                f"PPO cell failed to converge: "
+                f"env={env_name} row={row['row']} seed={seed}: {e}"
+            )
+            return None
+
+        venv = env_utils.make_env(
+            env_name, n_envs=1, rng=np.random.default_rng(seed + 10_000)
+        )
+        try:
+            res = eval_policy_rollout(
+                policy,
+                venv,
+                n_episodes=50,
+                deterministic=True,
+                expert_policy=policy,
+            )
+        finally:
+            venv.close()
+    finally:
+        cfg["ppo_kwargs"] = orig_ppo_kwargs
+
+    from imitation.experiments.ftrl.env_baselines import REFERENCE_BASELINES
+    ref = REFERENCE_BASELINES[env_name]
+    score_range = ref["expert_score"] - ref["random_score"]
+    norm_ret = (
+        0.0
+        if abs(score_range) < 1e-8
+        else (res.mean_return - ref["random_score"]) / score_range
+    )
+
+    return {
+        "normalized_return": float(norm_ret),
+        "mean_return": float(res.mean_return),
+        "self_ce_on_Doffline": float(res.current_round_ce),
+    }
+
+
 def main() -> None:
     logger.info("expert_self_ce_matrix: starting")
     results: List[Dict[str, Any]] = []
@@ -81,12 +158,36 @@ def main() -> None:
                     f"=== env={env_name} row={row['row']} "
                     f"trainer={row['trainer']} seed={seed} ==="
                 )
-                # Body added in Task 2.
-                pass
+                cell_key = {
+                    "env": env_name,
+                    "row": row["row"],
+                    "seed": seed,
+                    "trainer": row["trainer"],
+                    "label": row["label"],
+                    "clip_range": row["kwargs"].get("clip_range"),
+                    "ent_coef": row["kwargs"].get("ent_coef"),
+                }
+                if row["trainer"] == "PPO":
+                    metrics = _run_ppo_cell(env_name, row, seed)
+                elif row["trainer"] == "A2C":
+                    metrics = None  # implemented in Task 3
+                else:
+                    raise ValueError(f"unknown trainer {row['trainer']!r}")
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_PATH, "w") as f:
-        json.dump(results, f, indent=2)
+                if metrics is None:
+                    logger.warning(f"skipping cell {cell_key}")
+                    continue
+
+                results.append({**cell_key, **metrics})
+                # Persist incrementally so a mid-run crash still keeps prior rows.
+                OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(OUTPUT_PATH, "w") as f:
+                    json.dump(results, f, indent=2)
+                logger.info(
+                    f"  -> norm_ret={metrics['normalized_return']:.3f} "
+                    f"self_ce={metrics['self_ce_on_Doffline']:.4f}"
+                )
+
     logger.info(f"wrote {OUTPUT_PATH}")
 
 
