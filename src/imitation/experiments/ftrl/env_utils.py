@@ -149,8 +149,10 @@ ENV_GROUPS: Dict[str, list] = {
     "classical": list(ENV_CONFIGS.keys()),
     # Ordered fastest-to-slowest by expected wall-clock time per experiment.
     # Pong/Breakout have short episodes and converge quickly (SimPLe reached
-    # max Pong/Freeway in 100k interactions). Enduro/MsPacman have long
-    # episodes (thousands of steps) which makes policy eval expensive.
+    # max Pong/Freeway in 100k interactions). MsPacman has long episodes
+    # (thousands of steps) which makes policy eval expensive. Enduro is
+    # excluded: episodes are so long that a single episode (>20k frames)
+    # blows past samples_per_round, producing only 1 round of data per run.
     "atari-zoo": [
         "PongNoFrameskip-v4",
         "BreakoutNoFrameskip-v4",
@@ -159,7 +161,6 @@ ENV_GROUPS: Dict[str, list] = {
         "QbertNoFrameskip-v4",
         "SeaquestNoFrameskip-v4",
         "MsPacmanNoFrameskip-v4",
-        "EnduroNoFrameskip-v4",
     ],
     "atari-fast": [
         "FreewayNoFrameskip-v4",

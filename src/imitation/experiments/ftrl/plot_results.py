@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
@@ -56,6 +57,11 @@ ALGO_LINESTYLES: Dict[str, str] = {
 
 LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger"}  # fixed BC excluded
 
+
+def _env_category(env_name: str) -> str:
+    """Route env to 'atari' or 'classical' output subdir."""
+    return "atari" if "NoFrameskip" in env_name else "classical"
+
 LOSS_SUBTITLE_LINES = [
     (
         r"Loss: $\ell_t(\pi^t) = -\frac{1}{|D_{\mathrm{eval}}^t|}"
@@ -71,12 +77,16 @@ LOSS_SUBTITLE_LINES = [
         r"where $\ell_t(\pi^*)$ is the expert's CE on the same $D_{\mathrm{eval}}^t$."
     ),
     (
-        "BC+DAgger train set = expert-data prefix matched to DAgger's "
-        "cumulative observation count."
+        "x-axis = cumulative expert queries (= transitions labeled by "
+        r"$\pi^*$). Algorithms compared at equal expert-label budget."
     ),
     (
-        "Note: FTL/FTRL use episode-aligned DAgger collection, so obs "
-        "counts vary slightly by env/seed (<5% vs fixed-step BC)."
+        "BC / BC+DAgger slice the expert buffer at exact k*samples_per_round. "
+        "FTL/FTRL+DAgger collect whole episodes, so their grid is"
+    ),
+    (
+        "episode-aligned and can overshoot when episode length > "
+        "samples_per_round (e.g. LunarLander ~900, Taxi ~600)."
     ),
 ]
 
@@ -336,6 +346,24 @@ def _plot_metric(
         ax.set_yscale("log")
     if log_x:
         ax.set_xscale("log")
+        # Dense labeled ticks on log-x. Default matplotlib only labels
+        # decades (1e3, 1e4), which is too sparse for our ~5e2..1e5
+        # range. Major ticks at {1,2,5} per decade (labeled), minor
+        # ticks at {3,4,6,7,8,9} (unlabeled, for gridline density).
+        ax.xaxis.set_major_locator(
+            mticker.LogLocator(base=10.0, subs=(1.0, 2.0, 5.0), numticks=20)
+        )
+        ax.xaxis.set_minor_locator(
+            mticker.LogLocator(
+                base=10.0, subs=(3.0, 4.0, 6.0, 7.0, 8.0, 9.0), numticks=40
+            )
+        )
+        ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+        ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+        ax.tick_params(axis="x", which="major", labelsize=8, rotation=0)
+    # Force x tick labels on every subplot (sharex otherwise hides
+    # labels on all but the bottom axis).
+    ax.tick_params(axis="x", labelbottom=True)
     ax.set_xlabel("Number of Observations" + (" (log)" if log_x else ""))
     ax.set_ylabel(ylabel)
     ax.legend(fontsize=9)
@@ -519,7 +547,9 @@ def plot_all(
     saved_paths = []
     for env_name in sorted(df["env"].unique()):
         safe_name = env_name.replace("/", "_")
-        out_path = pathlib.Path(output_dir) / f"{safe_name}.png"
+        out_path = (
+            pathlib.Path(output_dir) / _env_category(env_name) / f"{safe_name}.png"
+        )
         plot_env(df, env_name, out_path, show_expert_on_loss=show_expert_on_loss)
         saved_paths.append(out_path)
 

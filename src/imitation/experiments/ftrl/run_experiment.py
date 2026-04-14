@@ -24,7 +24,8 @@ import numpy as np
 import torch as th
 
 from imitation.algorithms import bc, ftrl
-from imitation.data import rollout
+from imitation.algorithms.dagger import _save_dagger_demo
+from imitation.data import rollout, serialize, types
 from imitation.experiments.ftrl import env_utils, experts, policy_utils
 from imitation.util import logger as imit_logger
 
@@ -34,10 +35,23 @@ ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_dagger"]
 
 
 def _free_memory() -> None:
-    """Run GC and drop PyTorch's CUDA cache to keep RSS bounded across rounds."""
+    """Run GC, drop PyTorch's CUDA cache, and trim glibc's heap.
+
+    glibc's malloc doesn't automatically return freed pages to the OS,
+    so RSS grows monotonically even when Python objects are collected.
+    ``malloc_trim(0)`` forces the allocator to release pages, preventing
+    RSS from ballooning across experiments and triggering the OOM killer
+    when multiple shards run in parallel.
+    """
     gc.collect()
     if th.cuda.is_available():
         th.cuda.empty_cache()
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Not Linux or libc not found — skip silently
 
 
 def resolve_envs(
@@ -126,7 +140,7 @@ def _compute_round_eval(
     eval_res = eval_policy_rollout(
         policy,
         venv,
-        n_episodes=20,
+        n_episodes=10,
         deterministic=True,
         expert_policy=expert_policy,
     )
@@ -323,7 +337,76 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
     logger.info(f"Saved {out_file} ({elapsed:.1f}s)")
 
     venv.close()
+    _free_memory()
     return result
+
+
+def _truncate_trajectory(traj: types.Trajectory, n: int) -> types.Trajectory:
+    """Return the first ``n`` transitions of ``traj`` as a new Trajectory.
+
+    Mid-episode cut => terminal=False. Used to make each DAgger round contribute
+    exactly samples_per_round expert labels, matching BC / BC+DAgger bookkeeping.
+    """
+    assert 0 < n < len(traj), (n, len(traj))
+    new_infos = None if traj.infos is None else traj.infos[:n]
+    if isinstance(traj, types.TrajectoryWithRew):
+        return dataclasses.replace(
+            traj,
+            obs=traj.obs[: n + 1],
+            acts=traj.acts[:n],
+            infos=new_infos,
+            rews=traj.rews[:n],
+            terminal=False,
+        )
+    return dataclasses.replace(
+        traj,
+        obs=traj.obs[: n + 1],
+        acts=traj.acts[:n],
+        infos=new_infos,
+        terminal=False,
+    )
+
+
+def _truncate_round_demos(
+    round_dir: pathlib.Path, n_target: int, rng: np.random.Generator
+) -> None:
+    """Rewrite ``round_dir`` so the flattened transitions total exactly ``n_target``.
+
+    Keeps whole saved trajectories while their cumulative length <= n_target,
+    then cuts the next trajectory mid-episode to fill the remainder. Matches
+    BC / BC+DAgger which slice upfront-collected transitions to an exact N.
+    """
+    # Demos are saved as HuggingFace dataset directories (suffix is still .npz).
+    demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
+    trajs: List[types.Trajectory] = []
+    for p in demo_paths:
+        trajs.extend(serialize.load(p))
+
+    kept: List[types.Trajectory] = []
+    cum = 0
+    for traj in trajs:
+        if cum + len(traj) <= n_target:
+            kept.append(traj)
+            cum += len(traj)
+            if cum == n_target:
+                break
+        else:
+            remaining = n_target - cum
+            if remaining > 0:
+                kept.append(_truncate_trajectory(traj, remaining))
+                cum = n_target
+            break
+
+    if cum != n_target:
+        raise RuntimeError(
+            f"Round at {round_dir} collected {sum(len(t) for t in trajs)} "
+            f"transitions; only {cum} usable for target {n_target}."
+        )
+
+    for p in demo_paths:
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+    for idx, traj in enumerate(kept):
+        _save_dagger_demo(traj, idx, round_dir, rng, prefix="truncated")
 
 
 def _run_dagger_variant(
@@ -395,8 +478,6 @@ def _run_dagger_variant(
         custom_logger=custom_logger,
     )
 
-    from imitation.data import serialize
-
     d_eval_obs: List[np.ndarray] = []
     d_eval_expert_acts: List[np.ndarray] = []
     rce_history: List[float] = []
@@ -426,29 +507,32 @@ def _run_dagger_variant(
         }
     )
 
-    # Train one round at a time so we can eval + early-stop between rounds.
-    # SB3 SimpleDAggerTrainer.train runs the collect-and-update loop while
-    # total_timestep_count (local to the call) is below total_timesteps, so
-    # calling with total_timesteps=samples_per_round runs exactly one round
-    # per call while preserving self.round_num across calls.
+    # Manual DAgger round: collect learner-on-policy rollouts, truncate this
+    # round's on-disk demos to exactly samples_per_round transitions (matching
+    # BC / BC+DAgger's expert-label bookkeeping), then extend_and_update.
+    # Overshoot beyond samples_per_round is discarded so the x-axis counts
+    # expert labels (DAgger convention), not rolled-out environment steps.
     cum_obs = 0
     stopped_early = False
     for round_num in range(1, config.n_rounds + 1):
-        trainer.train(
-            total_timesteps=config.samples_per_round,
-            rollout_round_min_episodes=1,
-            rollout_round_min_timesteps=config.samples_per_round,
+        collector = trainer.create_trajectory_collector()
+        sample_until = rollout.make_sample_until(
+            min_timesteps=max(config.samples_per_round, trainer.batch_size),
+            min_episodes=1,
+        )
+        rollout.generate_trajectories(
+            policy=expert_policy,
+            venv=collector,
+            sample_until=sample_until,
+            deterministic_policy=True,
+            rng=collector.rng,
         )
 
-        # Reconstruct the just-collected round's obs count from demo files.
-        demo_round = trainer.round_num - 1
-        round_dir = trainer._demo_dir_path_for_round(demo_round)
-        demo_paths = trainer._get_demo_paths(round_dir)
-        round_demos = []
-        for p in demo_paths:
-            round_demos.extend(serialize.load(p))
-        round_transitions = rollout.flatten_trajectories(round_demos)
-        cum_obs += len(round_transitions)
+        round_dir = trainer._demo_dir_path_for_round()
+        _truncate_round_demos(round_dir, config.samples_per_round, rng)
+
+        trainer.extend_and_update({})
+        cum_obs += config.samples_per_round
 
         metrics = list(trainer.get_metrics())
         m = metrics[-1]
@@ -498,11 +582,8 @@ def _run_dagger_variant(
         if stopped_early:
             break
 
-        # Drop references and flush caches so RSS does not accumulate across
-        # rounds. Cached torch allocations and stale ``round_demos`` /
-        # ``round_transitions`` are freed each round; the DAgger dataset
-        # inside the trainer grows cumulatively by design.
-        del round_demos, round_transitions
+        # Flush caches so RSS does not accumulate across rounds. The DAgger
+        # dataset inside the trainer grows cumulatively by design.
         _free_memory()
 
     return per_round
@@ -540,7 +621,7 @@ def _run_bc(
         res = eval_policy_rollout(
             pol,
             venv,
-            n_episodes=20,
+            n_episodes=10,
             deterministic=True,
             expert_policy=expert_policy,
         )
