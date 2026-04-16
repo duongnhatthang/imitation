@@ -55,7 +55,36 @@ ALGO_LINESTYLES: Dict[str, str] = {
     "expert": "--",
 }
 
-LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger"}  # fixed BC excluded
+LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger", "bc"}
+
+
+def _draw_bc_hlines(
+    axes: List[plt.Axes],
+    env_df: pd.DataFrame,
+    metrics: List[str],
+):
+    """Draw BC as horizontal reference lines on the given axes."""
+    bc_df = env_df[env_df["algo"] == "bc"]
+    if bc_df.empty:
+        return
+    bc_row = bc_df.iloc[0]
+    color = ALGO_COLORS.get("bc", "#17a663")
+    linestyle = ALGO_LINESTYLES.get("bc", "--")
+    label = ALGO_LABELS.get("bc", "BC (fixed)")
+
+    for ax, metric in zip(axes, metrics):
+        val = bc_row.get(metric)
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            continue
+        ax.axhline(
+            y=float(val),
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.5,
+            alpha=0.7,
+            label=f"{label} = {float(val):.3f}",
+        )
+        ax.legend(fontsize=9)
 
 
 def _env_category(env_name: str) -> str:
@@ -69,8 +98,8 @@ LOSS_SUBTITLE_LINES = [
         r"$a^*(s)=\arg\max_a \pi^*(a|s).$"
     ),
     (
-        r"$D_{\mathrm{eval}}^t$: aggregated fresh rollouts of the current "
-        r"learner (labeled with expert argmax)."
+        r"$D_{\mathrm{eval}}^t$: 10-episode rollout of the current "
+        r"learner $\pi^t$ (labeled with expert argmax). Not aggregated."
     ),
     (
         r"Cum. regret: $\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
@@ -78,15 +107,7 @@ LOSS_SUBTITLE_LINES = [
     ),
     (
         "x-axis = cumulative expert queries (= transitions labeled by "
-        r"$\pi^*$). Algorithms compared at equal expert-label budget."
-    ),
-    (
-        "BC / BC+DAgger slice the expert buffer at exact k*samples_per_round. "
-        "FTL/FTRL+DAgger collect whole episodes, so their grid is"
-    ),
-    (
-        "episode-aligned and can overshoot when episode length > "
-        "samples_per_round (e.g. LunarLander ~900, Taxi ~600)."
+        r"$\pi^*$). All algorithms evaluated at equal expert-label budget."
     ),
 ]
 
@@ -131,7 +152,10 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
     rows = []
     results_path = pathlib.Path(results_dir)
 
-    for json_file in sorted(results_path.rglob("*.json")):
+    for json_file in sorted(
+        p for p in results_path.rglob("*.json")
+        if not any(part.startswith("_archive") for part in p.parts)
+    ):
         try:
             with open(json_file) as f:
                 data = json.load(f)
@@ -290,6 +314,8 @@ def _plot_metric(
     for algo in algos:
         if allowed_algos is not None and algo not in allowed_algos:
             continue
+        if algo == "bc":
+            continue  # BC drawn as horizontal lines by _draw_bc_hlines
         algo_df = df[df["algo"] == algo]
         valid_df = algo_df.dropna(subset=[metric])
         if valid_df.empty:
@@ -505,6 +531,12 @@ def plot_env(
         r"Cumulative Regret (vs Expert $\pi^*$)",
         log_x=True,
         allowed_algos=LOSS_SUBPLOT_ALGOS,
+    )
+
+    _draw_bc_hlines(
+        [ax1, ax2, ax3, ax4],
+        env_df,
+        ["rollout_cross_entropy", "normalized_return", "disagreement_rate", "cum_regret"],
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
