@@ -284,6 +284,7 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
             "l2_decay": config.l2_decay,
             "n_rounds": config.n_rounds,
             "samples_per_round": config.samples_per_round,
+            "eval_interval": config.eval_interval,
             "warm_start": config.warm_start,
             "beta_rampdown": config.beta_rampdown,
             "bc_n_epochs": config.bc_n_epochs,
@@ -818,12 +819,24 @@ def _worker_init(gpu_queue):
 def _run_single_wrapper(args):
     """Wrapper for multiprocessing.Pool.map (unpacks config)."""
     config = args
-    # Resume support: skip already-completed experiments
+    # Resume support: skip already-completed experiments whose config matches.
     if _is_already_done(config):
         out_file = _result_path(config)
         try:
             with open(out_file) as f:
-                return json.load(f)
+                cached = json.load(f)
+            cached_cfg = cached.get("config", {})
+            if (
+                cached_cfg.get("samples_per_round") == config.samples_per_round
+                and cached_cfg.get("n_rounds") == config.n_rounds
+                and cached_cfg.get("eval_interval") == config.eval_interval
+            ):
+                return cached
+            logger.info(
+                f"Stale result for {config.algo}/{config.env_name}/seed{config.seed} "
+                f"(config mismatch), re-running"
+            )
+            out_file.unlink()
         except (json.JSONDecodeError, IOError):
             pass  # corrupted, re-run
 
@@ -1029,6 +1042,23 @@ def main():
             f"Shard {args.shard_idx}/{args.n_shards}: "
             f"processing {len(all_configs)} of the total configs",
         )
+
+    # Clean stale results from seeds outside the current run.
+    # Prevents old 5-seed files from poisoning a new 3-seed run.
+    expected_seeds = set(range(args.seeds))
+    output_dir = pathlib.Path(args.output_dir)
+    for env_name in args.envs:
+        env_dir = output_dir / env_name.replace("/", "_")
+        if not env_dir.exists():
+            continue
+        for f in env_dir.glob("*.json"):
+            # Extract seed from filename like "ftl_linear_seed4.json"
+            parts = f.stem.rsplit("seed", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                file_seed = int(parts[1])
+                if file_seed not in expected_seeds:
+                    logger.info(f"Removing stale result: {f} (seed {file_seed} not in current run)")
+                    f.unlink()
 
     total_requested = len(all_configs)
 

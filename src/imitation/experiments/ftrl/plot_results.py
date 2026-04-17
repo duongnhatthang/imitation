@@ -207,7 +207,41 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
         f"{df['env'].nunique()} envs, {df['algo'].nunique()} algos, "
         f"{df['seed'].nunique()} seeds"
     )
+
+    _check_stale_data(df)
     return df
+
+
+def _check_stale_data(df: pd.DataFrame) -> None:
+    """Warn if seeds within the same (algo, env) have inconsistent n_observations.
+
+    This catches stale results from a previous run (e.g. different
+    samples_per_round) mixed with current results.
+    """
+    for (algo, env), group in df.groupby(["algo", "env"]):
+        per_seed_rounds = {}
+        for seed, seed_df in group.groupby("seed"):
+            obs_by_round = dict(
+                zip(seed_df["round"], seed_df["n_observations"])
+            )
+            per_seed_rounds[seed] = obs_by_round
+
+        seeds = list(per_seed_rounds.keys())
+        if len(seeds) < 2:
+            continue
+        ref = per_seed_rounds[seeds[0]]
+        for seed in seeds[1:]:
+            other = per_seed_rounds[seed]
+            shared = set(ref.keys()) & set(other.keys())
+            for rnd in shared:
+                if ref[rnd] != other[rnd]:
+                    logger.warning(
+                        f"STALE DATA: {algo}/{env} round {rnd}: "
+                        f"seed {seeds[0]} has n_obs={ref[rnd]}, "
+                        f"seed {seed} has n_obs={other[rnd]}. "
+                        f"Delete old results and re-run."
+                    )
+                    return
 
 
 def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
@@ -340,9 +374,6 @@ def _plot_metric(
                 values = np.maximum(values, y_clip_floor)
             iqm, ci_lo, ci_hi = _compute_iqm_and_ci(values)
             mean_obs = rnd_df["n_observations"].mean()
-            if log_x and mean_obs <= 0:
-                # Drop round 0 from log-x plots (log(0) is -inf).
-                continue
             x_vals.append(mean_obs)
             iqm_vals.append(iqm)
             ci_lows.append(ci_lo)
@@ -371,21 +402,8 @@ def _plot_metric(
     if log_scale:
         ax.set_yscale("log")
     if log_x:
-        ax.set_xscale("log")
-        # Dense labeled ticks on log-x. Default matplotlib only labels
-        # decades (1e3, 1e4), which is too sparse for our ~5e2..1e5
-        # range. Major ticks at {1,2,5} per decade (labeled), minor
-        # ticks at {3,4,6,7,8,9} (unlabeled, for gridline density).
-        ax.xaxis.set_major_locator(
-            mticker.LogLocator(base=10.0, subs=(1.0, 2.0, 5.0), numticks=20)
-        )
-        ax.xaxis.set_minor_locator(
-            mticker.LogLocator(
-                base=10.0, subs=(3.0, 4.0, 6.0, 7.0, 8.0, 9.0), numticks=40
-            )
-        )
+        ax.set_xscale("symlog", linthresh=100)
         ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-        ax.xaxis.set_minor_formatter(mticker.NullFormatter())
         ax.tick_params(axis="x", which="major", labelsize=8, rotation=0)
     # Force x tick labels on every subplot (sharex otherwise hides
     # labels on all but the bottom axis).
