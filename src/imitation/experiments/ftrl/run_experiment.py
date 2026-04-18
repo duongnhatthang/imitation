@@ -106,6 +106,7 @@ class ExperimentConfig:
     output_dir: pathlib.Path
     expert_cache_dir: pathlib.Path
     learning_rate: float = 1e-3
+    result_name_override: Optional[str] = None
     early_stop: bool = False
     early_stop_patience: int = 5
     early_stop_min_delta: float = 0.005
@@ -316,7 +317,7 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
     result["elapsed_seconds"] = round(elapsed, 1)
 
     # Save result
-    out_file = env_dir / f"{config.algo}_{config.policy_mode}_seed{config.seed}.json"
+    out_file = _result_path(config)
     with open(out_file, "w") as f:
         json.dump(result, f, indent=2)
     logger.info(f"Saved {out_file} ({elapsed:.1f}s)")
@@ -791,7 +792,8 @@ def _run_bc_dagger(
 def _result_path(config: ExperimentConfig) -> pathlib.Path:
     """Return the output JSON path for a given experiment config."""
     env_dir = config.output_dir / config.env_name.replace("/", "_")
-    return env_dir / f"{config.algo}_{config.policy_mode}_seed{config.seed}.json"
+    name = config.result_name_override or config.algo
+    return env_dir / f"{name}_{config.policy_mode}_seed{config.seed}.json"
 
 
 def _is_already_done(config: ExperimentConfig) -> bool:

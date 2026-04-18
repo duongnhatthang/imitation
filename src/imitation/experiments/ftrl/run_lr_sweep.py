@@ -270,12 +270,11 @@ def main():
                     )
                 )
 
-    # The result file name includes LR to avoid collisions between LR values.
-    # Override _result_path by embedding LR in the algo name for file naming.
-    # We do this by modifying the algo field to include LR.
+    # Use result_name_override to separate files by LR value.
     for cfg in all_configs:
-        # Encode LR into algo name so each LR gets a separate result file
-        object.__setattr__(cfg, "algo", f"ftl_lr{cfg.learning_rate:.0e}")
+        object.__setattr__(
+            cfg, "result_name_override", f"ftl_lr{cfg.learning_rate:.0e}"
+        )
 
     # Filter already-done configs
     from imitation.experiments.ftrl.run_experiment import _is_already_done
