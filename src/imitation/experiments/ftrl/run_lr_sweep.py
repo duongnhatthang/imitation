@@ -48,26 +48,33 @@ DEFAULT_SAMPLES_PER_ROUND = 50  # small for speed; saturation is LR-dependent
 def detect_t_sat(
     disagreement_rates: List[Optional[float]],
     n_observations: List[int],
-    window: int = 10,
-    abs_delta: float = 0.02,
+    smooth_window: int = 20,
+    rel_change_threshold: float = 0.30,
 ) -> Tuple[Optional[int], Optional[float]]:
     """Detect the observation count at which disagreement rate saturates.
 
-    Uses a rolling-window approach resilient to noise: computes the mean
-    over consecutive windows and declares saturation when the improvement
-    between the first and second half-window drops below ``abs_delta``.
+    Strategy (backward, relative-change on sliding windows):
+      1. Smooth the series with a moving average to remove noise.
+      2. For each position, compute the relative change across a window:
+         ``|max - min| / mean`` over the next ``smooth_window`` points.
+      3. Walk backward from the end; a point is "flat" if the relative
+         change in its window is below ``rel_change_threshold``.
+      4. T_sat = earliest contiguous flat point.
+
+    This correctly distinguishes "slowly declining" (large relative change
+    across a window even if the per-step slope is small) from "truly flat"
+    (values bounce around but don't trend).
 
     Args:
-        disagreement_rates: Per-round disagreement values (None = not evaluated).
+        disagreement_rates: Per-round disagreement values (None = not eval'd).
         n_observations: Per-round cumulative observation counts.
-        window: Number of eval points in each comparison window.
-        abs_delta: Maximum absolute difference between the mean of the first
-            half-window and the mean of the second half-window to declare
-            saturation.
+        smooth_window: Moving-average window for smoothing.
+        rel_change_threshold: Maximum ``(max-min)/mean`` within a window
+            to consider it flat.  0.20 = 20% swing allowed.
 
     Returns:
         (t_sat_obs, saturated_value) or (None, None) if not saturated.
-        ``t_sat_obs`` is the observation count at the start of the plateau.
+        ``t_sat_obs`` is the observation count where the plateau begins.
     """
     # Filter to evaluated points only
     vals = [
@@ -75,23 +82,53 @@ def detect_t_sat(
         for obs, d in zip(n_observations, disagreement_rates)
         if d is not None
     ]
-    if len(vals) < window:
+    if len(vals) < smooth_window + 2:
         return None, None
 
-    half = window // 2
-    for i in range(len(vals) - window + 1):
-        chunk = vals[i : i + window]
-        first_half = [v for _, v in chunk[:half]]
-        second_half = [v for _, v in chunk[half:]]
-        mean_first = float(np.mean(first_half))
-        mean_second = float(np.mean(second_half))
-        # Plateau: second half is within abs_delta of first half (no big drop)
-        if abs(mean_first - mean_second) < abs_delta:
-            sat_obs = chunk[0][0]
-            sat_val = float(np.mean([v for _, v in chunk]))
-            return sat_obs, sat_val
+    obs_arr = np.array([o for o, _ in vals], dtype=float)
+    raw_arr = np.array([d for _, d in vals], dtype=float)
 
-    return None, None
+    # Check for convergence: final level must be meaningfully below initial
+    initial_mean = float(np.mean(raw_arr[:min(3, len(raw_arr))]))
+    final_mean = float(np.mean(raw_arr[-smooth_window:]))
+    if final_mean > 0.8 * initial_mean:
+        return None, None
+
+    # Smooth
+    kernel = np.ones(smooth_window) / smooth_window
+    pad_l = smooth_window // 2
+    pad_r = smooth_window - 1 - pad_l
+    padded = np.pad(raw_arr, (pad_l, pad_r), mode="edge")
+    smoothed = np.convolve(padded, kernel, mode="valid")
+
+    # For each position, compute relative change in its forward window
+    n = len(smoothed)
+    min_start = smooth_window  # skip pre-learning region
+
+    def _is_flat(idx: int) -> bool:
+        end = min(idx + smooth_window, n)
+        window = smoothed[idx:end]
+        wmean = float(np.mean(window))
+        if wmean < 1e-8:
+            return True  # essentially zero
+        rel_change = (float(np.max(window)) - float(np.min(window))) / wmean
+        return rel_change < rel_change_threshold
+
+    # Walk backward from end
+    earliest_flat = n - 1
+    for i in range(n - 1, min_start - 1, -1):
+        if _is_flat(i):
+            earliest_flat = i
+        else:
+            break
+
+    # Must have found a plateau of at least a few points past min_start
+    if earliest_flat >= n - 2 or earliest_flat < min_start:
+        return None, None
+
+    sat_obs = int(obs_arr[earliest_flat])
+    sat_val = float(np.mean(smoothed[earliest_flat:]))
+    return sat_obs, sat_val
 
 
 def detect_best_value(
@@ -130,50 +167,85 @@ def analyze_sweep_results(
             all_disagree = []
             all_t_sat = []
             all_best = []
+            # Collect per-seed best values
+            all_best = []
             for sr in seed_results:
-                per_round = sr["per_round"]
-                n_obs = [p["n_observations"] for p in per_round]
-                disagree = [p.get("disagreement_rate") for p in per_round]
-                t_sat, sat_val = detect_t_sat(disagree, n_obs)
-                best_val = detect_best_value(disagree)
-                all_disagree.append(disagree)
-                all_t_sat.append(t_sat)
-                all_best.append(best_val)
+                disagree = [p.get("disagreement_rate") for p in sr["per_round"]]
+                all_best.append(detect_best_value(disagree))
 
             # Mean best disagreement across seeds
             valid_best = [b for b in all_best if b is not None]
             mean_best = float(np.mean(valid_best)) if valid_best else None
-            # Median T_sat (None if majority didn't saturate)
-            valid_t_sat = [t for t in all_t_sat if t is not None]
-            median_t_sat = (
-                int(np.median(valid_t_sat))
-                if len(valid_t_sat) > len(all_t_sat) / 2
-                else None
-            )
+
+            # T_sat on the mean curve (not per-seed)
+            # Build mean disagreement per round across seeds
+            by_round: Dict[int, List[float]] = {}
+            by_round_obs: Dict[int, List[int]] = {}
+            for sr in seed_results:
+                for p in sr["per_round"]:
+                    r = p["round"]
+                    d = p.get("disagreement_rate")
+                    if d is not None:
+                        by_round.setdefault(r, []).append(d)
+                        by_round_obs.setdefault(r, []).append(p["n_observations"])
+
+            rounds_sorted = sorted(by_round.keys())
+            mean_disagree = [float(np.mean(by_round[r])) for r in rounds_sorted]
+            mean_obs = [int(np.mean(by_round_obs[r])) for r in rounds_sorted]
+            t_sat, sat_val = detect_t_sat(mean_disagree, mean_obs)
+
             lr_summaries.append({
                 "lr": lr,
                 "mean_best_disagreement": mean_best,
-                "median_t_sat": median_t_sat,
+                "t_sat": t_sat,
+                "sat_val": round(sat_val, 6) if sat_val is not None else None,
                 "n_seeds": len(seed_results),
-                "n_saturated": len(valid_t_sat),
                 "per_seed_best": all_best,
-                "per_seed_t_sat": all_t_sat,
             })
 
-        # Pick best LR: lowest mean_best_disagreement, tie-break by earliest T_sat
+        # Rank LRs: smallest T_sat among those reaching near-best performance.
+        # "Near-best" = within 2x of the overall best disagreement rate.
+        all_best_d = [
+            s["mean_best_disagreement"]
+            for s in lr_summaries
+            if s["mean_best_disagreement"] is not None
+        ]
+        best_d_overall = min(all_best_d) if all_best_d else 1e9
+        near_best_threshold = max(best_d_overall * 2, best_d_overall + 0.01)
+
+        # Competitive LRs: those within threshold
+        competitive = [
+            s for s in lr_summaries
+            if s["mean_best_disagreement"] is not None
+            and s["mean_best_disagreement"] <= near_best_threshold
+        ]
+        if not competitive:
+            competitive = lr_summaries
+
+        # Among competitive, rank by T_sat (earliest first), then by disagree
         ranked = sorted(
+            competitive,
+            key=lambda s: (
+                s["t_sat"] if s["t_sat"] is not None else 1e9,
+                s["mean_best_disagreement"] if s["mean_best_disagreement"] is not None else 1e9,
+            ),
+        )
+        # Full ranking for display (all LRs, same sort key)
+        full_ranked = sorted(
             lr_summaries,
             key=lambda s: (
+                s["t_sat"] if s["t_sat"] is not None else 1e9,
                 s["mean_best_disagreement"] if s["mean_best_disagreement"] is not None else 1e9,
-                s["median_t_sat"] if s["median_t_sat"] is not None else 1e9,
             ),
         )
         best = ranked[0]
         calibration[env_name] = {
             "best_lr": best["lr"],
             "best_disagreement": best["mean_best_disagreement"],
-            "best_t_sat": best["median_t_sat"],
+            "best_t_sat": best["t_sat"],
+            "near_best_threshold": round(near_best_threshold, 6),
             "all_lr_results": lr_summaries,
+            "ranked": full_ranked,
         }
 
     return calibration
@@ -190,15 +262,42 @@ def print_sweep_summary(calibration: Dict[str, Any]) -> None:
         print(f"  {env_name}")
         print(f"  Best LR: {cal['best_lr']:.0e}  |  "
               f"Best disagreement: {cal['best_disagreement']:.4f}  |  "
-              f"T_sat: {cal['best_t_sat']}")
+              f"T_sat: {cal['best_t_sat']}  |  "
+              f"Near-best threshold: {cal['near_best_threshold']:.4f}")
+
+        # Table sorted by LR value
+        print(f"\n  By LR value:")
         print(f"  {'LR':<10} {'Best Disagree':<18} {'T_sat (obs)':<14} "
-              f"{'Saturated':<12} {'Seeds'}")
+              f"{'Sat Level':<14} {'Seeds'}")
         print(f"  {'─' * 70}")
         for s in cal["all_lr_results"]:
             best_d = f"{s['mean_best_disagreement']:.4f}" if s["mean_best_disagreement"] is not None else "N/A"
-            t_sat = str(s["median_t_sat"]) if s["median_t_sat"] is not None else "N/A"
+            t_sat = str(s["t_sat"]) if s["t_sat"] is not None else "N/A"
+            sat_v = f"{s['sat_val']:.4f}" if s.get("sat_val") is not None else "N/A"
+            competitive = (
+                s["mean_best_disagreement"] is not None
+                and s["mean_best_disagreement"] <= cal["near_best_threshold"]
+            )
+            marker = " *" if competitive else ""
             print(f"  {s['lr']:<10.0e} {best_d:<18} {t_sat:<14} "
-                  f"{s['n_saturated']}/{s['n_seeds']:<10} {s['n_seeds']}")
+                  f"{sat_v:<14} {s['n_seeds']}{marker}")
+
+        # Ranking: sorted by T_sat (fastest to reach good performance)
+        print(f"\n  Ranking (fastest T_sat among near-best, marked with *):")
+        print(f"  {'Rank':<6} {'LR':<10} {'T_sat (obs)':<14} "
+              f"{'Best Disagree':<18} {'Competitive'}")
+        print(f"  {'─' * 70}")
+        for rank, s in enumerate(cal["ranked"], 1):
+            best_d = f"{s['mean_best_disagreement']:.4f}" if s["mean_best_disagreement"] is not None else "N/A"
+            t_sat = str(s["t_sat"]) if s["t_sat"] is not None else "N/A"
+            competitive = (
+                s["mean_best_disagreement"] is not None
+                and s["mean_best_disagreement"] <= cal["near_best_threshold"]
+            )
+            tag = "yes *" if competitive else "no"
+            winner = " << BEST" if rank == 1 and s["lr"] == cal["best_lr"] else ""
+            print(f"  {rank:<6} {s['lr']:<10.0e} {t_sat:<14} "
+                  f"{best_d:<18} {tag}{winner}")
 
     print("\n" + "=" * 90)
 
