@@ -105,6 +105,7 @@ class ExperimentConfig:
     eval_interval: int
     output_dir: pathlib.Path
     expert_cache_dir: pathlib.Path
+    learning_rate: float = 1e-3
     early_stop: bool = False
     early_stop_patience: int = 5
     early_stop_min_delta: float = 0.005
@@ -288,6 +289,7 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
             "warm_start": config.warm_start,
             "beta_rampdown": config.beta_rampdown,
             "bc_n_epochs": config.bc_n_epochs,
+            "learning_rate": config.learning_rate,
         },
         "baselines": baselines,
         "per_round": [],
@@ -435,6 +437,7 @@ def _run_dagger_variant(
         action_space=venv.action_space,
         rng=rng,
         policy=policy,
+        optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
     )
 
@@ -604,6 +607,7 @@ def _run_bc(
         policy=policy,
         demonstrations=all_transitions,
         batch_size=min(32, len(all_transitions)),
+        optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
     )
     bc_trainer.train(n_epochs=config.bc_n_epochs)
@@ -750,6 +754,7 @@ def _run_bc_dagger(
             policy=policy,
             demonstrations=prefix,
             batch_size=min(32, len(prefix)),
+            optimizer_kwargs={"lr": config.learning_rate},
             custom_logger=custom_logger,
         )
         bc_trainer.train(n_epochs=config.bc_n_epochs)
@@ -885,6 +890,7 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         eval_interval=args.eval_interval,
                         output_dir=pathlib.Path(args.output_dir),
                         expert_cache_dir=pathlib.Path(args.expert_cache_dir),
+                        learning_rate=args.learning_rate,
                         early_stop=args.early_stop,
                         early_stop_patience=args.early_stop_patience,
                         early_stop_min_delta=args.early_stop_min_delta,
@@ -981,6 +987,12 @@ def main():
     )
     parser.add_argument(
         "--bc-n-epochs", type=int, default=20, help="Number of BC training epochs"
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-3,
+        help="Learning rate for BC optimizer (default: 1e-3)",
     )
     parser.add_argument(
         "--eval-interval",
