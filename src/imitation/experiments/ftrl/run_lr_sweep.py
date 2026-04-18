@@ -47,39 +47,49 @@ DEFAULT_SAMPLES_PER_ROUND = 50  # small for speed; saturation is LR-dependent
 
 def detect_t_sat(
     disagreement_rates: List[Optional[float]],
-    rounds: List[int],
-    patience: int = 5,
-    rel_delta: float = 0.02,
+    n_observations: List[int],
+    window: int = 10,
+    abs_delta: float = 0.02,
 ) -> Tuple[Optional[int], Optional[float]]:
-    """Detect the round at which disagreement rate saturates.
+    """Detect the observation count at which disagreement rate saturates.
 
-    Saturation is defined as the first eval point after which the metric
-    does not improve by more than ``rel_delta`` (relative) for
-    ``patience`` consecutive eval points.
+    Uses a rolling-window approach resilient to noise: computes the mean
+    over consecutive windows and declares saturation when the improvement
+    between the first and second half-window drops below ``abs_delta``.
+
+    Args:
+        disagreement_rates: Per-round disagreement values (None = not evaluated).
+        n_observations: Per-round cumulative observation counts.
+        window: Number of eval points in each comparison window.
+        abs_delta: Maximum absolute difference between the mean of the first
+            half-window and the mean of the second half-window to declare
+            saturation.
 
     Returns:
-        (t_sat_round, saturated_value) or (None, None) if not saturated.
+        (t_sat_obs, saturated_value) or (None, None) if not saturated.
+        ``t_sat_obs`` is the observation count at the start of the plateau.
     """
-    # Filter to evaluated rounds only (non-None disagreement_rate)
+    # Filter to evaluated points only
     vals = [
-        (r, d)
-        for r, d in zip(rounds, disagreement_rates)
+        (obs, d)
+        for obs, d in zip(n_observations, disagreement_rates)
         if d is not None
     ]
-    if len(vals) < patience + 1:
+    if len(vals) < window:
         return None, None
 
-    for i in range(len(vals) - patience):
-        base_round, base_val = vals[i]
-        # Check if all subsequent `patience` points are within rel_delta
-        saturated = True
-        for j in range(1, patience + 1):
-            _, later_val = vals[i + j]
-            if base_val > 0 and abs(later_val - base_val) / base_val > rel_delta:
-                saturated = False
-                break
-        if saturated:
-            return base_round, base_val
+    half = window // 2
+    for i in range(len(vals) - window + 1):
+        chunk = vals[i : i + window]
+        first_half = [v for _, v in chunk[:half]]
+        second_half = [v for _, v in chunk[half:]]
+        mean_first = float(np.mean(first_half))
+        mean_second = float(np.mean(second_half))
+        # Plateau: second half is within abs_delta of first half (no big drop)
+        if abs(mean_first - mean_second) < abs_delta:
+            sat_obs = chunk[0][0]
+            sat_val = float(np.mean([v for _, v in chunk]))
+            return sat_obs, sat_val
 
     return None, None
 
@@ -122,9 +132,9 @@ def analyze_sweep_results(
             all_best = []
             for sr in seed_results:
                 per_round = sr["per_round"]
-                rounds = [p["round"] for p in per_round]
+                n_obs = [p["n_observations"] for p in per_round]
                 disagree = [p.get("disagreement_rate") for p in per_round]
-                t_sat, sat_val = detect_t_sat(disagree, rounds)
+                t_sat, sat_val = detect_t_sat(disagree, n_obs)
                 best_val = detect_best_value(disagree)
                 all_disagree.append(disagree)
                 all_t_sat.append(t_sat)
@@ -181,13 +191,13 @@ def print_sweep_summary(calibration: Dict[str, Any]) -> None:
         print(f"  Best LR: {cal['best_lr']:.0e}  |  "
               f"Best disagreement: {cal['best_disagreement']:.4f}  |  "
               f"T_sat: {cal['best_t_sat']}")
-        print(f"  {'LR':<10} {'Best Disagree':<18} {'T_sat':<10} "
+        print(f"  {'LR':<10} {'Best Disagree':<18} {'T_sat (obs)':<14} "
               f"{'Saturated':<12} {'Seeds'}")
         print(f"  {'─' * 70}")
         for s in cal["all_lr_results"]:
             best_d = f"{s['mean_best_disagreement']:.4f}" if s["mean_best_disagreement"] is not None else "N/A"
             t_sat = str(s["median_t_sat"]) if s["median_t_sat"] is not None else "N/A"
-            print(f"  {s['lr']:<10.0e} {best_d:<18} {t_sat:<10} "
+            print(f"  {s['lr']:<10.0e} {best_d:<18} {t_sat:<14} "
                   f"{s['n_saturated']}/{s['n_seeds']:<10} {s['n_seeds']}")
 
     print("\n" + "=" * 90)
