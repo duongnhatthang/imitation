@@ -790,8 +790,26 @@ def _result_path(config: ExperimentConfig) -> pathlib.Path:
 
 
 def _is_already_done(config: ExperimentConfig) -> bool:
-    """Check if this experiment has already been run (result JSON exists)."""
-    return _result_path(config).exists()
+    """Check if this experiment has already been run with matching config.
+
+    Checks that the result JSON exists AND that its stored config matches the
+    current ``samples_per_round``, ``n_rounds``, and ``eval_interval``.  This
+    prevents stale results from a previous run with different parameters from
+    being silently reused.
+    """
+    out_file = _result_path(config)
+    if not out_file.exists():
+        return False
+    try:
+        with open(out_file) as f:
+            cached_cfg = json.load(f).get("config", {})
+        return (
+            cached_cfg.get("samples_per_round") == config.samples_per_round
+            and cached_cfg.get("n_rounds") == config.n_rounds
+            and cached_cfg.get("eval_interval") == config.eval_interval
+        )
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
 _WORKER_GPU_ID: Optional[int] = None
@@ -824,19 +842,9 @@ def _run_single_wrapper(args):
         out_file = _result_path(config)
         try:
             with open(out_file) as f:
-                cached = json.load(f)
-            cached_cfg = cached.get("config", {})
-            if (
-                cached_cfg.get("samples_per_round") == config.samples_per_round
-                and cached_cfg.get("n_rounds") == config.n_rounds
-                and cached_cfg.get("eval_interval") == config.eval_interval
-            ):
-                return cached
-            logger.info(
-                f"Stale result for {config.algo}/{config.env_name}/seed{config.seed} "
-                f"(config mismatch), re-running"
-            )
-            out_file.unlink()
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
         except (json.JSONDecodeError, IOError):
             pass  # corrupted, re-run
 
