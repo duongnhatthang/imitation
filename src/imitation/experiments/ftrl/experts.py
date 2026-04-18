@@ -53,7 +53,8 @@ def get_or_train_expert(
     # Load cached model if available
     if model_file.exists():
         logger.info(f"Loading cached expert from {model_file}")
-        model = PPO.load(model_file, env=venv)
+        device = "auto" if env_utils.is_atari(env_name) else "cpu"
+        model = PPO.load(model_file, env=venv, device=device)
         return model.policy
 
     if env_utils.is_atari(env_name):
