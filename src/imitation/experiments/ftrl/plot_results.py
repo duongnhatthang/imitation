@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
@@ -54,7 +55,41 @@ ALGO_LINESTYLES: Dict[str, str] = {
     "expert": "--",
 }
 
-LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger"}  # fixed BC excluded
+LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger", "bc"}
+
+
+def _draw_bc_hlines(
+    axes: List[plt.Axes],
+    env_df: pd.DataFrame,
+    metrics: List[str],
+):
+    """Draw BC as horizontal reference lines on the given axes."""
+    bc_df = env_df[env_df["algo"] == "bc"]
+    if bc_df.empty:
+        return
+    bc_row = bc_df.iloc[0]
+    color = ALGO_COLORS.get("bc", "#17a663")
+    linestyle = ALGO_LINESTYLES.get("bc", "--")
+    label = ALGO_LABELS.get("bc", "BC (fixed)")
+
+    for ax, metric in zip(axes, metrics):
+        val = bc_row.get(metric)
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            continue
+        ax.axhline(
+            y=float(val),
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.5,
+            alpha=0.7,
+            label=f"{label} = {float(val):.3f}",
+        )
+        ax.legend(fontsize=9)
+
+
+def _env_category(env_name: str) -> str:
+    """Route env to 'atari' or 'classical' output subdir."""
+    return "atari" if "NoFrameskip" in env_name else "classical"
 
 LOSS_SUBTITLE_LINES = [
     (
@@ -63,20 +98,16 @@ LOSS_SUBTITLE_LINES = [
         r"$a^*(s)=\arg\max_a \pi^*(a|s).$"
     ),
     (
-        r"$D_{\mathrm{eval}}^t$: aggregated fresh rollouts of the current "
-        r"learner (labeled with expert argmax)."
+        r"$D_{\mathrm{eval}}^t$: 10-episode rollout of the current "
+        r"learner $\pi^t$ (labeled with expert argmax). Not aggregated."
     ),
     (
         r"Cum. regret: $\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
         r"where $\ell_t(\pi^*)$ is the expert's CE on the same $D_{\mathrm{eval}}^t$."
     ),
     (
-        "BC+DAgger train set = expert-data prefix matched to DAgger's "
-        "cumulative observation count."
-    ),
-    (
-        "Note: FTL/FTRL use episode-aligned DAgger collection, so obs "
-        "counts vary slightly by env/seed (<5% vs fixed-step BC)."
+        "x-axis = cumulative expert queries (= transitions labeled by "
+        r"$\pi^*$). All algorithms evaluated at equal expert-label budget."
     ),
 ]
 
@@ -121,7 +152,10 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
     rows = []
     results_path = pathlib.Path(results_dir)
 
-    for json_file in sorted(results_path.rglob("*.json")):
+    for json_file in sorted(
+        p for p in results_path.rglob("*.json")
+        if not any(part.startswith("_archive") for part in p.parts)
+    ):
         try:
             with open(json_file) as f:
                 data = json.load(f)
@@ -173,7 +207,41 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
         f"{df['env'].nunique()} envs, {df['algo'].nunique()} algos, "
         f"{df['seed'].nunique()} seeds"
     )
+
+    _check_stale_data(df)
     return df
+
+
+def _check_stale_data(df: pd.DataFrame) -> None:
+    """Warn if seeds within the same (algo, env) have inconsistent n_observations.
+
+    This catches stale results from a previous run (e.g. different
+    samples_per_round) mixed with current results.
+    """
+    for (algo, env), group in df.groupby(["algo", "env"]):
+        per_seed_rounds = {}
+        for seed, seed_df in group.groupby("seed"):
+            obs_by_round = dict(
+                zip(seed_df["round"], seed_df["n_observations"])
+            )
+            per_seed_rounds[seed] = obs_by_round
+
+        seeds = list(per_seed_rounds.keys())
+        if len(seeds) < 2:
+            continue
+        ref = per_seed_rounds[seeds[0]]
+        for seed in seeds[1:]:
+            other = per_seed_rounds[seed]
+            shared = set(ref.keys()) & set(other.keys())
+            for rnd in shared:
+                if ref[rnd] != other[rnd]:
+                    logger.warning(
+                        f"STALE DATA: {algo}/{env} round {rnd}: "
+                        f"seed {seeds[0]} has n_obs={ref[rnd]}, "
+                        f"seed {seed} has n_obs={other[rnd]}. "
+                        f"Delete old results and re-run."
+                    )
+                    return
 
 
 def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
@@ -280,6 +348,8 @@ def _plot_metric(
     for algo in algos:
         if allowed_algos is not None and algo not in allowed_algos:
             continue
+        if algo == "bc":
+            continue  # BC drawn as horizontal lines by _draw_bc_hlines
         algo_df = df[df["algo"] == algo]
         valid_df = algo_df.dropna(subset=[metric])
         if valid_df.empty:
@@ -304,9 +374,6 @@ def _plot_metric(
                 values = np.maximum(values, y_clip_floor)
             iqm, ci_lo, ci_hi = _compute_iqm_and_ci(values)
             mean_obs = rnd_df["n_observations"].mean()
-            if log_x and mean_obs <= 0:
-                # Drop round 0 from log-x plots (log(0) is -inf).
-                continue
             x_vals.append(mean_obs)
             iqm_vals.append(iqm)
             ci_lows.append(ci_lo)
@@ -335,7 +402,12 @@ def _plot_metric(
     if log_scale:
         ax.set_yscale("log")
     if log_x:
-        ax.set_xscale("log")
+        ax.set_xscale("symlog", linthresh=100)
+        ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+        ax.tick_params(axis="x", which="major", labelsize=8, rotation=0)
+    # Force x tick labels on every subplot (sharex otherwise hides
+    # labels on all but the bottom axis).
+    ax.tick_params(axis="x", labelbottom=True)
     ax.set_xlabel("Number of Observations" + (" (log)" if log_x else ""))
     ax.set_ylabel(ylabel)
     ax.legend(fontsize=9)
@@ -479,6 +551,12 @@ def plot_env(
         allowed_algos=LOSS_SUBPLOT_ALGOS,
     )
 
+    _draw_bc_hlines(
+        [ax1, ax2, ax3, ax4],
+        env_df,
+        ["rollout_cross_entropy", "normalized_return", "disagreement_rate", "cum_regret"],
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # No bbox_inches="tight" — we deliberately reserved the top 12% for
     # title + subtitle via subplots_adjust, and tight-cropping would
@@ -519,7 +597,9 @@ def plot_all(
     saved_paths = []
     for env_name in sorted(df["env"].unique()):
         safe_name = env_name.replace("/", "_")
-        out_path = pathlib.Path(output_dir) / f"{safe_name}.png"
+        out_path = (
+            pathlib.Path(output_dir) / _env_category(env_name) / f"{safe_name}.png"
+        )
         plot_env(df, env_name, out_path, show_expert_on_loss=show_expert_on_loss)
         saved_paths.append(out_path)
 
