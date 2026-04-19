@@ -18,7 +18,7 @@ import argparse
 import json
 import logging
 import pathlib
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -419,6 +419,7 @@ def plot_env(
     env_name: str,
     output_path: pathlib.Path,
     show_expert_on_loss: bool = True,
+    calibration: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Generate a 4-subplot figure for one environment.
 
@@ -470,10 +471,19 @@ def plot_env(
         fontweight="bold",
         y=0.98,
     )
+    # Add calibration info line if available
+    cal_line = ""
+    if calibration:
+        lr = calibration.get("best_lr")
+        t_sat = calibration.get("best_t_sat")
+        lr_str = f"lr={lr:.0e}" if lr is not None else "lr=default"
+        t_sat_str = f"T_sat={t_sat} obs" if t_sat is not None else "T_sat=N/A"
+        cal_line = f"\nCalibrated: {lr_str},  {t_sat_str},  max_obs=2×T_sat"
+
     fig.text(
         0.5,
         0.955,
-        subtitle_text,
+        subtitle_text + cal_line,
         ha="center",
         va="top",
         fontsize=10,
@@ -571,6 +581,7 @@ def plot_all(
     output_dir: pathlib.Path,
     envs: Optional[List[str]] = None,
     show_expert_on_loss: bool = True,
+    calibration_data: Optional[Dict[str, Any]] = None,
 ) -> List[pathlib.Path]:
     """Generate plots for all environments.
 
@@ -579,6 +590,7 @@ def plot_all(
         output_dir: Directory to save PNG plots.
         envs: Optional list of envs to filter. If None, plots all found.
         show_expert_on_loss: Forwarded to ``plot_env``.
+        calibration_data: Optional dict from lr_calibration.json, keyed by env.
 
     Returns:
         List of saved plot file paths.
@@ -600,7 +612,12 @@ def plot_all(
         out_path = (
             pathlib.Path(output_dir) / _env_category(env_name) / f"{safe_name}.png"
         )
-        plot_env(df, env_name, out_path, show_expert_on_loss=show_expert_on_loss)
+        cal = (calibration_data or {}).get(env_name)
+        plot_env(
+            df, env_name, out_path,
+            show_expert_on_loss=show_expert_on_loss,
+            calibration=cal,
+        )
         saved_paths.append(out_path)
 
     return saved_paths
@@ -641,6 +658,12 @@ def main():
         action="store_false",
         help="Hide expert self-CE on the loss subplot",
     )
+    parser.add_argument(
+        "--calibration-file",
+        type=str,
+        default=None,
+        help="Path to lr_calibration.json for displaying LR and T_sat in titles",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -648,11 +671,17 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    calibration_data = None
+    if args.calibration_file:
+        with open(args.calibration_file) as f:
+            calibration_data = json.load(f)
+
     paths = plot_all(
         pathlib.Path(args.results_dir),
         pathlib.Path(args.output_dir),
         envs=args.envs,
         show_expert_on_loss=args.show_expert_on_loss,
+        calibration_data=calibration_data,
     )
     if paths:
         logger.info(f"Generated {len(paths)} plots in {args.output_dir}")
