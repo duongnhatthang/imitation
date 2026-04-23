@@ -197,8 +197,8 @@ def test_run_bc_taxi(tmp_path):
     assert len(result["per_round"]) >= 1
 
 
-def test_bc_subsample_strategy_uniform_shuffles(tmp_path):
-    """With strategy='uniform', BC should train on a shuffled subset.
+def test_collect_and_subsample_uniform_samples_without_replacement(tmp_path):
+    """With strategy='uniform', BC samples without replacement from the pool.
 
     We run two BC configs with the same seed but strategy='uniform' vs
     'prefix' and assert they produce different round-1 n_observations
@@ -227,3 +227,49 @@ def test_bc_subsample_strategy_uniform_shuffles(tmp_path):
     assert len(uniform) == 50
     assert set(uniform).issubset(set(fake_txns))
     assert len(set(uniform)) == 50  # no duplicates
+
+
+def test_collect_and_subsample_preserves_transitions_type():
+    """Uniform subsampling over a Transitions object preserves type and shapes."""
+    from imitation.data import types
+    from imitation.experiments.ftrl.run_experiment import (
+        _collect_and_subsample_transitions,
+    )
+    import numpy as np
+
+    n = 40
+    obs = np.arange(n * 4, dtype=np.float32).reshape(n, 4)
+    next_obs = obs + 1.0
+    acts = np.arange(n, dtype=np.int64)
+    dones = np.zeros(n, dtype=bool)
+    infos = np.array([{} for _ in range(n)])
+    trans = types.Transitions(
+        obs=obs, acts=acts, infos=infos, next_obs=next_obs, dones=dones,
+    )
+
+    rng = np.random.default_rng(7)
+    out = _collect_and_subsample_transitions(
+        trans, n_target=10, strategy="uniform", rng=rng,
+    )
+
+    # Type preserved
+    assert isinstance(out, types.Transitions)
+    # Length matches n_target for all fields
+    assert len(out.obs) == 10
+    assert len(out.acts) == 10
+    assert len(out.next_obs) == 10
+    assert len(out.dones) == 10
+    assert len(out.infos) == 10
+    # Selected indices are a subset of the original pool
+    selected = set(int(a) for a in out.acts)
+    assert selected.issubset(set(range(n)))
+    assert len(selected) == 10  # no duplicates
+    # next_obs still paired correctly: next_obs[i] == obs[i] + 1
+    np.testing.assert_allclose(out.next_obs, out.obs + 1.0)
+
+    # And prefix strategy returns the first 10
+    rng2 = np.random.default_rng(7)
+    prefix = _collect_and_subsample_transitions(
+        trans, n_target=10, strategy="prefix", rng=rng2,
+    )
+    np.testing.assert_array_equal(prefix.acts, np.arange(10))

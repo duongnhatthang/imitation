@@ -18,7 +18,7 @@ import os
 import pathlib
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch as th
@@ -564,11 +564,11 @@ def _run_dagger_variant(
 
 
 def _collect_and_subsample_transitions(
-    all_transitions,
+    all_transitions: "Union[types.TransitionsMinimal, list]",
     n_target: int,
     strategy: str,
     rng: np.random.Generator,
-):
+) -> "Union[types.TransitionsMinimal, list]":
     """Select n_target transitions from ``all_transitions``.
 
     "prefix"  → return ``all_transitions[:n_target]`` (original behavior).
