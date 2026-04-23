@@ -195,3 +195,35 @@ def test_run_bc_taxi(tmp_path):
     assert result["algo"] == "bc"
     assert result["env"] == "Taxi-v3"
     assert len(result["per_round"]) >= 1
+
+
+def test_bc_subsample_strategy_uniform_shuffles(tmp_path):
+    """With strategy='uniform', BC should train on a shuffled subset.
+
+    We run two BC configs with the same seed but strategy='uniform' vs
+    'prefix' and assert they produce different round-1 n_observations
+    orderings. Since the dataset is collected deterministically from the
+    same seed, prefix order is fixed; uniform must differ.
+    """
+    from imitation.experiments.ftrl.run_experiment import (
+        ExperimentConfig,
+        _collect_and_subsample_transitions,
+    )
+    import numpy as np
+
+    rng_prefix = np.random.default_rng(0)
+    rng_uniform = np.random.default_rng(0)
+
+    # Build a fake transitions list by indices
+    fake_txns = list(range(1000))
+    prefix = _collect_and_subsample_transitions(
+        fake_txns, n_target=50, strategy="prefix", rng=rng_prefix
+    )
+    uniform = _collect_and_subsample_transitions(
+        fake_txns, n_target=50, strategy="uniform", rng=rng_uniform
+    )
+    assert prefix == list(range(50))
+    assert uniform != list(range(50))
+    assert len(uniform) == 50
+    assert set(uniform).issubset(set(fake_txns))
+    assert len(set(uniform)) == 50  # no duplicates

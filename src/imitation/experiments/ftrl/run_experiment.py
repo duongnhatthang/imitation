@@ -110,6 +110,7 @@ class ExperimentConfig:
     early_stop: bool = False
     early_stop_patience: int = 5
     early_stop_min_delta: float = 0.005
+    subsample_strategy: str = "uniform"  # "uniform" or "prefix"
 
 
 def _compute_round_eval(
@@ -562,6 +563,41 @@ def _run_dagger_variant(
     return per_round
 
 
+def _collect_and_subsample_transitions(
+    all_transitions,
+    n_target: int,
+    strategy: str,
+    rng: np.random.Generator,
+):
+    """Select n_target transitions from ``all_transitions``.
+
+    "prefix"  → return ``all_transitions[:n_target]`` (original behavior).
+    "uniform" → return ``n_target`` transitions picked uniformly without
+                replacement across the full pool.
+    """
+    if strategy == "prefix":
+        return all_transitions[:n_target]
+    if strategy == "uniform":
+        if len(all_transitions) < n_target:
+            raise ValueError(
+                f"uniform subsample needs {n_target} transitions, "
+                f"pool has {len(all_transitions)}"
+            )
+        idx = rng.choice(len(all_transitions), size=n_target, replace=False)
+        idx.sort()  # stable order for reproducibility across backends
+        if isinstance(all_transitions, types.TransitionsMinimal):
+            # Build a new Transitions(-like) dataclass with each numpy field
+            # gathered by the index array. ``__getitem__`` only supports
+            # int/slice, so we replace fields directly.
+            field_updates = {
+                f.name: getattr(all_transitions, f.name)[idx]
+                for f in dataclasses.fields(all_transitions)
+            }
+            return dataclasses.replace(all_transitions, **field_updates)
+        return [all_transitions[i] for i in idx]
+    raise ValueError(f"Unknown subsample strategy: {strategy!r}")
+
+
 def _run_bc(
     config: ExperimentConfig,
     venv,
@@ -595,7 +631,12 @@ def _run_bc(
     )
     all_transitions = rollout.flatten_trajectories(list(trajs))
     if len(all_transitions) > total_timesteps:
-        all_transitions = all_transitions[:total_timesteps]
+        all_transitions = _collect_and_subsample_transitions(
+            all_transitions,
+            n_target=total_timesteps,
+            strategy=config.subsample_strategy,
+            rng=rng,
+        )
 
     custom_logger = imit_logger.configure(
         str(config.output_dir / "tb" / f"bc_{config.env_name}_{config.seed}"),
@@ -665,10 +706,15 @@ def _run_bc_dagger(
     all_transitions = rollout.flatten_trajectories(list(trajs))
     if len(all_transitions) < total_timesteps:
         raise RuntimeError(
-            f"BC (growing dataset): collected {len(all_transitions)} transitions, "
-            f"need {total_timesteps}"
+            f"BC (growing dataset): collected {len(all_transitions)} "
+            f"transitions, need {total_timesteps}"
         )
-    all_transitions = all_transitions[:total_timesteps]
+    all_transitions = _collect_and_subsample_transitions(
+        all_transitions,
+        n_target=total_timesteps,
+        strategy=config.subsample_strategy,
+        rng=rng,
+    )
 
     warm_start = env_utils.is_atari(config.env_name)
 
