@@ -183,7 +183,7 @@ def _should_early_stop(
        require the current rolling mean to be within ``2 * expert_ce_floor``
        of zero. Prevents early-stopping while rollout_ce is still
        clearly far from expert-level (as happened on noisy LunarLander
-       BC+DAgger runs with the old min-based criterion).
+       BC (growing dataset) runs with the old min-based criterion).
     """
     if patience < 1 or len(rce_history) < 2 * patience:
         return False
@@ -331,7 +331,7 @@ def _truncate_trajectory(traj: types.Trajectory, n: int) -> types.Trajectory:
     """Return the first ``n`` transitions of ``traj`` as a new Trajectory.
 
     Mid-episode cut => terminal=False. Used to make each DAgger round contribute
-    exactly samples_per_round expert labels, matching BC / BC+DAgger bookkeeping.
+    exactly samples_per_round expert labels, matching BC / BC (growing dataset) bookkeeping.
     """
     assert 0 < n < len(traj), (n, len(traj))
     new_infos = None if traj.infos is None else traj.infos[:n]
@@ -360,7 +360,7 @@ def _truncate_round_demos(
 
     Keeps whole saved trajectories while their cumulative length <= n_target,
     then cuts the next trajectory mid-episode to fill the remainder. Matches
-    BC / BC+DAgger which slice upfront-collected transitions to an exact N.
+    BC / BC (growing dataset) which slice upfront-collected transitions to an exact N.
     """
     # Demos are saved as HuggingFace dataset directories (suffix is still .npz).
     demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
@@ -641,7 +641,7 @@ def _run_bc_dagger(
     rng: np.random.Generator,
     baselines: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    """BC+DAgger baseline.
+    """BC (growing dataset) baseline.
 
     Per-round ERM on a growing PREFIX of the expert dataset, sized to
     match DAgger's aggregated observation budget. Eval uses the same
@@ -665,7 +665,7 @@ def _run_bc_dagger(
     all_transitions = rollout.flatten_trajectories(list(trajs))
     if len(all_transitions) < total_timesteps:
         raise RuntimeError(
-            f"BC+DAgger: collected {len(all_transitions)} transitions, "
+            f"BC (growing dataset): collected {len(all_transitions)} transitions, "
             f"need {total_timesteps}"
         )
     all_transitions = all_transitions[:total_timesteps]
