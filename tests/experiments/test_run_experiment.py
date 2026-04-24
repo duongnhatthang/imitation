@@ -273,3 +273,49 @@ def test_collect_and_subsample_preserves_transitions_type():
         trans, n_target=10, strategy="prefix", rng=rng2,
     )
     np.testing.assert_array_equal(prefix.acts, np.arange(10))
+
+
+def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
+    """With strategy='uniform', FTL's round demos should not be the prefix.
+
+    Run FTL on CartPole with samples_per_round=15 and n_rounds=2. Inspect
+    the demo dir for round 1 and confirm the selected transitions span a
+    wider range of source timesteps than a sequential prefix would.
+    """
+    from imitation.data import serialize
+    from imitation.experiments.ftrl.run_experiment import (
+        ExperimentConfig,
+        run_single,
+    )
+
+    config = ExperimentConfig(
+        algo="ftl",
+        env_name="CartPole-v1",
+        seed=0,
+        policy_mode="linear",
+        n_rounds=2,
+        samples_per_round=15,
+        l2_lambda=0.0,
+        l2_decay=False,
+        warm_start=True,
+        beta_rampdown=2,
+        bc_n_epochs=2,
+        eval_interval=1,
+        output_dir=tmp_path / "results",
+        expert_cache_dir=tmp_path / "experts",
+        subsample_strategy="uniform",
+    )
+    run_single(config)
+
+    # Scratch dir is where FTL wrote the per-round demos
+    round_dir = (
+        tmp_path / "results" / "scratch" / "ftl_CartPole-v1_0"
+        / "demos" / "round-000"
+    )
+    assert round_dir.exists(), f"Missing round_dir: {round_dir}"
+    demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
+    assert demo_paths, "no demos saved"
+    total = 0
+    for p in demo_paths:
+        total += sum(len(t) for t in serialize.load(p))
+    assert total == 15

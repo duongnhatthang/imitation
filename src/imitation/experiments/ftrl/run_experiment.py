@@ -396,6 +396,68 @@ def _truncate_round_demos(
         _save_dagger_demo(traj, idx, round_dir, rng, prefix="truncated")
 
 
+def _uniform_round_demos(
+    round_dir: pathlib.Path, n_target: int, rng: np.random.Generator
+) -> None:
+    """Rewrite ``round_dir`` to contain exactly ``n_target`` transitions
+    sampled uniformly without replacement from the flattened pool.
+
+    Each selected transition is written as a 1-step pseudo-trajectory with
+    ``terminal=False``, preserving the HF-dataset format the FTRL trainer
+    reads (see ``_save_dagger_demo``).
+    """
+    demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
+    trajs: List[types.Trajectory] = []
+    for p in demo_paths:
+        trajs.extend(serialize.load(p))
+
+    all_flat = rollout.flatten_trajectories(trajs)
+    if len(all_flat) < n_target:
+        raise RuntimeError(
+            f"Round at {round_dir}: collected {len(all_flat)} "
+            f"transitions, need {n_target}"
+        )
+
+    idx = rng.choice(len(all_flat), size=n_target, replace=False)
+    idx.sort()
+
+    # Build n_target single-step trajectories. Each has obs=[obs, next_obs],
+    # acts=[act], infos=None, terminal=False.
+    selected: List[types.Trajectory] = []
+    obs_arr = all_flat.obs
+    next_obs_arr = all_flat.next_obs
+    acts_arr = all_flat.acts
+    infos_arr = all_flat.infos
+    # Some Transition implementations expose rews when available.
+    rews_arr = getattr(all_flat, "rews", None)
+
+    for k in idx:
+        pair_obs = np.stack([obs_arr[k], next_obs_arr[k]], axis=0)
+        info = None if infos_arr is None else np.array([infos_arr[k]])
+        if rews_arr is not None:
+            traj = types.TrajectoryWithRew(
+                obs=pair_obs,
+                acts=np.array([acts_arr[k]]),
+                infos=info,
+                rews=np.array([rews_arr[k]], dtype=np.float32),
+                terminal=False,
+            )
+        else:
+            traj = types.Trajectory(
+                obs=pair_obs,
+                acts=np.array([acts_arr[k]]),
+                infos=info,
+                terminal=False,
+            )
+        selected.append(traj)
+
+    # Wipe the round dir and rewrite with the sampled pseudo-trajectories.
+    for p in demo_paths:
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+    for j, traj in enumerate(selected):
+        _save_dagger_demo(traj, j, round_dir, rng, prefix="uniform")
+
+
 def _run_dagger_variant(
     config: ExperimentConfig,
     venv,
@@ -530,7 +592,10 @@ def _run_dagger_variant(
         )
 
         round_dir = trainer._demo_dir_path_for_round()
-        _truncate_round_demos(round_dir, config.samples_per_round, rng)
+        if config.subsample_strategy == "uniform":
+            _uniform_round_demos(round_dir, config.samples_per_round, rng)
+        else:
+            _truncate_round_demos(round_dir, config.samples_per_round, rng)
 
         # --- 3. Train on all accumulated demos ---
         trainer.extend_and_update({})
