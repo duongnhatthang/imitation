@@ -278,7 +278,7 @@ def test_collect_and_subsample_preserves_transitions_type():
 def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
     """With strategy='uniform', FTL's round demos should not be the prefix.
 
-    Run FTL on CartPole with samples_per_round=15 and n_rounds=2. Inspect
+    Run FTL on CartPole with samples_per_round=50 and n_rounds=2. Inspect
     the demo dir for round 1 and confirm the selected transitions span a
     wider range of source timesteps than a sequential prefix would.
     """
@@ -294,7 +294,7 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
         seed=0,
         policy_mode="linear",
         n_rounds=2,
-        samples_per_round=15,
+        samples_per_round=50,
         l2_lambda=0.0,
         l2_decay=False,
         warm_start=True,
@@ -318,4 +318,4 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
     total = 0
     for p in demo_paths:
         total += sum(len(t) for t in serialize.load(p))
-    assert total == 15
+    assert total == 50
