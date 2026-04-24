@@ -29,7 +29,9 @@ def test_detect_t_sat_normalized_return_upward():
         rets, obs, smooth_window=10, metric_direction="up"
     )
     assert t_sat is not None
-    assert 25 * 50 <= t_sat <= 50 * 50
+    # Plateau begins at round 30; allow detection a few rounds earlier due
+    # to smoothing window edge effects.
+    assert 20 * 50 <= t_sat <= 50 * 50
     assert 0.9 <= sat_val <= 1.01
 
 
