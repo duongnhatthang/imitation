@@ -349,7 +349,15 @@ def main():
         "--policy-mode", choices=["end_to_end", "linear"], default="linear",
     )
     parser.add_argument("--eval-interval", type=int, default=1,
-                        help="Evaluate every N rounds (default: 1 for dense tracking)")
+                        help="(unused in 2-D sweep; see --eval-points-per-cell)")
+    parser.add_argument(
+        "--eval-points-per-cell", type=int, default=60,
+        help=(
+            "Target number of eval points per cell. Per-cell eval_interval "
+            "is derived as max(1, n_rounds // this). 60 is enough for the "
+            "saturation detector and keeps sp=1 wall-time manageable."
+        ),
+    )
     parser.add_argument(
         "--output-dir", type=str, default="experiments/lr_obs_sweep",
     )
@@ -388,6 +396,10 @@ def main():
         for lr in args.lr_values:
             for sp in args.samples_per_round_values:
                 n_rounds = max(1, args.total_obs // sp)
+                # Cap eval points per cell so sp=1 (1000 rounds) doesn't
+                # dominate wall-clock. 60 eval points is enough for the
+                # saturation detector (window=5..20 on 60 points is fine).
+                cell_eval_interval = max(1, n_rounds // args.eval_points_per_cell)
                 for seed in range(args.seeds):
                     all_configs.append(
                         ExperimentConfig(
@@ -402,7 +414,7 @@ def main():
                             warm_start=True,
                             beta_rampdown=min(15, max(1, n_rounds // 4)),
                             bc_n_epochs=args.bc_n_epochs,
-                            eval_interval=args.eval_interval,
+                            eval_interval=cell_eval_interval,
                             output_dir=pathlib.Path(args.output_dir),
                             expert_cache_dir=pathlib.Path(args.expert_cache_dir),
                             learning_rate=lr,
