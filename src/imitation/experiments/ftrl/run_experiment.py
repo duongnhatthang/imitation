@@ -488,11 +488,14 @@ def _run_dagger_variant(
     else:
         l2_schedule = ftrl.ConstantL2Schedule(config.l2_lambda)
 
+    # Per-cell unique tag so parallel sweep workers don't collide on
+    # tb/scratch dirs when multiple (lr, sp) cells share env+seed.
+    cell_name = config.result_name_override or config.algo
+    cell_tag = f"{cell_name}_{config.env_name}_seed{config.seed}"
+
     # Create custom logger (suppress output)
     custom_logger = imit_logger.configure(
-        str(
-            config.output_dir / "tb" / f"{config.algo}_{config.env_name}_{config.seed}"
-        ),
+        str(config.output_dir / "tb" / cell_tag),
         format_strs=[],
     )
 
@@ -509,9 +512,7 @@ def _run_dagger_variant(
 
     # Create scratch dir for this run. Clear any stale contents from a
     # previous partial run so DAgger doesn't refuse to overwrite its demos.
-    scratch_dir = (
-        config.output_dir / "scratch" / f"{config.algo}_{config.env_name}_{config.seed}"
-    )
+    scratch_dir = config.output_dir / "scratch" / cell_tag
     if scratch_dir.exists():
         shutil.rmtree(scratch_dir)
 
