@@ -37,12 +37,15 @@ from imitation.experiments.ftrl.run_experiment import (
 
 logger = logging.getLogger(__name__)
 
-# LR values to sweep — biased upward since default 1e-3 is too small.
-DEFAULT_LR_VALUES = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
+# LR values to sweep — covers the 1e-1..3 range chosen for the 2-D sweep
+# of classical MDPs (CartPole, Blackjack, FrozenLake).
+DEFAULT_LR_VALUES = [1e-1, 3e-1, 1.0, 3.0]
 
-# Sweep uses more rounds than production to give slower LRs time to converge.
-DEFAULT_N_ROUNDS = 60
-DEFAULT_SAMPLES_PER_ROUND = 50  # small for speed; saturation is LR-dependent
+# Observations-per-update values to sweep.
+DEFAULT_SAMPLES_PER_ROUND_VALUES = [1, 15, 30, 45]
+
+# Total observation budget per cell. n_rounds is derived from this.
+DEFAULT_TOTAL_OBS = 1000
 
 
 def detect_t_sat(
@@ -317,13 +320,29 @@ def main():
         choices=list(env_utils.ENV_GROUPS.keys()),
     )
     parser.add_argument("--seeds", type=int, default=3)
-    parser.add_argument("--n-rounds", type=int, default=DEFAULT_N_ROUNDS)
     parser.add_argument(
-        "--samples-per-round", type=int, default=DEFAULT_SAMPLES_PER_ROUND,
+        "--total-obs", type=int, default=DEFAULT_TOTAL_OBS,
+        help="Total observation budget per cell. n_rounds = total_obs // samples_per_round",
+    )
+    parser.add_argument(
+        "--samples-per-round-values", type=int, nargs="+",
+        default=DEFAULT_SAMPLES_PER_ROUND_VALUES,
+        help="Observations-per-update values to sweep (heatmap X axis)",
     )
     parser.add_argument(
         "--lr-values", type=float, nargs="+", default=DEFAULT_LR_VALUES,
-        help="Learning rates to sweep",
+        help="Learning rates to sweep (heatmap Y axis)",
+    )
+    parser.add_argument(
+        "--saturation-metric",
+        choices=["normalized_return", "disagreement_rate"],
+        default="normalized_return",
+        help="Which per-round metric to run saturation detection on",
+    )
+    parser.add_argument(
+        "--subsample-strategy", choices=["uniform", "prefix"],
+        default="uniform",
+        help="Per-round data selection strategy passed to ExperimentConfig",
     )
     parser.add_argument("--bc-n-epochs", type=int, default=20)
     parser.add_argument(
@@ -332,7 +351,7 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=1,
                         help="Evaluate every N rounds (default: 1 for dense tracking)")
     parser.add_argument(
-        "--output-dir", type=str, default="experiments/lr_sweep",
+        "--output-dir", type=str, default="experiments/lr_obs_sweep",
     )
     parser.add_argument(
         "--expert-cache-dir", type=str, default="experiments/expert_cache",
@@ -353,41 +372,51 @@ def main():
 
     envs = resolve_envs(args.env_group, args.envs)
     logger.info(
-        f"LR sweep: {len(envs)} envs × {len(args.lr_values)} LRs × "
-        f"{args.seeds} seeds = {len(envs) * len(args.lr_values) * args.seeds} configs"
+        f"2-D sweep: {len(envs)} envs × {len(args.lr_values)} LRs × "
+        f"{len(args.samples_per_round_values)} sample counts × "
+        f"{args.seeds} seeds = "
+        f"{len(envs) * len(args.lr_values) * len(args.samples_per_round_values) * args.seeds} configs"
     )
     logger.info(f"LR values: {args.lr_values}")
-    logger.info(f"Rounds: {args.n_rounds}, samples/round: {args.samples_per_round}")
+    logger.info(f"Samples-per-round values: {args.samples_per_round_values}")
+    logger.info(f"Total obs per cell: {args.total_obs}")
+    logger.info(f"Saturation metric: {args.saturation_metric}")
 
-    # Build configs: FTL only, one per (env, lr, seed)
+    # Build configs: FTL only, one per (env, lr, sp, seed)
     all_configs = []
     for env_name in envs:
         for lr in args.lr_values:
-            for seed in range(args.seeds):
-                all_configs.append(
-                    ExperimentConfig(
-                        algo="ftl",
-                        env_name=env_name,
-                        seed=seed,
-                        policy_mode=args.policy_mode,
-                        n_rounds=args.n_rounds,
-                        samples_per_round=args.samples_per_round,
-                        l2_lambda=0.0,
-                        l2_decay=False,
-                        warm_start=True,
-                        beta_rampdown=15,
-                        bc_n_epochs=args.bc_n_epochs,
-                        eval_interval=args.eval_interval,
-                        output_dir=pathlib.Path(args.output_dir),
-                        expert_cache_dir=pathlib.Path(args.expert_cache_dir),
-                        learning_rate=lr,
+            for sp in args.samples_per_round_values:
+                n_rounds = max(1, args.total_obs // sp)
+                for seed in range(args.seeds):
+                    all_configs.append(
+                        ExperimentConfig(
+                            algo="ftl",
+                            env_name=env_name,
+                            seed=seed,
+                            policy_mode=args.policy_mode,
+                            n_rounds=n_rounds,
+                            samples_per_round=sp,
+                            l2_lambda=0.0,
+                            l2_decay=False,
+                            warm_start=True,
+                            beta_rampdown=min(15, max(1, n_rounds // 4)),
+                            bc_n_epochs=args.bc_n_epochs,
+                            eval_interval=args.eval_interval,
+                            output_dir=pathlib.Path(args.output_dir),
+                            expert_cache_dir=pathlib.Path(args.expert_cache_dir),
+                            learning_rate=lr,
+                            subsample_strategy=args.subsample_strategy,
+                            bc_batch_size=min(32, sp),
+                        )
                     )
-                )
 
-    # Use result_name_override to separate files by LR value.
+    # Filename override: include sp so (lr, sp) cells don't clobber each other.
     for cfg in all_configs:
         object.__setattr__(
-            cfg, "result_name_override", f"ftl_lr{cfg.learning_rate:.0e}"
+            cfg,
+            "result_name_override",
+            f"ftl_lr{cfg.learning_rate:.0e}_sp{cfg.samples_per_round:02d}",
         )
 
     # Filter already-done configs
@@ -466,7 +495,9 @@ def main():
         return
 
     # Analyze and save calibration
-    calibration = analyze_sweep_results(all_results, args.lr_values)
+    calibration = analyze_sweep_results(
+        all_results, args.lr_values, saturation_metric=args.saturation_metric,
+    )
     print_sweep_summary(calibration)
 
     # Save/update calibration file
