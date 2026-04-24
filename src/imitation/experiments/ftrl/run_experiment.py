@@ -111,6 +111,7 @@ class ExperimentConfig:
     early_stop_patience: int = 5
     early_stop_min_delta: float = 0.005
     subsample_strategy: str = "uniform"  # "uniform" or "prefix"
+    bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
 
 
 def _compute_round_eval(
@@ -503,6 +504,7 @@ def _run_dagger_variant(
         policy=policy,
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
+        batch_size=config.bc_batch_size,
     )
 
     # Create scratch dir for this run. Clear any stale contents from a
@@ -713,7 +715,7 @@ def _run_bc(
         rng=rng,
         policy=policy,
         demonstrations=all_transitions,
-        batch_size=min(32, len(all_transitions)),
+        batch_size=min(config.bc_batch_size, len(all_transitions)),
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
     )
@@ -865,7 +867,7 @@ def _run_bc_dagger(
             rng=rng,
             policy=policy,
             demonstrations=prefix,
-            batch_size=min(32, len(prefix)),
+            batch_size=min(config.bc_batch_size, len(prefix)),
             optimizer_kwargs={"lr": config.learning_rate},
             custom_logger=custom_logger,
         )

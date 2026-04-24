@@ -319,3 +319,37 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
     for p in demo_paths:
         total += sum(len(t) for t in serialize.load(p))
     assert total == 50
+
+
+def test_ftl_with_small_bc_batch_size(tmp_path):
+    """FTL works with samples_per_round < default BC batch_size when bc_batch_size is set.
+
+    With samples_per_round=15 and bc_batch_size=15, BC's batch fits and FTL
+    runs without the 'Not enough transitions to form a single batch' error.
+    """
+    from imitation.experiments.ftrl.run_experiment import (
+        ExperimentConfig,
+        run_single,
+    )
+
+    config = ExperimentConfig(
+        algo="ftl",
+        env_name="CartPole-v1",
+        seed=0,
+        policy_mode="linear",
+        n_rounds=2,
+        samples_per_round=15,
+        l2_lambda=0.0,
+        l2_decay=False,
+        warm_start=True,
+        beta_rampdown=2,
+        bc_n_epochs=1,
+        eval_interval=1,
+        output_dir=tmp_path / "results",
+        expert_cache_dir=tmp_path / "experts",
+        subsample_strategy="uniform",
+        bc_batch_size=15,
+    )
+    result = run_single(config)
+    assert result["algo"] == "ftl"
+    assert len(result["per_round"]) >= 2
