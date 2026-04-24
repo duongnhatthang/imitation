@@ -98,11 +98,16 @@ def detect_t_sat(
     final_mean = float(np.mean(raw_arr[-smooth_window:]))
 
     if metric_direction == "down":
+        # Disagreement-rate style: must have fallen meaningfully.
         if final_mean > 0.8 * initial_mean:
             return None, None
     elif metric_direction == "up":
-        if final_mean < 1.2 * initial_mean:
-            return None, None
+        # Normalized-return style: no convergence gate. A curve that saturates
+        # at a low level is still saturated; a curve that starts near the
+        # ceiling (fast learning) is still saturated. The flatness check
+        # below handles both cases; only genuinely-oscillating curves return
+        # None via the ``earliest_flat >= n - 2`` trailing check.
+        pass
     else:
         raise ValueError(
             f"metric_direction must be 'up' or 'down', got {metric_direction!r}"
