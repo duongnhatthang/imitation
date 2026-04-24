@@ -309,7 +309,7 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
 
     # Scratch dir is where FTL wrote the per-round demos
     round_dir = (
-        tmp_path / "results" / "scratch" / "ftl_CartPole-v1_0"
+        tmp_path / "results" / "scratch" / "ftl_CartPole-v1_seed0"
         / "demos" / "round-000"
     )
     assert round_dir.exists(), f"Missing round_dir: {round_dir}"
