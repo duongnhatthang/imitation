@@ -194,8 +194,9 @@ def plot_combined_heatmap(
     """Render the combined 3 rows × 2 cols heatmap."""
     direction = "up" if saturation_metric == "normalized_return" else "down"
 
+    # Extra vertical headroom for the multi-line subtitle.
     fig, axes = plt.subplots(
-        len(envs), 2, figsize=(12, 4 * len(envs)), squeeze=False,
+        len(envs), 2, figsize=(12, 4 * len(envs) + 1), squeeze=False,
     )
 
     all_t_sat: List[float] = []
@@ -282,9 +283,22 @@ def plot_combined_heatmap(
     fig.suptitle(
         f"LR × samples_per_round sensitivity "
         f"(saturation on {saturation_metric})",
-        fontsize=13, fontweight="bold",
+        fontsize=13, fontweight="bold", y=0.995,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    subtitle = (
+        "T_sat (left): median observations-to-saturation across seeds. "
+        "N/A = no contiguous flat region in the cell's round budget "
+        "(typical when samples_per_round is large → few rounds → noisier curve).\n"
+        "Return at T_sat (right): IQM normalized return across seeds, "
+        "evaluated at T_sat (or at the budget cap if N/A). "
+        "Cell text = IQM\\n[lo, hi] where [lo, hi] is the 95% stratified-bootstrap CI."
+    )
+    fig.text(
+        0.5, 0.965, subtitle,
+        ha="center", va="top", fontsize=10, style="italic", color="0.25",
+    )
+    headroom = 0.93 - 0.01 * len(envs)
+    fig.tight_layout(rect=[0, 0, 1, max(0.85, headroom)])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
