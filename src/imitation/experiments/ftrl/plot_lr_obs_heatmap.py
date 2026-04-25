@@ -140,7 +140,11 @@ def _draw_heatmap(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
 ):
-    """Draw a single heatmap with annotations and hatched N/A cells."""
+    """Draw a single heatmap with annotations and hatched N/A cells.
+
+    Annotation color is chosen per-cell from the cell's background luminance
+    (via the colormap output) so light text never lands on light cells.
+    """
     display = np.where(na_mask, np.nan, matrix)
     im = ax.imshow(
         display, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax,
@@ -153,6 +157,11 @@ def _draw_heatmap(
     ax.set_ylabel("learning_rate")
     ax.set_title(title, fontsize=10)
 
+    cmap_obj = plt.get_cmap(cmap)
+    lo = vmin if vmin is not None else float(np.nanmin(display))
+    hi = vmax if vmax is not None else float(np.nanmax(display))
+    span = hi - lo if hi > lo else 1.0
+
     for i in range(len(lr_values)):
         for j in range(len(sp_values)):
             if na_mask[i, j]:
@@ -160,11 +169,18 @@ def _draw_heatmap(
                     (j - 0.5, i - 0.5), 1, 1,
                     fill=False, hatch="///", edgecolor="0.4", linewidth=0,
                 ))
-            txt = annot_values[i][j]
+                color = "0.1"
+            else:
+                # Choose contrasting text color from the cell's RGB luminance.
+                norm = (matrix[i, j] - lo) / span
+                norm = float(np.clip(norm, 0.0, 1.0))
+                r, g, b, _ = cmap_obj(norm)
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+                color = "black" if lum > 0.55 else "white"
             ax.text(
-                j, i, txt,
+                j, i, annot_values[i][j],
                 ha="center", va="center",
-                fontsize=8, color="white" if not na_mask[i, j] else "0.2",
+                fontsize=8, color=color,
             )
     return im
 
