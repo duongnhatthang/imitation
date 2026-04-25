@@ -291,7 +291,9 @@ def plot_combined_heatmap(
         "(typical when samples_per_round is large → few rounds → noisier curve).\n"
         "Return at T_sat (right): IQM normalized return across seeds, "
         "evaluated at T_sat (or at the budget cap if N/A). "
-        "Cell text = IQM\\n[lo, hi] where [lo, hi] is the 95% stratified-bootstrap CI."
+        "Cell text = IQM\\n[lo, hi] where [lo, hi] is the 95% stratified-bootstrap CI.\n"
+        "Values may fall outside [0, 1] on stochastic envs (e.g. Blackjack): "
+        "10-episode evals can drift above the expert reference (>1) or below random (<0)."
     )
     fig.text(
         0.5, 0.965, subtitle,
