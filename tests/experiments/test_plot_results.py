@@ -33,13 +33,18 @@ def _write_fake_result(
     for r in range(n_rounds):
         ce = base_ce * np.exp(-0.1 * r) + rng.normal(0, 0.05)
         ce = max(ce, 0.01)
-        per_round.append({
+        round_data = {
             "round": r + 1,
             "n_observations": (r + 1) * samples_per_round,
-            "cross_entropy": round(ce, 6),
+            "train_cross_entropy": round(ce, 6),
+            "rollout_cross_entropy": round(ce, 6),
             "l2_norm": round(rng.uniform(0.1, 1.0), 6),
             "total_loss": round(ce + 0.001, 6),
-        })
+            # normalized_return and disagreement_rate present only at even rounds
+            "normalized_return": round(rng.uniform(0, 1), 6) if r % 2 == 0 else None,
+            "disagreement_rate": round(rng.uniform(0, 0.5), 6) if r % 2 == 0 else None,
+        }
+        per_round.append(round_data)
 
     result = {
         "algo": algo,
@@ -48,6 +53,11 @@ def _write_fake_result(
         "policy_mode": "end_to_end",
         "config": {"n_rounds": n_rounds},
         "per_round": per_round,
+        "baselines": {
+            "expert_return": 500.0,
+            "random_return": 22.0,
+            "expert_self_ce": 0.05,
+        },
         "elapsed_seconds": 5.0,
     }
 
@@ -68,7 +78,11 @@ def _populate_results(results_dir, envs=None, algos=None, seeds=3, n_rounds=5):
         for algo in algos:
             for seed in range(seeds):
                 _write_fake_result(
-                    results_dir, algo, env, seed, n_rounds,
+                    results_dir,
+                    algo,
+                    env,
+                    seed,
+                    n_rounds,
                     base_ce=base_ces.get(algo, 1.0),
                 )
 
@@ -79,10 +93,17 @@ def test_load_results(tmp_path):
     _populate_results(results_dir, seeds=2, n_rounds=4)
 
     df = load_results(results_dir)
-    # 2 envs × 3 algos × 2 seeds × 4 rounds = 48 rows
+    # 2 envs x 3 algos x 2 seeds x 4 rounds = 48 rows
     assert len(df) == 48
     assert set(df.columns) >= {
-        "algo", "env", "seed", "round", "cross_entropy", "l2_norm",
+        "algo",
+        "env",
+        "seed",
+        "round",
+        "rollout_cross_entropy",
+        "l2_norm",
+        "normalized_return",
+        "disagreement_rate",
     }
     assert set(df["algo"].unique()) == {"ftl", "ftrl", "bc"}
     assert set(df["env"].unique()) == {"CartPole-v1", "FrozenLake-v1"}
@@ -105,11 +126,13 @@ def test_load_results_skips_errors(tmp_path):
 
     # Write an error result
     err_file = results_dir / "CartPole-v1" / "err.json"
-    err_file.write_text(json.dumps({"error": "boom", "algo": "x", "env": "y", "seed": 0}))
+    err_file.write_text(
+        json.dumps({"error": "boom", "algo": "x", "env": "y", "seed": 0})
+    )
 
     df = load_results(results_dir)
     # Should only have the 1 valid file's data
-    assert len(df) == 5  # 1 algo × 1 seed × 5 rounds
+    assert len(df) == 5  # 1 algo x 1 seed x 5 rounds
 
 
 def test_compute_cumulative_loss(tmp_path):
@@ -143,7 +166,7 @@ def test_compute_cumulative_regret(tmp_path):
 
 
 def test_plot_env(tmp_path):
-    """plot_env generates a PNG file."""
+    """plot_env generates a PNG file with 4 subplots."""
     results_dir = tmp_path / "results"
     _populate_results(results_dir, envs=["CartPole-v1"], seeds=2)
 

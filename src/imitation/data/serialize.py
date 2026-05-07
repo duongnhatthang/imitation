@@ -20,7 +20,11 @@ def save(path: AnyPath, trajectories: Sequence[Trajectory]) -> None:
         trajectories: The trajectories to save.
     """
     p = util.parse_path(path)
-    huggingface_utils.trajectories_to_dataset(trajectories).save_to_disk(str(p))
+    dataset = huggingface_utils.trajectories_to_dataset(trajectories)
+    # Force num_shards=1 to avoid an IndexError from datasets' max-shard-size
+    # heuristic when a single large trajectory (e.g., long Atari episodes)
+    # exceeds the 500MB default and the library tries to split into >1 shards.
+    dataset.save_to_disk(str(p), num_shards=1)
     logging.info(f"Dumped demonstrations to {p}.")
 
 

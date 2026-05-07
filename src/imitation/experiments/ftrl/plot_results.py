@@ -1,7 +1,13 @@
-"""Plotting for FTL vs FTRL vs BC experiment results.
+"""Plotting for FTL vs FTRL vs BC (growing dataset) vs BC experiment results.
 
-Generates per-environment figures with cumulative loss and cumulative regret.
-Supports incremental generation — can plot partial results as experiments complete.
+Generates per-environment figures with 4 subplots:
+  1. Rollout cross-entropy on the aggregated D_eval^t buffer (log scale)
+  2. Normalized expected return
+  3. On-policy disagreement rate
+  4. Cumulative regret (vs best dynamic algo)
+
+Uses IQM + 95% stratified bootstrap CI (via rliable) instead of mean +/- std.
+Supports incremental generation -- can plot partial results as experiments complete.
 
 Usage:
     python -m imitation.experiments.ftrl.plot_results --results-dir experiments/results/
@@ -12,14 +18,13 @@ import argparse
 import json
 import logging
 import pathlib
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
-
-from imitation.experiments.ftrl import env_utils
 
 logger = logging.getLogger(__name__)
 
@@ -27,16 +32,109 @@ logger = logging.getLogger(__name__)
 matplotlib.use("Agg")
 
 ALGO_COLORS: Dict[str, str] = {
-    "ftl": "#1f77b4",   # blue
+    "ftl": "#1f77b4",  # blue
     "ftrl": "#d62728",  # red
-    "bc": "#2ca02c",    # green
+    "bc_dagger": "#2ca02c",  # green
+    "bc": "#17a663",  # dark green (dashed reference)
+    "expert": "#555555",  # gray (dashed reference)
 }
 
 ALGO_LABELS: Dict[str, str] = {
-    "ftl": "FTL (DAgger, λ=0)",
-    "ftrl": "FTRL (DAgger + L2)",
-    "bc": "BC (offline)",
+    "ftl": "FTL+DAgger",
+    "ftrl": "FTRL+DAgger",
+    "bc_dagger": "BC (growing dataset)",
+    "bc": "BC (fixed)",
+    "expert": "Expert",
 }
+
+ALGO_LINESTYLES: Dict[str, str] = {
+    "ftl": "-",
+    "ftrl": "-",
+    "bc_dagger": "-",
+    "bc": "--",
+    "expert": "--",
+}
+
+LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger", "bc"}
+
+
+def _draw_bc_hlines(
+    axes: List[plt.Axes],
+    env_df: pd.DataFrame,
+    metrics: List[str],
+):
+    """Draw BC as horizontal reference lines on the given axes."""
+    bc_df = env_df[env_df["algo"] == "bc"]
+    if bc_df.empty:
+        return
+    bc_row = bc_df.iloc[0]
+    color = ALGO_COLORS.get("bc", "#17a663")
+    linestyle = ALGO_LINESTYLES.get("bc", "--")
+    label = ALGO_LABELS.get("bc", "BC (fixed)")
+
+    for ax, metric in zip(axes, metrics):
+        val = bc_row.get(metric)
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            continue
+        ax.axhline(
+            y=float(val),
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.5,
+            alpha=0.7,
+            label=f"{label} = {float(val):.3f}",
+        )
+        ax.legend(fontsize=9)
+
+
+def _env_category(env_name: str) -> str:
+    """Route env to 'atari' or 'classical' output subdir."""
+    return "atari" if "NoFrameskip" in env_name else "classical"
+
+LOSS_SUBTITLE_LINES = [
+    (
+        r"Loss: $\ell_t(\pi^t) = -\frac{1}{|D_{\mathrm{eval}}^t|}"
+        r"\sum_{(s,a^*)\in D_{\mathrm{eval}}^t}\log\pi^t(a^*|s),$   "
+        r"$a^*(s)=\arg\max_a \pi^*(a|s).$"
+    ),
+    (
+        r"$D_{\mathrm{eval}}^t$: 10-episode rollout of the current "
+        r"learner $\pi^t$ (labeled with expert argmax). Not aggregated."
+    ),
+    (
+        r"Cum. regret: $\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
+        r"where $\ell_t(\pi^*)$ is the expert's CE on the same $D_{\mathrm{eval}}^t$."
+    ),
+    (
+        "x-axis = cumulative expert queries (= transitions labeled by "
+        r"$\pi^*$). All algorithms evaluated at equal expert-label budget."
+    ),
+]
+
+
+def _compute_iqm_and_ci(
+    values_by_seed: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Compute IQM and 95% stratified bootstrap CI using rliable.
+
+    Args:
+        values_by_seed: 1D array of values, one per seed.
+
+    Returns:
+        (iqm_value, ci_low, ci_high)
+    """
+    from rliable import library as rly
+    from rliable import metrics as rly_metrics
+
+    if len(values_by_seed) < 2:
+        val = float(values_by_seed[0]) if len(values_by_seed) == 1 else 0.0
+        return val, val, val
+
+    # rliable expects dict of {algo_name: array of shape (n_runs, n_tasks)}
+    data = {"a": values_by_seed.reshape(-1, 1)}
+    aggregate_func = lambda x: np.array([rly_metrics.aggregate_iqm(x)])
+    scores, cis = rly.get_interval_estimates(data, aggregate_func, reps=2000)
+    return float(scores["a"][0]), float(cis["a"][0, 0]), float(cis["a"][1, 0])
 
 
 def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
@@ -48,13 +146,16 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
         results_dir: Directory containing per-env subdirs with JSON files.
 
     Returns:
-        DataFrame with columns: algo, env, seed, policy_mode, round,
-        cross_entropy, l2_norm, total_loss.
+        DataFrame with per-round metrics plus top-level ``expert_self_ce``
+        carried from the ``baselines`` block.
     """
     rows = []
     results_path = pathlib.Path(results_dir)
 
-    for json_file in sorted(results_path.rglob("*.json")):
+    for json_file in sorted(
+        p for p in results_path.rglob("*.json")
+        if not any(part.startswith("_archive") for part in p.parts)
+    ):
         try:
             with open(json_file) as f:
                 data = json.load(f)
@@ -66,6 +167,7 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
             logger.warning(f"Skipping failed run: {json_file}")
             continue
 
+        expert_self_ce = data.get("baselines", {}).get("expert_self_ce")
         for m in data.get("per_round", []):
             row = {
                 "algo": data["algo"],
@@ -74,12 +176,25 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
                 "policy_mode": data.get("policy_mode", "unknown"),
                 "round": m["round"],
                 "n_observations": m.get("n_observations", 0),
-                "cross_entropy": m["cross_entropy"],
-                "l2_norm": m["l2_norm"],
-                "total_loss": m["total_loss"],
+                "train_cross_entropy": m.get("train_cross_entropy"),
+                "rollout_cross_entropy": m.get("rollout_cross_entropy"),
+                "expert_rollout_cross_entropy": m.get(
+                    "expert_rollout_cross_entropy"
+                ),
+                "l2_norm": m.get("l2_norm"),
+                "total_loss": m.get("total_loss"),
+                "normalized_return": (
+                    m["normalized_return"]
+                    if m.get("normalized_return") is not None
+                    else np.nan
+                ),
+                "disagreement_rate": (
+                    m["disagreement_rate"]
+                    if m.get("disagreement_rate") is not None
+                    else np.nan
+                ),
+                "expert_self_ce": expert_self_ce,
             }
-            if "expert_cross_entropy" in m:
-                row["expert_cross_entropy"] = m["expert_cross_entropy"]
             rows.append(row)
 
     if not rows:
@@ -92,58 +207,111 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
         f"{df['env'].nunique()} envs, {df['algo'].nunique()} algos, "
         f"{df['seed'].nunique()} seeds"
     )
+
+    _check_stale_data(df)
     return df
 
 
-def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute cumulative cross-entropy loss per (algo, env, seed).
+def _check_stale_data(df: pd.DataFrame) -> None:
+    """Warn if seeds within the same (algo, env) have inconsistent n_observations.
 
-    Also computes expert cumulative loss if expert_cross_entropy is available.
+    This catches stale results from a previous run (e.g. different
+    samples_per_round) mixed with current results.
+    """
+    for (algo, env), group in df.groupby(["algo", "env"]):
+        per_seed_rounds = {}
+        for seed, seed_df in group.groupby("seed"):
+            obs_by_round = dict(
+                zip(seed_df["round"], seed_df["n_observations"])
+            )
+            per_seed_rounds[seed] = obs_by_round
+
+        seeds = list(per_seed_rounds.keys())
+        if len(seeds) < 2:
+            continue
+        ref = per_seed_rounds[seeds[0]]
+        for seed in seeds[1:]:
+            other = per_seed_rounds[seed]
+            shared = set(ref.keys()) & set(other.keys())
+            for rnd in shared:
+                if ref[rnd] != other[rnd]:
+                    logger.warning(
+                        f"STALE DATA: {algo}/{env} round {rnd}: "
+                        f"seed {seeds[0]} has n_obs={ref[rnd]}, "
+                        f"seed {seed} has n_obs={other[rnd]}. "
+                        f"Delete old results and re-run."
+                    )
+                    return
+
+
+def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute cumulative rollout cross-entropy per (algo, env, seed).
+
+    Also computes cumulative expert rollout cross-entropy on the same
+    aggregated D_eval^t buffer (if the field is present).
 
     Args:
         df: DataFrame from load_results.
 
     Returns:
-        Same DataFrame with added 'cum_loss' column (and 'expert_cum_loss'
-        if expert_cross_entropy is present).
+        Same DataFrame with added ``cum_loss`` and ``cum_expert_loss``
+        columns. Rows with missing ``rollout_cross_entropy`` contribute
+        nothing to the cumulative sum.
     """
     df = df.sort_values(["algo", "env", "seed", "round"]).copy()
-    df["cum_loss"] = df.groupby(["algo", "env", "seed"])["cross_entropy"].cumsum()
-    if "expert_cross_entropy" in df.columns:
-        df["expert_cum_loss"] = (
-            df.groupby(["algo", "env", "seed"])["expert_cross_entropy"].cumsum()
-        )
+    # cumsum over eval points; NaN entries (non-eval rounds) contribute 0
+    # to the running sum but keep NaN in the cum_loss column so the line
+    # plot skips those rounds.
+    df["_rce_filled"] = df["rollout_cross_entropy"].fillna(0.0)
+    df["cum_loss"] = df.groupby(["algo", "env", "seed"])["_rce_filled"].cumsum()
+    df.loc[df["rollout_cross_entropy"].isna(), "cum_loss"] = np.nan
+    df.drop(columns=["_rce_filled"], inplace=True)
+
+    if "expert_rollout_cross_entropy" in df.columns:
+        df["_erce_filled"] = df["expert_rollout_cross_entropy"].fillna(0.0)
+        df["cum_expert_loss"] = df.groupby(["algo", "env", "seed"])[
+            "_erce_filled"
+        ].cumsum()
+        df.loc[
+            df["expert_rollout_cross_entropy"].isna(), "cum_expert_loss"
+        ] = np.nan
+        df.drop(columns=["_erce_filled"], inplace=True)
     return df
 
 
 def compute_cumulative_regret(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute cumulative regret relative to the expert's cumulative loss.
+    """Compute cumulative regret vs the expert on the same D_eval^t buffer.
 
-    Regret for algo A at round t = cum_loss_A(t) - expert_cum_loss(t).
-    Falls back to best-algo baseline if expert data is unavailable.
+    Formula matches the DAgger regret bound:
+    :math:`\\sum_{t=1}^T [\\ell_t(\\pi^t) - \\ell_t(\\pi^*)]`
+    where :math:`\\ell_t` is the sampled-action CE on the aggregated eval
+    buffer. The expert's loss on that buffer is stored per-round as
+    ``expert_rollout_cross_entropy``.
+
+    If ``expert_rollout_cross_entropy`` is missing (e.g. older JSONs),
+    falls back to using the env-level ``expert_self_ce`` constant, which
+    approximates expert loss when the learner is near-expert.
 
     Args:
-        df: DataFrame with 'cum_loss' column (from compute_cumulative_loss).
+        df: DataFrame with ``cum_loss`` column (from compute_cumulative_loss).
 
     Returns:
-        Same DataFrame with an added 'cum_regret' column.
+        Same DataFrame with an added ``cum_regret`` column.
     """
     if "cum_loss" not in df.columns:
         df = compute_cumulative_loss(df)
 
-    if "expert_cum_loss" in df.columns:
-        # Use expert as baseline
-        df["cum_regret"] = df["cum_loss"] - df["expert_cum_loss"]
+    if "cum_expert_loss" in df.columns and df["cum_expert_loss"].notna().any():
+        df["cum_regret"] = df["cum_loss"] - df["cum_expert_loss"]
     else:
-        # Fallback: minimum cumulative loss across algos
-        baseline = (
-            df.groupby(["env", "seed", "round"])["cum_loss"]
-            .min()
-            .rename("baseline_cum_loss")
-        )
-        df = df.merge(baseline, on=["env", "seed", "round"])
-        df["cum_regret"] = df["cum_loss"] - df["baseline_cum_loss"]
-        df.drop(columns=["baseline_cum_loss"], inplace=True)
+        # Fallback: treat expert loss as constant expert_self_ce per eval
+        # point. Count eval points seen so far per run.
+        df["_is_eval"] = df["rollout_cross_entropy"].notna().astype(int)
+        df["_eval_count"] = df.groupby(["algo", "env", "seed"])[
+            "_is_eval"
+        ].cumsum()
+        df["cum_regret"] = df["cum_loss"] - df["_eval_count"] * df["expert_self_ce"]
+        df.drop(columns=["_is_eval", "_eval_count"], inplace=True)
     return df
 
 
@@ -152,122 +320,258 @@ def _plot_metric(
     df: pd.DataFrame,
     metric: str,
     ylabel: str,
-    expert_baseline: Optional[pd.DataFrame] = None,
+    log_scale: bool = False,
+    allowed_algos: Optional[set] = None,
+    log_x: bool = False,
+    y_clip_floor: Optional[float] = None,
 ):
-    """Plot a metric with mean ± 1 std bands across seeds.
+    """Plot a metric with IQM and 95% bootstrap CI bands across seeds.
 
     Args:
         ax: Matplotlib axes to plot on.
         df: DataFrame filtered to a single env.
         metric: Column name to plot.
         ylabel: Y-axis label.
-        expert_baseline: Optional DataFrame with 'mean_metric' and 'mean_obs'
-            columns. Plotted as a black dashed line.
+        log_scale: Whether to use log scale on y-axis.
+        allowed_algos: Optional filter on algo set; if given, only those
+            algos are drawn on this subplot.
+        log_x: Whether to use log scale on x-axis. Rounds with
+            ``n_observations == 0`` are dropped (can't render at log(0)).
+        y_clip_floor: If set, values below this floor are clipped up to
+            the floor before plotting. Useful for log-y plots where the
+            natural metric can be zero or slightly negative.
     """
-    algos = sorted(df["algo"].unique(), key=lambda a: list(ALGO_COLORS.keys()).index(a)
-                   if a in ALGO_COLORS else 99)
-
+    algos = sorted(
+        df["algo"].unique(),
+        key=lambda a: list(ALGO_COLORS.keys()).index(a) if a in ALGO_COLORS else 99,
+    )
     for algo in algos:
+        if allowed_algos is not None and algo not in allowed_algos:
+            continue
+        if algo == "bc":
+            continue  # BC drawn as horizontal lines by _draw_bc_hlines
         algo_df = df[df["algo"] == algo]
-        stats = (
-            algo_df.groupby("round")
-            .agg(mean_metric=(metric, "mean"), std_metric=(metric, "std"),
-                 mean_obs=("n_observations", "mean"))
-            .reset_index()
-        )
-        stats["std_metric"] = stats["std_metric"].fillna(0)
+        valid_df = algo_df.dropna(subset=[metric])
+        if valid_df.empty:
+            continue
 
+        # Drop rounds not present in every seed for this algo — otherwise
+        # single-seed rounds pull the per-round mean(n_observations) to
+        # whatever that lone seed happens to have, causing the line plot
+        # to jump left/right on the x-axis.
+        n_seeds = valid_df["seed"].nunique()
+        seed_counts = valid_df.groupby("round")["seed"].nunique()
+        complete_rounds = set(seed_counts[seed_counts == n_seeds].index)
+        rounds = sorted(r for r in valid_df["round"].unique() if r in complete_rounds)
+
+        x_vals, iqm_vals, ci_lows, ci_highs = [], [], [], []
+        for rnd in rounds:
+            rnd_df = valid_df[valid_df["round"] == rnd]
+            values = rnd_df[metric].values
+            if len(values) == 0:
+                continue
+            if y_clip_floor is not None:
+                values = np.maximum(values, y_clip_floor)
+            iqm, ci_lo, ci_hi = _compute_iqm_and_ci(values)
+            mean_obs = rnd_df["n_observations"].mean()
+            x_vals.append(mean_obs)
+            iqm_vals.append(iqm)
+            ci_lows.append(ci_lo)
+            ci_highs.append(ci_hi)
+        if not x_vals:
+            continue
         color = ALGO_COLORS.get(algo, "#888888")
+        linestyle = ALGO_LINESTYLES.get(algo, "-")
         label = ALGO_LABELS.get(algo, algo)
-        x = stats["mean_obs"].values
-        mean = stats["mean_metric"].values
-        std = stats["std_metric"].values
+        if y_clip_floor is not None:
+            iqm_vals = [max(v, y_clip_floor) for v in iqm_vals]
+            ci_lows = [max(v, y_clip_floor) for v in ci_lows]
+            ci_highs = [max(v, y_clip_floor) for v in ci_highs]
+        ax.plot(
+            x_vals,
+            iqm_vals,
+            color=color,
+            linestyle=linestyle,
+            label=label,
+            linewidth=2,
+            marker="o" if linestyle == "-" else None,
+            markersize=3,
+        )
+        ax.fill_between(x_vals, ci_lows, ci_highs, color=color, alpha=0.12)
 
-        ax.plot(x, mean, color=color, label=label, linewidth=2, marker="o",
-                markersize=3)
-        ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
-
-    # Expert baseline
-    if expert_baseline is not None and not expert_baseline.empty:
-        x = expert_baseline["mean_obs"].values
-        values = expert_baseline["mean_metric"].values
-        # If values are roughly constant, draw a flat line; otherwise a curve
-        if np.std(values) < 0.01 * (np.mean(np.abs(values)) + 1e-8):
-            ax.axhline(
-                y=np.mean(values),
-                color="black", linestyle="--", linewidth=1.5, alpha=0.7,
-                label=f"Expert (π*) = {np.mean(values):.3f}",
-            )
-        else:
-            ax.plot(
-                x, values,
-                color="black", linestyle="--", linewidth=1.5, alpha=0.7,
-                marker="s", markersize=3,
-                label="Expert (π*)",
-            )
-
-    ax.set_xlabel("Number of Observations")
+    if log_scale:
+        ax.set_yscale("log")
+    if log_x:
+        ax.set_xscale("symlog", linthresh=100)
+        ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+        ax.tick_params(axis="x", which="major", labelsize=8, rotation=0)
+    # Force x tick labels on every subplot (sharex otherwise hides
+    # labels on all but the bottom axis).
+    ax.tick_params(axis="x", labelbottom=True)
+    ax.set_xlabel("Number of Observations" + (" (log)" if log_x else ""))
     ax.set_ylabel(ylabel)
     ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which="both")
 
 
 def plot_env(
     df: pd.DataFrame,
     env_name: str,
     output_path: pathlib.Path,
+    show_expert_on_loss: bool = True,
+    calibration: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Generate a 3-subplot figure for one environment.
+    """Generate a 4-subplot figure for one environment.
 
-    Top: per-round cross-entropy (learning curve).
-    Middle: cumulative loss.
-    Bottom: cumulative regret.
+    Subplot 1: rollout cross-entropy on aggregated D_eval^t (log scale).
+    Subplot 2: normalized expected return.
+    Subplot 3: on-policy disagreement rate.
+    Subplot 4: cumulative regret vs best dynamic algo.
 
     Args:
         df: Full DataFrame with cum_loss and cum_regret columns.
         env_name: Environment to plot.
         output_path: Path to save the PNG.
+        show_expert_on_loss: If True, draw expert self-CE as a dashed line
+            on the loss subplot.
     """
     env_df = df[df["env"] == env_name]
     if env_df.empty:
         logger.warning(f"No data for {env_name}, skipping")
         return
 
-    # Detect policy mode for title
     policy_modes = env_df["policy_mode"].unique()
     mode_str = policy_modes[0] if len(policy_modes) == 1 else "mixed"
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
-    fig.suptitle(f"{env_name}  ({mode_str})", fontsize=14, fontweight="bold")
+    # Wider figure so the subtitle has room to breathe and long formulas
+    # don't overflow. Room at top is controlled via subplots_adjust;
+    # bbox_inches="tight" is intentionally NOT used so the layout isn't
+    # recropped out from under us.
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+        4,
+        1,
+        figsize=(11, 17),
+        sharex=True,
+    )
+    subtitle_text = "\n".join(LOSS_SUBTITLE_LINES)
+    # Reserve 17% of the figure for title + subtitle. Subplot 1 top lands
+    # at y=0.83, leaving y=0.83..1.00 for text. The extra headroom avoids
+    # any overlap between the bottom of the multi-line subtitle and the
+    # top spine of subplot 1.
+    plt.subplots_adjust(
+        top=0.83,
+        left=0.10,
+        right=0.97,
+        bottom=0.05,
+        hspace=0.38,
+    )
+    fig.suptitle(
+        f"{env_name}  ({mode_str})",
+        fontsize=15,
+        fontweight="bold",
+        y=0.98,
+    )
+    # Add calibration info line if available
+    cal_line = ""
+    if calibration:
+        lr = calibration.get("best_lr")
+        t_sat = calibration.get("best_t_sat")
+        lr_str = f"lr={lr:.0e}" if lr is not None else "lr=default"
+        t_sat_str = f"T_sat={t_sat} obs" if t_sat is not None else "T_sat=N/A"
+        cal_line = f"\nCalibrated: {lr_str},  {t_sat_str},  max_obs=2×T_sat"
 
-    # Get expert baselines if available (as DataFrames with mean_obs column)
-    expert_ce = None
-    expert_cum = None
-    if "expert_cross_entropy" in env_df.columns:
-        expert_ce = (
-            env_df.groupby("round")
-            .agg(mean_metric=("expert_cross_entropy", "mean"),
-                 mean_obs=("n_observations", "mean"))
-            .reset_index()
-        )
-    if "expert_cum_loss" in env_df.columns:
-        expert_cum = (
-            env_df.groupby("round")
-            .agg(mean_metric=("expert_cum_loss", "mean"),
-                 mean_obs=("n_observations", "mean"))
-            .reset_index()
-        )
+    fig.text(
+        0.5,
+        0.955,
+        subtitle_text + cal_line,
+        ha="center",
+        va="top",
+        fontsize=10,
+        linespacing=1.4,
+    )
 
-    _plot_metric(ax1, env_df, "cross_entropy", "Per-Round Cross-Entropy",
-                 expert_baseline=expert_ce)
-    _plot_metric(ax2, env_df, "cum_loss", "Cumulative Cross-Entropy Loss",
-                 expert_baseline=expert_cum)
-    _plot_metric(ax3, env_df, "cum_regret", "Cumulative Regret (vs expert)",
-                 expert_baseline=None)  # regret is relative, no expert line needed
+    # Subplot 1: rollout_cross_entropy on the aggregated D_eval^t buffer.
+    # Log x-axis to zoom in on early learning.
+    _plot_metric(
+        ax1,
+        env_df,
+        "rollout_cross_entropy",
+        r"Rollout CE on $D_{\mathrm{eval}}^t$",
+        log_scale=True,
+        log_x=True,
+        allowed_algos=LOSS_SUBPLOT_ALGOS,
+    )
+    if show_expert_on_loss:
+        expert_self_ce_vals = env_df.get("expert_self_ce")
+        if expert_self_ce_vals is not None and expert_self_ce_vals.notna().any():
+            y = float(expert_self_ce_vals.dropna().iloc[0])
+            ax1.axhline(
+                y=y,
+                color=ALGO_COLORS["expert"],
+                linestyle=ALGO_LINESTYLES["expert"],
+                linewidth=1.2,
+                alpha=0.7,
+                label=rf"{ALGO_LABELS['expert']} $\pi^*$ self-CE = {y:.3f}",
+            )
+            ax1.legend(fontsize=9)
 
-    plt.tight_layout()
+    # Subplot 2: Normalized expected return.
+    # Log y-axis (clipped to a small floor since round 0 can be slightly
+    # negative and the random baseline is exactly 0). Log x-axis as well.
+    _plot_metric(
+        ax2,
+        env_df,
+        "normalized_return",
+        "Normalized Return",
+        log_scale=True,
+        log_x=True,
+        y_clip_floor=1e-3,
+    )
+    ax2.axhline(
+        y=1.0,
+        color=ALGO_COLORS["expert"],
+        linestyle=ALGO_LINESTYLES["expert"],
+        linewidth=1.2,
+        alpha=0.7,
+        label=rf"{ALGO_LABELS['expert']} $\pi^*$",
+    )
+    ax2.legend(fontsize=9)
+
+    # Subplot 3: On-policy disagreement rate (dynamic algos + fixed BC).
+    # Log y-axis (natural for a rate in [0, 1]) + log x.
+    _plot_metric(
+        ax3,
+        env_df,
+        "disagreement_rate",
+        "Disagreement Rate",
+        log_scale=True,
+        log_x=True,
+        y_clip_floor=1e-3,
+        allowed_algos={"ftl", "ftrl", "bc_dagger", "bc"},
+    )
+
+    # Subplot 4: Cumulative regret vs expert.
+    # Log x only (regret can be negative, so linear y).
+    _plot_metric(
+        ax4,
+        env_df,
+        "cum_regret",
+        r"Cumulative Regret (vs Expert $\pi^*$)",
+        log_x=True,
+        allowed_algos=LOSS_SUBPLOT_ALGOS,
+    )
+
+    _draw_bc_hlines(
+        [ax1, ax2, ax3, ax4],
+        env_df,
+        ["rollout_cross_entropy", "normalized_return", "disagreement_rate", "cum_regret"],
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    # No bbox_inches="tight" — we deliberately reserved the top 12% for
+    # title + subtitle via subplots_adjust, and tight-cropping would
+    # claw back exactly that space.
+    fig.savefig(output_path, dpi=150)
     plt.close(fig)
     logger.info(f"Saved plot: {output_path}")
 
@@ -276,6 +580,8 @@ def plot_all(
     results_dir: pathlib.Path,
     output_dir: pathlib.Path,
     envs: Optional[List[str]] = None,
+    show_expert_on_loss: bool = True,
+    calibration_data: Optional[Dict[str, Any]] = None,
 ) -> List[pathlib.Path]:
     """Generate plots for all environments.
 
@@ -283,6 +589,8 @@ def plot_all(
         results_dir: Directory with JSON result files.
         output_dir: Directory to save PNG plots.
         envs: Optional list of envs to filter. If None, plots all found.
+        show_expert_on_loss: Forwarded to ``plot_env``.
+        calibration_data: Optional dict from lr_calibration.json, keyed by env.
 
     Returns:
         List of saved plot file paths.
@@ -301,8 +609,15 @@ def plot_all(
     saved_paths = []
     for env_name in sorted(df["env"].unique()):
         safe_name = env_name.replace("/", "_")
-        out_path = pathlib.Path(output_dir) / f"{safe_name}.png"
-        plot_env(df, env_name, out_path)
+        out_path = (
+            pathlib.Path(output_dir) / _env_category(env_name) / f"{safe_name}.png"
+        )
+        cal = (calibration_data or {}).get(env_name)
+        plot_env(
+            df, env_name, out_path,
+            show_expert_on_loss=show_expert_on_loss,
+            calibration=cal,
+        )
         saved_paths.append(out_path)
 
     return saved_paths
@@ -310,19 +625,44 @@ def plot_all(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot FTL vs FTRL vs BC experiment results",
+        description="Plot FTL vs FTRL vs BC (growing dataset) vs BC experiment results",
     )
     parser.add_argument(
-        "--results-dir", type=str, default="experiments/results",
+        "--results-dir",
+        type=str,
+        default="experiments/results",
         help="Directory containing JSON result files",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="experiments/plots",
+        "--output-dir",
+        type=str,
+        default="experiments/plots",
         help="Directory to save PNG plots",
     )
     parser.add_argument(
-        "--envs", nargs="+", default=None,
+        "--envs",
+        nargs="+",
+        default=None,
         help="Filter to specific environments",
+    )
+    parser.add_argument(
+        "--show-expert-on-loss",
+        dest="show_expert_on_loss",
+        action="store_true",
+        default=True,
+        help="Draw expert self-CE on the loss subplot (default on)",
+    )
+    parser.add_argument(
+        "--hide-expert-on-loss",
+        dest="show_expert_on_loss",
+        action="store_false",
+        help="Hide expert self-CE on the loss subplot",
+    )
+    parser.add_argument(
+        "--calibration-file",
+        type=str,
+        default=None,
+        help="Path to lr_calibration.json for displaying LR and T_sat in titles",
     )
     args = parser.parse_args()
 
@@ -331,15 +671,22 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    calibration_data = None
+    if args.calibration_file:
+        with open(args.calibration_file) as f:
+            calibration_data = json.load(f)
+
     paths = plot_all(
         pathlib.Path(args.results_dir),
         pathlib.Path(args.output_dir),
         envs=args.envs,
+        show_expert_on_loss=args.show_expert_on_loss,
+        calibration_data=calibration_data,
     )
     if paths:
         logger.info(f"Generated {len(paths)} plots in {args.output_dir}")
     else:
-        logger.warning("No plots generated — check results directory")
+        logger.warning("No plots generated -- check results directory")
 
 
 if __name__ == "__main__":

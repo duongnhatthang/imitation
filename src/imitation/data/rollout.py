@@ -48,7 +48,9 @@ def unwrap_traj(traj: types.TrajectoryWithRew) -> types.TrajectoryWithRew:
     if traj.infos is None:
         raise ValueError("Trajectory must have infos to unwrap")
     ep_info = traj.infos[-1]["rollout"]
-    res = dataclasses.replace(traj, obs=ep_info["obs"], rews=ep_info["rews"])
+    res = dataclasses.replace(
+        traj, obs=ep_info["obs"], rews=np.array(ep_info["rews"], dtype=float)
+    )
     assert len(res.obs) == len(res.acts) + 1
     assert len(res.rews) == len(res.acts)
     return res

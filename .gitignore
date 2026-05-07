@@ -167,3 +167,11 @@ experiments/expert_cache/
 experiments/plots/
 experiments/setup_server.sh
 experiments/sync_results.sh
+
+.worktrees/
+experiments/expert_cache_ent_default/
+
+# Internal dev docs and experiment logs (not shipped)
+docs/superpowers/
+experiments/logs/
+experiments/ent_coef_zero_experiment.py
