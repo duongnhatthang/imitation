@@ -37,21 +37,25 @@ from imitation.experiments.ftrl.run_experiment import (
 
 logger = logging.getLogger(__name__)
 
-# LR values to sweep — biased upward since default 1e-3 is too small.
-DEFAULT_LR_VALUES = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
+# LR values to sweep — covers the 1e-1..3 range chosen for the 2-D sweep
+# of classical MDPs (CartPole, Blackjack, FrozenLake).
+DEFAULT_LR_VALUES = [1e-1, 3e-1, 1.0, 3.0]
 
-# Sweep uses more rounds than production to give slower LRs time to converge.
-DEFAULT_N_ROUNDS = 60
-DEFAULT_SAMPLES_PER_ROUND = 50  # small for speed; saturation is LR-dependent
+# Observations-per-update values to sweep.
+DEFAULT_SAMPLES_PER_ROUND_VALUES = [1, 15, 30, 45]
+
+# Total observation budget per cell. n_rounds is derived from this.
+DEFAULT_TOTAL_OBS = 1000
 
 
 def detect_t_sat(
-    disagreement_rates: List[Optional[float]],
+    values: List[Optional[float]],
     n_observations: List[int],
     smooth_window: int = 20,
     rel_change_threshold: float = 0.30,
+    metric_direction: str = "down",
 ) -> Tuple[Optional[int], Optional[float]]:
-    """Detect the observation count at which disagreement rate saturates.
+    """Detect the observation count at which a curve saturates (flattens).
 
     Strategy (backward, relative-change on sliding windows):
       1. Smooth the series with a moving average to remove noise.
@@ -61,25 +65,27 @@ def detect_t_sat(
          change in its window is below ``rel_change_threshold``.
       4. T_sat = earliest contiguous flat point.
 
-    This correctly distinguishes "slowly declining" (large relative change
-    across a window even if the per-step slope is small) from "truly flat"
-    (values bounce around but don't trend).
+    Convergence gate, direction-aware:
+      - ``metric_direction="down"``: reject if ``final_mean > 0.8 * initial_mean``
+        (disagreement-rate style — must have fallen meaningfully).
+      - ``metric_direction="up"``: reject if ``final_mean < 1.2 * initial_mean``
+        (normalized-return style — must have risen meaningfully).
 
     Args:
-        disagreement_rates: Per-round disagreement values (None = not eval'd).
+        values: Per-round metric values (None = not eval'd).
         n_observations: Per-round cumulative observation counts.
-        smooth_window: Moving-average window for smoothing.
+        smooth_window: Moving-average window for smoothing. May be reduced
+            automatically when the number of valid points is small.
         rel_change_threshold: Maximum ``(max-min)/mean`` within a window
-            to consider it flat.  0.20 = 20% swing allowed.
+            to consider it flat.
+        metric_direction: "down" or "up".
 
     Returns:
         (t_sat_obs, saturated_value) or (None, None) if not saturated.
-        ``t_sat_obs`` is the observation count where the plateau begins.
     """
-    # Filter to evaluated points only
     vals = [
         (obs, d)
-        for obs, d in zip(n_observations, disagreement_rates)
+        for obs, d in zip(n_observations, values)
         if d is not None
     ]
     if len(vals) < smooth_window + 2:
@@ -88,11 +94,24 @@ def detect_t_sat(
     obs_arr = np.array([o for o, _ in vals], dtype=float)
     raw_arr = np.array([d for _, d in vals], dtype=float)
 
-    # Check for convergence: final level must be meaningfully below initial
-    initial_mean = float(np.mean(raw_arr[:min(3, len(raw_arr))]))
+    initial_mean = float(np.mean(raw_arr[: min(3, len(raw_arr))]))
     final_mean = float(np.mean(raw_arr[-smooth_window:]))
-    if final_mean > 0.8 * initial_mean:
-        return None, None
+
+    if metric_direction == "down":
+        # Disagreement-rate style: must have fallen meaningfully.
+        if final_mean > 0.8 * initial_mean:
+            return None, None
+    elif metric_direction == "up":
+        # Normalized-return style: no convergence gate. A curve that saturates
+        # at a low level is still saturated; a curve that starts near the
+        # ceiling (fast learning) is still saturated. The flatness check
+        # below handles both cases; only genuinely-oscillating curves return
+        # None via the ``earliest_flat >= n - 2`` trailing check.
+        pass
+    else:
+        raise ValueError(
+            f"metric_direction must be 'up' or 'down', got {metric_direction!r}"
+        )
 
     # Smooth
     kernel = np.ones(smooth_window) / smooth_window
@@ -101,20 +120,18 @@ def detect_t_sat(
     padded = np.pad(raw_arr, (pad_l, pad_r), mode="edge")
     smoothed = np.convolve(padded, kernel, mode="valid")
 
-    # For each position, compute relative change in its forward window
     n = len(smoothed)
-    min_start = smooth_window  # skip pre-learning region
+    min_start = smooth_window
 
     def _is_flat(idx: int) -> bool:
         end = min(idx + smooth_window, n)
         window = smoothed[idx:end]
         wmean = float(np.mean(window))
-        if wmean < 1e-8:
-            return True  # essentially zero
-        rel_change = (float(np.max(window)) - float(np.min(window))) / wmean
+        if abs(wmean) < 1e-8:
+            return True
+        rel_change = (float(np.max(window)) - float(np.min(window))) / abs(wmean)
         return rel_change < rel_change_threshold
 
-    # Walk backward from end
     earliest_flat = n - 1
     for i in range(n - 1, min_start - 1, -1):
         if _is_flat(i):
@@ -122,7 +139,6 @@ def detect_t_sat(
         else:
             break
 
-    # Must have found a plateau of at least a few points past min_start
     if earliest_flat >= n - 2 or earliest_flat < min_start:
         return None, None
 
@@ -142,14 +158,18 @@ def detect_best_value(
 def analyze_sweep_results(
     results: List[Dict[str, Any]],
     lr_values: List[float],
+    saturation_metric: str = "normalized_return",
 ) -> Dict[str, Any]:
     """Analyze sweep results and pick the best LR per environment.
 
-    Best LR = lowest final disagreement rate.  Ties broken by faster T_sat.
+    The saturation detector runs on the chosen ``saturation_metric``.
+    "normalized_return" → direction="up"; "disagreement_rate" → direction="down".
 
-    Returns a calibration dict keyed by env name.
+    Best LR = lowest final disagreement rate on a per-seed basis (unchanged).
+    Ties broken by faster T_sat on the chosen saturation metric.
     """
-    # Group by env
+    direction = "up" if saturation_metric == "normalized_return" else "down"
+
     by_env: Dict[str, Dict[float, List[Dict]]] = {}
     for r in results:
         if "error" in r:
@@ -163,36 +183,34 @@ def analyze_sweep_results(
         lr_summaries = []
         for lr in sorted(lr_results.keys()):
             seed_results = lr_results[lr]
-            # Aggregate across seeds
-            all_disagree = []
-            all_t_sat = []
-            all_best = []
-            # Collect per-seed best values
             all_best = []
             for sr in seed_results:
                 disagree = [p.get("disagreement_rate") for p in sr["per_round"]]
                 all_best.append(detect_best_value(disagree))
 
-            # Mean best disagreement across seeds
             valid_best = [b for b in all_best if b is not None]
             mean_best = float(np.mean(valid_best)) if valid_best else None
 
-            # T_sat on the mean curve (not per-seed)
-            # Build mean disagreement per round across seeds
             by_round: Dict[int, List[float]] = {}
             by_round_obs: Dict[int, List[int]] = {}
             for sr in seed_results:
                 for p in sr["per_round"]:
                     r = p["round"]
-                    d = p.get("disagreement_rate")
+                    d = p.get(saturation_metric)
                     if d is not None:
                         by_round.setdefault(r, []).append(d)
                         by_round_obs.setdefault(r, []).append(p["n_observations"])
 
             rounds_sorted = sorted(by_round.keys())
-            mean_disagree = [float(np.mean(by_round[r])) for r in rounds_sorted]
+            mean_vals = [float(np.mean(by_round[r])) for r in rounds_sorted]
             mean_obs = [int(np.mean(by_round_obs[r])) for r in rounds_sorted]
-            t_sat, sat_val = detect_t_sat(mean_disagree, mean_obs)
+            n_points = len(mean_vals)
+            window = max(5, min(20, n_points // 3)) if n_points else 20
+            t_sat, sat_val = detect_t_sat(
+                mean_vals, mean_obs,
+                smooth_window=window,
+                metric_direction=direction,
+            )
 
             lr_summaries.append({
                 "lr": lr,
@@ -203,8 +221,6 @@ def analyze_sweep_results(
                 "per_seed_best": all_best,
             })
 
-        # Rank LRs: smallest T_sat among those reaching near-best performance.
-        # "Near-best" = within 2x of the overall best disagreement rate.
         all_best_d = [
             s["mean_best_disagreement"]
             for s in lr_summaries
@@ -213,7 +229,6 @@ def analyze_sweep_results(
         best_d_overall = min(all_best_d) if all_best_d else 1e9
         near_best_threshold = max(best_d_overall * 2, best_d_overall + 0.01)
 
-        # Competitive LRs: those within threshold
         competitive = [
             s for s in lr_summaries
             if s["mean_best_disagreement"] is not None
@@ -222,7 +237,6 @@ def analyze_sweep_results(
         if not competitive:
             competitive = lr_summaries
 
-        # Among competitive, rank by T_sat (earliest first), then by disagree
         ranked = sorted(
             competitive,
             key=lambda s: (
@@ -230,7 +244,6 @@ def analyze_sweep_results(
                 s["mean_best_disagreement"] if s["mean_best_disagreement"] is not None else 1e9,
             ),
         )
-        # Full ranking for display (all LRs, same sort key)
         full_ranked = sorted(
             lr_summaries,
             key=lambda s: (
@@ -312,22 +325,46 @@ def main():
         choices=list(env_utils.ENV_GROUPS.keys()),
     )
     parser.add_argument("--seeds", type=int, default=3)
-    parser.add_argument("--n-rounds", type=int, default=DEFAULT_N_ROUNDS)
     parser.add_argument(
-        "--samples-per-round", type=int, default=DEFAULT_SAMPLES_PER_ROUND,
+        "--total-obs", type=int, default=DEFAULT_TOTAL_OBS,
+        help="Total observation budget per cell. n_rounds = total_obs // samples_per_round",
+    )
+    parser.add_argument(
+        "--samples-per-round-values", type=int, nargs="+",
+        default=DEFAULT_SAMPLES_PER_ROUND_VALUES,
+        help="Observations-per-update values to sweep (heatmap X axis)",
     )
     parser.add_argument(
         "--lr-values", type=float, nargs="+", default=DEFAULT_LR_VALUES,
-        help="Learning rates to sweep",
+        help="Learning rates to sweep (heatmap Y axis)",
+    )
+    parser.add_argument(
+        "--saturation-metric",
+        choices=["normalized_return", "disagreement_rate"],
+        default="normalized_return",
+        help="Which per-round metric to run saturation detection on",
+    )
+    parser.add_argument(
+        "--subsample-strategy", choices=["uniform", "prefix"],
+        default="uniform",
+        help="Per-round data selection strategy passed to ExperimentConfig",
     )
     parser.add_argument("--bc-n-epochs", type=int, default=20)
     parser.add_argument(
         "--policy-mode", choices=["end_to_end", "linear"], default="linear",
     )
     parser.add_argument("--eval-interval", type=int, default=1,
-                        help="Evaluate every N rounds (default: 1 for dense tracking)")
+                        help="(unused in 2-D sweep; see --eval-points-per-cell)")
     parser.add_argument(
-        "--output-dir", type=str, default="experiments/lr_sweep",
+        "--eval-points-per-cell", type=int, default=60,
+        help=(
+            "Target number of eval points per cell. Per-cell eval_interval "
+            "is derived as max(1, n_rounds // this). 60 is enough for the "
+            "saturation detector and keeps sp=1 wall-time manageable."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="experiments/lr_obs_sweep",
     )
     parser.add_argument(
         "--expert-cache-dir", type=str, default="experiments/expert_cache",
@@ -348,41 +385,55 @@ def main():
 
     envs = resolve_envs(args.env_group, args.envs)
     logger.info(
-        f"LR sweep: {len(envs)} envs × {len(args.lr_values)} LRs × "
-        f"{args.seeds} seeds = {len(envs) * len(args.lr_values) * args.seeds} configs"
+        f"2-D sweep: {len(envs)} envs × {len(args.lr_values)} LRs × "
+        f"{len(args.samples_per_round_values)} sample counts × "
+        f"{args.seeds} seeds = "
+        f"{len(envs) * len(args.lr_values) * len(args.samples_per_round_values) * args.seeds} configs"
     )
     logger.info(f"LR values: {args.lr_values}")
-    logger.info(f"Rounds: {args.n_rounds}, samples/round: {args.samples_per_round}")
+    logger.info(f"Samples-per-round values: {args.samples_per_round_values}")
+    logger.info(f"Total obs per cell: {args.total_obs}")
+    logger.info(f"Saturation metric: {args.saturation_metric}")
 
-    # Build configs: FTL only, one per (env, lr, seed)
+    # Build configs: FTL only, one per (env, lr, sp, seed)
     all_configs = []
     for env_name in envs:
         for lr in args.lr_values:
-            for seed in range(args.seeds):
-                all_configs.append(
-                    ExperimentConfig(
-                        algo="ftl",
-                        env_name=env_name,
-                        seed=seed,
-                        policy_mode=args.policy_mode,
-                        n_rounds=args.n_rounds,
-                        samples_per_round=args.samples_per_round,
-                        l2_lambda=0.0,
-                        l2_decay=False,
-                        warm_start=True,
-                        beta_rampdown=15,
-                        bc_n_epochs=args.bc_n_epochs,
-                        eval_interval=args.eval_interval,
-                        output_dir=pathlib.Path(args.output_dir),
-                        expert_cache_dir=pathlib.Path(args.expert_cache_dir),
-                        learning_rate=lr,
+            for sp in args.samples_per_round_values:
+                n_rounds = max(1, args.total_obs // sp)
+                # Cap eval points per cell so sp=1 (1000 rounds) doesn't
+                # dominate wall-clock. 60 eval points is enough for the
+                # saturation detector (window=5..20 on 60 points is fine).
+                cell_eval_interval = max(1, n_rounds // args.eval_points_per_cell)
+                for seed in range(args.seeds):
+                    all_configs.append(
+                        ExperimentConfig(
+                            algo="ftl",
+                            env_name=env_name,
+                            seed=seed,
+                            policy_mode=args.policy_mode,
+                            n_rounds=n_rounds,
+                            samples_per_round=sp,
+                            l2_lambda=0.0,
+                            l2_decay=False,
+                            warm_start=True,
+                            beta_rampdown=min(15, max(1, n_rounds // 4)),
+                            bc_n_epochs=args.bc_n_epochs,
+                            eval_interval=cell_eval_interval,
+                            output_dir=pathlib.Path(args.output_dir),
+                            expert_cache_dir=pathlib.Path(args.expert_cache_dir),
+                            learning_rate=lr,
+                            subsample_strategy=args.subsample_strategy,
+                            bc_batch_size=min(32, sp),
+                        )
                     )
-                )
 
-    # Use result_name_override to separate files by LR value.
+    # Filename override: include sp so (lr, sp) cells don't clobber each other.
     for cfg in all_configs:
         object.__setattr__(
-            cfg, "result_name_override", f"ftl_lr{cfg.learning_rate:.0e}"
+            cfg,
+            "result_name_override",
+            f"ftl_lr{cfg.learning_rate:.0e}_sp{cfg.samples_per_round:02d}",
         )
 
     # Filter already-done configs
@@ -461,7 +512,9 @@ def main():
         return
 
     # Analyze and save calibration
-    calibration = analyze_sweep_results(all_results, args.lr_values)
+    calibration = analyze_sweep_results(
+        all_results, args.lr_values, saturation_metric=args.saturation_metric,
+    )
     print_sweep_summary(calibration)
 
     # Save/update calibration file

@@ -1,4 +1,4 @@
-"""Plotting for FTL vs FTRL vs BC+DAgger vs BC experiment results.
+"""Plotting for FTL vs FTRL vs BC (growing dataset) vs BC experiment results.
 
 Generates per-environment figures with 4 subplots:
   1. Rollout cross-entropy on the aggregated D_eval^t buffer (log scale)
@@ -42,7 +42,7 @@ ALGO_COLORS: Dict[str, str] = {
 ALGO_LABELS: Dict[str, str] = {
     "ftl": "FTL+DAgger",
     "ftrl": "FTRL+DAgger",
-    "bc_dagger": "BC+DAgger",
+    "bc_dagger": "BC (growing dataset)",
     "bc": "BC (fixed)",
     "expert": "Expert",
 }
@@ -625,7 +625,7 @@ def plot_all(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot FTL vs FTRL vs BC+DAgger vs BC experiment results",
+        description="Plot FTL vs FTRL vs BC (growing dataset) vs BC experiment results",
     )
     parser.add_argument(
         "--results-dir",

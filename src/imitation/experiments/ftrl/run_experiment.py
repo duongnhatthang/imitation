@@ -18,7 +18,7 @@ import os
 import pathlib
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch as th
@@ -110,6 +110,8 @@ class ExperimentConfig:
     early_stop: bool = False
     early_stop_patience: int = 5
     early_stop_min_delta: float = 0.005
+    subsample_strategy: str = "uniform"  # "uniform" or "prefix"
+    bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
 
 
 def _compute_round_eval(
@@ -183,7 +185,7 @@ def _should_early_stop(
        require the current rolling mean to be within ``2 * expert_ce_floor``
        of zero. Prevents early-stopping while rollout_ce is still
        clearly far from expert-level (as happened on noisy LunarLander
-       BC+DAgger runs with the old min-based criterion).
+       BC (growing dataset) runs with the old min-based criterion).
     """
     if patience < 1 or len(rce_history) < 2 * patience:
         return False
@@ -331,7 +333,7 @@ def _truncate_trajectory(traj: types.Trajectory, n: int) -> types.Trajectory:
     """Return the first ``n`` transitions of ``traj`` as a new Trajectory.
 
     Mid-episode cut => terminal=False. Used to make each DAgger round contribute
-    exactly samples_per_round expert labels, matching BC / BC+DAgger bookkeeping.
+    exactly samples_per_round expert labels, matching BC / BC (growing dataset) bookkeeping.
     """
     assert 0 < n < len(traj), (n, len(traj))
     new_infos = None if traj.infos is None else traj.infos[:n]
@@ -360,7 +362,7 @@ def _truncate_round_demos(
 
     Keeps whole saved trajectories while their cumulative length <= n_target,
     then cuts the next trajectory mid-episode to fill the remainder. Matches
-    BC / BC+DAgger which slice upfront-collected transitions to an exact N.
+    BC / BC (growing dataset) which slice upfront-collected transitions to an exact N.
     """
     # Demos are saved as HuggingFace dataset directories (suffix is still .npz).
     demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
@@ -395,6 +397,68 @@ def _truncate_round_demos(
         _save_dagger_demo(traj, idx, round_dir, rng, prefix="truncated")
 
 
+def _uniform_round_demos(
+    round_dir: pathlib.Path, n_target: int, rng: np.random.Generator
+) -> None:
+    """Rewrite ``round_dir`` to contain exactly ``n_target`` transitions
+    sampled uniformly without replacement from the flattened pool.
+
+    Each selected transition is written as a 1-step pseudo-trajectory with
+    ``terminal=False``, preserving the HF-dataset format the FTRL trainer
+    reads (see ``_save_dagger_demo``).
+    """
+    demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
+    trajs: List[types.Trajectory] = []
+    for p in demo_paths:
+        trajs.extend(serialize.load(p))
+
+    all_flat = rollout.flatten_trajectories(trajs)
+    if len(all_flat) < n_target:
+        raise RuntimeError(
+            f"Round at {round_dir}: collected {len(all_flat)} "
+            f"transitions, need {n_target}"
+        )
+
+    idx = rng.choice(len(all_flat), size=n_target, replace=False)
+    idx.sort()
+
+    # Build n_target single-step trajectories. Each has obs=[obs, next_obs],
+    # acts=[act], infos=None, terminal=False.
+    selected: List[types.Trajectory] = []
+    obs_arr = all_flat.obs
+    next_obs_arr = all_flat.next_obs
+    acts_arr = all_flat.acts
+    infos_arr = all_flat.infos
+    # Some Transition implementations expose rews when available.
+    rews_arr = getattr(all_flat, "rews", None)
+
+    for k in idx:
+        pair_obs = np.stack([obs_arr[k], next_obs_arr[k]], axis=0)
+        info = None if infos_arr is None else np.array([infos_arr[k]])
+        if rews_arr is not None:
+            traj = types.TrajectoryWithRew(
+                obs=pair_obs,
+                acts=np.array([acts_arr[k]]),
+                infos=info,
+                rews=np.array([rews_arr[k]], dtype=np.float32),
+                terminal=False,
+            )
+        else:
+            traj = types.Trajectory(
+                obs=pair_obs,
+                acts=np.array([acts_arr[k]]),
+                infos=info,
+                terminal=False,
+            )
+        selected.append(traj)
+
+    # Wipe the round dir and rewrite with the sampled pseudo-trajectories.
+    for p in demo_paths:
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+    for j, traj in enumerate(selected):
+        _save_dagger_demo(traj, j, round_dir, rng, prefix="uniform")
+
+
 def _run_dagger_variant(
     config: ExperimentConfig,
     venv,
@@ -424,11 +488,14 @@ def _run_dagger_variant(
     else:
         l2_schedule = ftrl.ConstantL2Schedule(config.l2_lambda)
 
+    # Per-cell unique tag so parallel sweep workers don't collide on
+    # tb/scratch dirs when multiple (lr, sp) cells share env+seed.
+    cell_name = config.result_name_override or config.algo
+    cell_tag = f"{cell_name}_{config.env_name}_seed{config.seed}"
+
     # Create custom logger (suppress output)
     custom_logger = imit_logger.configure(
-        str(
-            config.output_dir / "tb" / f"{config.algo}_{config.env_name}_{config.seed}"
-        ),
+        str(config.output_dir / "tb" / cell_tag),
         format_strs=[],
     )
 
@@ -440,13 +507,12 @@ def _run_dagger_variant(
         policy=policy,
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
+        batch_size=config.bc_batch_size,
     )
 
     # Create scratch dir for this run. Clear any stale contents from a
     # previous partial run so DAgger doesn't refuse to overwrite its demos.
-    scratch_dir = (
-        config.output_dir / "scratch" / f"{config.algo}_{config.env_name}_{config.seed}"
-    )
+    scratch_dir = config.output_dir / "scratch" / cell_tag
     if scratch_dir.exists():
         shutil.rmtree(scratch_dir)
 
@@ -529,7 +595,10 @@ def _run_dagger_variant(
         )
 
         round_dir = trainer._demo_dir_path_for_round()
-        _truncate_round_demos(round_dir, config.samples_per_round, rng)
+        if config.subsample_strategy == "uniform":
+            _uniform_round_demos(round_dir, config.samples_per_round, rng)
+        else:
+            _truncate_round_demos(round_dir, config.samples_per_round, rng)
 
         # --- 3. Train on all accumulated demos ---
         trainer.extend_and_update({})
@@ -560,6 +629,41 @@ def _run_dagger_variant(
         _free_memory()
 
     return per_round
+
+
+def _collect_and_subsample_transitions(
+    all_transitions: "Union[types.TransitionsMinimal, list]",
+    n_target: int,
+    strategy: str,
+    rng: np.random.Generator,
+) -> "Union[types.TransitionsMinimal, list]":
+    """Select n_target transitions from ``all_transitions``.
+
+    "prefix"  → return ``all_transitions[:n_target]`` (original behavior).
+    "uniform" → return ``n_target`` transitions picked uniformly without
+                replacement across the full pool.
+    """
+    if strategy == "prefix":
+        return all_transitions[:n_target]
+    if strategy == "uniform":
+        if len(all_transitions) < n_target:
+            raise ValueError(
+                f"uniform subsample needs {n_target} transitions, "
+                f"pool has {len(all_transitions)}"
+            )
+        idx = rng.choice(len(all_transitions), size=n_target, replace=False)
+        idx.sort()  # stable order for reproducibility across backends
+        if isinstance(all_transitions, types.TransitionsMinimal):
+            # Build a new Transitions(-like) dataclass with each numpy field
+            # gathered by the index array. ``__getitem__`` only supports
+            # int/slice, so we replace fields directly.
+            field_updates = {
+                f.name: getattr(all_transitions, f.name)[idx]
+                for f in dataclasses.fields(all_transitions)
+            }
+            return dataclasses.replace(all_transitions, **field_updates)
+        return [all_transitions[i] for i in idx]
+    raise ValueError(f"Unknown subsample strategy: {strategy!r}")
 
 
 def _run_bc(
@@ -595,7 +699,12 @@ def _run_bc(
     )
     all_transitions = rollout.flatten_trajectories(list(trajs))
     if len(all_transitions) > total_timesteps:
-        all_transitions = all_transitions[:total_timesteps]
+        all_transitions = _collect_and_subsample_transitions(
+            all_transitions,
+            n_target=total_timesteps,
+            strategy=config.subsample_strategy,
+            rng=rng,
+        )
 
     custom_logger = imit_logger.configure(
         str(config.output_dir / "tb" / f"bc_{config.env_name}_{config.seed}"),
@@ -607,7 +716,7 @@ def _run_bc(
         rng=rng,
         policy=policy,
         demonstrations=all_transitions,
-        batch_size=min(32, len(all_transitions)),
+        batch_size=min(config.bc_batch_size, len(all_transitions)),
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
     )
@@ -641,7 +750,7 @@ def _run_bc_dagger(
     rng: np.random.Generator,
     baselines: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    """BC+DAgger baseline.
+    """BC (growing dataset) baseline.
 
     Per-round ERM on a growing PREFIX of the expert dataset, sized to
     match DAgger's aggregated observation budget. Eval uses the same
@@ -665,10 +774,15 @@ def _run_bc_dagger(
     all_transitions = rollout.flatten_trajectories(list(trajs))
     if len(all_transitions) < total_timesteps:
         raise RuntimeError(
-            f"BC+DAgger: collected {len(all_transitions)} transitions, "
-            f"need {total_timesteps}"
+            f"BC (growing dataset): collected {len(all_transitions)} "
+            f"transitions, need {total_timesteps}"
         )
-    all_transitions = all_transitions[:total_timesteps]
+    all_transitions = _collect_and_subsample_transitions(
+        all_transitions,
+        n_target=total_timesteps,
+        strategy=config.subsample_strategy,
+        rng=rng,
+    )
 
     warm_start = env_utils.is_atari(config.env_name)
 
@@ -754,7 +868,7 @@ def _run_bc_dagger(
             rng=rng,
             policy=policy,
             demonstrations=prefix,
-            batch_size=min(32, len(prefix)),
+            batch_size=min(config.bc_batch_size, len(prefix)),
             optimizer_kwargs={"lr": config.learning_rate},
             custom_logger=custom_logger,
         )
