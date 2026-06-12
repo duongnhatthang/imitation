@@ -538,3 +538,21 @@ def test_should_outer_early_stop_needs_2x_patience_points():
     history = [0.02] * 9  # less than 2*5
     assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
                                     disagreement_ceiling=0.05) is False
+
+
+def test_should_outer_early_stop_blocked_when_still_improving():
+    """Strictly-decreasing history below ceiling should NOT fire (plateau gate)."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    # Strictly improving from 0.10 → 0.02 over 10 evals; all below ceiling.
+    history = [0.10, 0.08, 0.07, 0.06, 0.05, 0.04, 0.04, 0.03, 0.03, 0.02]
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is False
+
+
+def test_should_outer_early_stop_fires_at_exact_ceiling():
+    """current_mean == ceiling allows stopping (>= semantics, > comparison)."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    # Flat at exactly the ceiling → plateau + current_mean == ceiling → fires.
+    history = [0.05] * 10
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is True

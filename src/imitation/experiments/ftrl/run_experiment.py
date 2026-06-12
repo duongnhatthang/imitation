@@ -110,6 +110,7 @@ class ExperimentConfig:
     # --- Outer-loop early stop: cross-round disagreement_rate plateau ---
     outer_early_stop: bool = True
     outer_early_stop_patience: int = 5
+    # Plateau threshold in disagreement_rate units (0.005 ≈ 0.5 pp absolute).
     outer_early_stop_min_delta: float = 0.005
     # Stop only when the rolling-mean disagreement_rate is <= this ceiling
     # (i.e. the policy already agrees with the expert at least ~95% of the time).
@@ -819,7 +820,7 @@ def _run_bc_dagger(
     aggregated D_eval^t buffer construction as FTL/FTRL+DAgger (spec §3.4).
 
     A round-0 eval (fresh policy, before any training) is also emitted,
-    and the outer round loop early-stops when rollout_ce plateaus.
+    and the outer round loop early-stops when disagreement_rate plateaus.
     """
     total_timesteps = config.n_rounds * config.samples_per_round
 
