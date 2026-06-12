@@ -631,10 +631,10 @@ def _run_dagger_variant(
             )
             rce_history.append(eval_data["rollout_cross_entropy"])
 
-            if config.early_stop and _should_early_stop(
+            if config.outer_early_stop and _should_early_stop(
                 rce_history,
-                config.early_stop_patience,
-                config.early_stop_min_delta,
+                config.outer_early_stop_patience,
+                config.outer_early_stop_min_delta,
                 expert_ce_floor=baselines.get("expert_self_ce"),
             ):
                 stopped_early = True
@@ -642,7 +642,7 @@ def _run_dagger_variant(
                     f"{config.algo}/{config.env_name}/seed{config.seed}: "
                     f"early stop at round {round_num} "
                     f"(rollout_ce plateau over "
-                    f"{config.early_stop_patience} eval points)"
+                    f"{config.outer_early_stop_patience} eval points)"
                 )
 
         # --- 2. Collect expert demos for this round ---
@@ -893,10 +893,10 @@ def _run_bc_dagger(
             )
             rce_history.append(eval_data["rollout_cross_entropy"])
 
-            if config.early_stop and _should_early_stop(
+            if config.outer_early_stop and _should_early_stop(
                 rce_history,
-                config.early_stop_patience,
-                config.early_stop_min_delta,
+                config.outer_early_stop_patience,
+                config.outer_early_stop_min_delta,
                 expert_ce_floor=baselines.get("expert_self_ce"),
             ):
                 stopped_early = True
@@ -904,7 +904,7 @@ def _run_bc_dagger(
                     f"bc_dagger/{config.env_name}/seed{config.seed}: "
                     f"early stop at round {round_num} "
                     f"(rollout_ce plateau over "
-                    f"{config.early_stop_patience} eval points)"
+                    f"{config.outer_early_stop_patience} eval points)"
                 )
 
         # --- 2. Train on growing prefix of expert data ---
@@ -1072,9 +1072,9 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         output_dir=pathlib.Path(args.output_dir),
                         expert_cache_dir=pathlib.Path(args.expert_cache_dir),
                         learning_rate=args.learning_rate,
-                        early_stop=args.early_stop,
-                        early_stop_patience=args.early_stop_patience,
-                        early_stop_min_delta=args.early_stop_min_delta,
+                        outer_early_stop=args.outer_early_stop,
+                        outer_early_stop_patience=args.outer_early_stop_patience,
+                        outer_early_stop_min_delta=args.outer_early_stop_min_delta,
                     )
                 )
     return configs
@@ -1112,26 +1112,38 @@ def main():
         default=50,
         help="Min timesteps per DAgger round",
     )
+    # Python 3.8 doesn't have argparse.BooleanOptionalAction, so we pair
+    # store_true / store_false on a shared dest.
     parser.add_argument(
-        "--early-stop",
+        "--outer-early-stop",
+        dest="outer_early_stop",
         action="store_true",
-        default=False,
-        help="Enable early stopping on rollout_ce plateau",
-    )
-    parser.add_argument(
-        "--early-stop-patience",
-        type=int,
-        default=5,
+        default=True,
         help=(
-            "Stop training when rollout_ce has not improved by "
-            "--early-stop-min-delta over this many consecutive eval points."
+            "Enable outer-loop early stopping on rollout_ce plateau "
+            "(default: True). Task 5 will switch the signal to disagreement_rate."
         ),
     )
     parser.add_argument(
-        "--early-stop-min-delta",
+        "--no-outer-early-stop",
+        dest="outer_early_stop",
+        action="store_false",
+        help="Disable outer-loop early stopping.",
+    )
+    parser.add_argument(
+        "--outer-early-stop-patience",
+        type=int,
+        default=5,
+        help=(
+            "Stop training when the tracked signal has not improved by "
+            "--outer-early-stop-min-delta over this many consecutive eval points."
+        ),
+    )
+    parser.add_argument(
+        "--outer-early-stop-min-delta",
         type=float,
         default=0.005,
-        help="Minimum improvement in rollout_ce to count as progress",
+        help="Min improvement to count as progress for outer ES (default 0.005).",
     )
     parser.add_argument(
         "--policy-mode",
