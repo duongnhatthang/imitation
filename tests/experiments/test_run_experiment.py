@@ -597,3 +597,51 @@ def test_inner_train_fixed_budget_records_stop_epoch(tmp_path):
     for m in result["per_round"]:
         assert m.get("inner_es_stop_epoch") == 3, f"Expected stop_epoch=3, got {m.get('inner_es_stop_epoch')}"
         assert m.get("inner_es_fallback") in (None, "")
+
+
+def test_inner_train_early_stop_records_stop_epoch(tmp_path):
+    """With inner_early_stop=True and a large enough dataset, BC fixed records
+    inner_es_stop_epoch <= bc_n_epochs and a non-empty val NLL trajectory.
+    """
+    config = _make_config(
+        "bc",
+        tmp_path,
+        bc_n_epochs=20,
+        n_rounds=2,
+        inner_early_stop=True,
+        inner_early_stop_patience=3,
+        inner_early_stop_min_epochs=2,
+        inner_early_stop_val_frac=0.1,
+        inner_early_stop_min_val_size=32,
+        outer_early_stop=False,
+    )
+    result = run_single(config)
+    assert len(result["per_round"]) >= 1
+    for m in result["per_round"]:
+        stop_ep = m.get("inner_es_stop_epoch")
+        assert stop_ep is not None and isinstance(stop_ep, int)
+        assert 1 <= stop_ep <= 20
+        traj = m.get("inner_es_val_nll_trajectory", [])
+        # Either we stopped early (traj length == stop_ep) or hit the cap.
+        assert isinstance(traj, list)
+        assert len(traj) == stop_ep
+
+
+def test_inner_train_fallback_on_small_dataset(tmp_path):
+    """With val_frac × |D| < min_val_size, falls back to fixed budget and
+    logs inner_es_fallback="dataset_too_small".
+    """
+    config = _make_config(
+        "bc",
+        tmp_path,
+        bc_n_epochs=4,
+        n_rounds=2,
+        inner_early_stop=True,
+        inner_early_stop_val_frac=0.1,
+        inner_early_stop_min_val_size=10_000,  # forces fallback
+        outer_early_stop=False,
+    )
+    result = run_single(config)
+    for m in result["per_round"]:
+        assert m.get("inner_es_fallback") == "dataset_too_small"
+        assert m.get("inner_es_stop_epoch") == 4

@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import copy
 import dataclasses
 import gc
 import json
@@ -274,8 +275,114 @@ def _inner_train(
             "inner_es_fallback": None,
         }
 
-    # Val-split early-stop branch lands in Task 7.
-    raise NotImplementedError("inner_early_stop=True path lands in Task 7")
+    # --- inner_early_stop=True: held-out-val early stopping ---
+
+    # 1. For DAgger callers, load this round's demos without training (n_epochs=0
+    #    skips gradient steps but still aggregates demos and advances round_num).
+    #    For BC callers, the trainer already has the full dataset.
+    if is_dagger:
+        trainer_or_bc.extend_and_update({"n_epochs": 0})
+        bc_trainer = trainer_or_bc.bc_trainer
+    else:
+        bc_trainer = trainer_or_bc
+
+    # 2. Extract the full transitions from the BC trainer's data loader.
+    full_transitions = bc_trainer._demo_data_loader.dataset
+
+    # 3. Decide val split.
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=len(full_transitions),
+        seed=int(config.seed),
+        round_num=int(round_num),
+        val_frac=float(config.inner_early_stop_val_frac),
+        min_val_size=int(config.inner_early_stop_min_val_size),
+    )
+
+    if train_idx is None:
+        # Dataset too small for a meaningful val split → fixed budget on full set.
+        bc_trainer.train(n_epochs=max_epochs, progress_bar=False)
+        return {
+            "inner_es_stop_epoch": max_epochs,
+            "inner_es_val_nll_best": None,
+            "inner_es_val_nll_trajectory": [],
+            "inner_es_fallback": "dataset_too_small",
+        }
+
+    # 4. Carve the train and val slices.
+    if isinstance(full_transitions, types.TransitionsMinimal):
+        # TransitionsMinimal.__getitem__ only accepts int/slice; build new
+        # dataclass instances by field-wise gather (same pattern as
+        # _collect_and_subsample_transitions).
+        train_subset = dataclasses.replace(
+            full_transitions,
+            **{
+                f.name: getattr(full_transitions, f.name)[train_idx]
+                for f in dataclasses.fields(full_transitions)
+            },
+        )
+        val_subset = dataclasses.replace(
+            full_transitions,
+            **{
+                f.name: getattr(full_transitions, f.name)[val_idx]
+                for f in dataclasses.fields(full_transitions)
+            },
+        )
+        val_obs = np.asarray(val_subset.obs)
+        val_acts = np.asarray(val_subset.acts)
+    else:
+        # List-of-dicts fallback.
+        train_subset = [full_transitions[int(i)] for i in train_idx]
+        val_subset = [full_transitions[int(i)] for i in val_idx]
+        val_obs = np.stack([t["obs"] for t in val_subset]).astype(np.float32)
+        val_acts = np.stack([t["acts"] for t in val_subset])
+
+    # 5. Re-bind BC trainer to train-only.
+    bc_trainer.set_demonstrations(train_subset)
+
+    # 6. Loop epochs with val-NLL early stop.
+    patience = int(config.inner_early_stop_patience)
+    min_delta = float(config.inner_early_stop_min_delta)
+    min_epochs = int(config.inner_early_stop_min_epochs)
+    best_val = float("inf")
+    best_state = None
+    patience_ctr = 0
+    val_nll_trajectory: List[float] = []
+    stop_epoch = max_epochs
+    for epoch in range(max_epochs):
+        bc_trainer.train(n_epochs=1, progress_bar=False, reset_tensorboard=False)
+        val_nll = _compute_val_nll(
+            bc_trainer.policy,
+            val_obs,
+            val_acts,
+            batch_size=int(config.bc_batch_size),
+        )
+        val_nll_trajectory.append(float(val_nll))
+        if val_nll + min_delta < best_val:
+            best_val = float(val_nll)
+            best_state = copy.deepcopy(bc_trainer.policy.state_dict())
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
+        if epoch + 1 >= min_epochs and patience_ctr >= patience:
+            stop_epoch = epoch + 1
+            break
+
+    # 7. Restore best weights (if we ever saw an improvement).
+    if best_state is not None:
+        bc_trainer.policy.load_state_dict(best_state)
+
+    # 8. Restore the BC trainer's data loader to the full dataset for any
+    #    downstream operations (e.g. next round's extend_and_update will call
+    #    set_demonstrations itself; for BC fixed, restore here so post-round
+    #    bookkeeping sees the full set).
+    bc_trainer.set_demonstrations(full_transitions)
+
+    return {
+        "inner_es_stop_epoch": stop_epoch,
+        "inner_es_val_nll_best": (None if best_val == float("inf") else best_val),
+        "inner_es_val_nll_trajectory": val_nll_trajectory,
+        "inner_es_fallback": None,
+    }
 
 
 def _should_outer_early_stop(
