@@ -1,10 +1,10 @@
 """Plotting for FTL vs FTRL vs BC (growing dataset) vs BC experiment results.
 
-Generates per-environment figures with 4 subplots:
-  1. Rollout cross-entropy on the aggregated D_eval^t buffer (log scale)
-  2. Normalized expected return
-  3. On-policy disagreement rate
-  4. Cumulative regret (vs best dynamic algo)
+Generates per-environment figures with 4 subplots (linear x-axis by default):
+  1. Rollout cross-entropy on the aggregated D_eval^t buffer (log y)
+  2. Normalized expected return (log y, floor 1e-3)
+  3. On-policy disagreement rate (log y, floor 1e-3)
+  4. Cumulative regret vs expert pi* (linear y)
 
 Uses IQM + 95% stratified bootstrap CI (via rliable) instead of mean +/- std.
 Supports incremental generation -- can plot partial results as experiments complete.
@@ -491,14 +491,12 @@ def plot_env(
     )
 
     # Subplot 1: rollout_cross_entropy on the aggregated D_eval^t buffer.
-    # Log x-axis to zoom in on early learning.
     _plot_metric(
         ax1,
         env_df,
         "rollout_cross_entropy",
         r"Rollout CE on $D_{\mathrm{eval}}^t$",
         log_scale=True,
-        log_x=True,
         allowed_algos=LOSS_SUBPLOT_ALGOS,
     )
     if show_expert_on_loss:
@@ -517,14 +515,13 @@ def plot_env(
 
     # Subplot 2: Normalized expected return.
     # Log y-axis (clipped to a small floor since round 0 can be slightly
-    # negative and the random baseline is exactly 0). Log x-axis as well.
+    # negative and the random baseline is exactly 0).
     _plot_metric(
         ax2,
         env_df,
         "normalized_return",
         "Normalized Return",
         log_scale=True,
-        log_x=True,
         y_clip_floor=1e-3,
     )
     ax2.axhline(
@@ -538,26 +535,23 @@ def plot_env(
     ax2.legend(fontsize=9)
 
     # Subplot 3: On-policy disagreement rate (dynamic algos + fixed BC).
-    # Log y-axis (natural for a rate in [0, 1]) + log x.
+    # Log y-axis (natural for a rate in [0, 1]).
     _plot_metric(
         ax3,
         env_df,
         "disagreement_rate",
         "Disagreement Rate",
         log_scale=True,
-        log_x=True,
         y_clip_floor=1e-3,
         allowed_algos={"ftl", "ftrl", "bc_dagger", "bc"},
     )
 
-    # Subplot 4: Cumulative regret vs expert.
-    # Log x only (regret can be negative, so linear y).
+    # Subplot 4: Cumulative regret vs expert. Linear y (regret can be negative).
     _plot_metric(
         ax4,
         env_df,
         "cum_regret",
         r"Cumulative Regret (vs Expert $\pi^*$)",
-        log_x=True,
         allowed_algos=LOSS_SUBPLOT_ALGOS,
     )
 
