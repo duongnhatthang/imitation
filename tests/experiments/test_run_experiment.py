@@ -13,7 +13,12 @@ from imitation.experiments.ftrl.run_experiment import (
 
 
 def _make_config(algo, tmp_path, **overrides):
-    """Helper to create an ExperimentConfig for testing."""
+    """Helper to create an ExperimentConfig for testing.
+
+    Inner / outer early-stop default to OFF in the fixture so the existing
+    smoke tests exercise deterministic fixed-budget behavior. Tests targeting
+    early-stop semantics opt in explicitly.
+    """
     defaults = dict(
         algo=algo,
         env_name="CartPole-v1",
@@ -29,6 +34,8 @@ def _make_config(algo, tmp_path, **overrides):
         eval_interval=5,
         output_dir=tmp_path / "results",
         expert_cache_dir=tmp_path / "experts",
+        inner_early_stop=False,
+        outer_early_stop=False,
     )
     defaults.update(overrides)
     return ExperimentConfig(**defaults)
@@ -498,8 +505,25 @@ def test_experiment_config_accepts_new_es_fields(tmp_path):
     assert config.inner_early_stop is False
     assert config.inner_early_stop_min_val_size == 64
 
-    # Defaults that the test didn't override.
-    config_defaults = _make_config("ftrl", tmp_path)
+    # Production defaults asserted directly on the dataclass (bypassing
+    # _make_config which turns ES off in its fixture). This pins the
+    # production defaults regardless of what the test helper sets.
+    config_defaults = ExperimentConfig(
+        algo="ftrl",
+        env_name="CartPole-v1",
+        seed=0,
+        policy_mode="end_to_end",
+        n_rounds=3,
+        samples_per_round=300,
+        l2_lambda=1e-4,
+        l2_decay=False,
+        warm_start=True,
+        beta_rampdown=2,
+        bc_n_epochs=2,
+        eval_interval=5,
+        output_dir=tmp_path / "results",
+        expert_cache_dir=tmp_path / "experts",
+    )
     assert config_defaults.outer_early_stop is True
     assert config_defaults.outer_early_stop_disagreement_ceiling == 0.05
     assert config_defaults.inner_early_stop is True
