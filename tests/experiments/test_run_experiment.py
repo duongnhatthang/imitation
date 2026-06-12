@@ -556,3 +556,20 @@ def test_should_outer_early_stop_fires_at_exact_ceiling():
     history = [0.05] * 10
     assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
                                     disagreement_ceiling=0.05) is True
+
+
+def test_inner_train_fixed_budget_records_stop_epoch(tmp_path):
+    """With inner_early_stop=False, each per-round dict records stop_epoch == bc_n_epochs."""
+    config = _make_config(
+        "bc",
+        tmp_path,
+        bc_n_epochs=3,
+        n_rounds=2,
+        inner_early_stop=False,
+        outer_early_stop=False,
+    )
+    result = run_single(config)
+    assert len(result["per_round"]) >= 1
+    for m in result["per_round"]:
+        assert m.get("inner_es_stop_epoch") == 3, f"Expected stop_epoch=3, got {m.get('inner_es_stop_epoch')}"
+        assert m.get("inner_es_fallback") in (None, "")

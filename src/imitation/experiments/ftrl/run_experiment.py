@@ -229,6 +229,55 @@ def _split_transitions_for_val(
     return train_idx, val_idx
 
 
+def _inner_train(
+    trainer_or_bc,
+    config: "ExperimentConfig",
+    round_num: int,
+    is_dagger: bool,
+) -> Dict[str, Any]:
+    """Run one round of inner BC training, with optional val-split early stopping.
+
+    For ``inner_early_stop=False`` (this task) runs the underlying BC training
+    once with ``n_epochs=config.bc_n_epochs``. For DAgger callers this routes
+    through ``extend_and_update`` so the round counter advances and demos
+    aggregate; for BC / BC-DAgger callers it calls ``bc_trainer.train`` directly.
+
+    The val-split early-stop branch lands in Task 7.
+
+    Args:
+        trainer_or_bc: A ``SimpleDAggerTrainer`` (or subclass) if ``is_dagger``;
+            otherwise a ``BC`` instance.
+        config: Full experiment config; reads ``bc_n_epochs`` and the
+            ``inner_early_stop_*`` family.
+        round_num: Current DAgger round (used for val-split seeding when
+            ``inner_early_stop=True``).
+        is_dagger: ``True`` routes to ``extend_and_update``; ``False`` routes to
+            ``bc_trainer.train``.
+
+    Returns:
+        Dict with keys ``inner_es_stop_epoch`` (int, equals ``bc_n_epochs`` when
+        early-stop didn't fire), ``inner_es_val_nll_best`` (float or None),
+        ``inner_es_val_nll_trajectory`` (list[float]), ``inner_es_fallback``
+        (str | None).
+    """
+    max_epochs = int(config.bc_n_epochs)
+
+    if not config.inner_early_stop:
+        if is_dagger:
+            trainer_or_bc.extend_and_update({"n_epochs": max_epochs})
+        else:
+            trainer_or_bc.train(n_epochs=max_epochs, progress_bar=False)
+        return {
+            "inner_es_stop_epoch": max_epochs,
+            "inner_es_val_nll_best": None,
+            "inner_es_val_nll_trajectory": [],
+            "inner_es_fallback": None,
+        }
+
+    # Val-split early-stop branch lands in Task 7.
+    raise NotImplementedError("inner_early_stop=True path lands in Task 7")
+
+
 def _should_outer_early_stop(
     disagreement_history: List[float],
     patience: int,
@@ -664,7 +713,7 @@ def _run_dagger_variant(
             _truncate_round_demos(round_dir, config.samples_per_round, rng)
 
         # --- 3. Train on all accumulated demos ---
-        trainer.extend_and_update({})
+        inner_log = _inner_train(trainer, config, round_num=round_num, is_dagger=True)
         cum_obs += config.samples_per_round
 
         metrics = list(trainer.get_metrics())
@@ -680,6 +729,7 @@ def _run_dagger_variant(
             "normalized_return": None,
             "disagreement_rate": None,
             "d_eval_size": None,
+            **inner_log,
         }
 
         if eval_data is not None:
@@ -783,7 +833,7 @@ def _run_bc(
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
     )
-    bc_trainer.train(n_epochs=config.bc_n_epochs)
+    inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
 
     eval_data = _compute_round_eval(
         bc_trainer.policy, expert_policy, venv, baselines,
@@ -801,6 +851,7 @@ def _run_bc(
             "train_cross_entropy": None,
             "l2_norm": round(l2_norm, 6),
             "total_loss": None,
+            **inner_log,
             **eval_data,
         }
     ]
@@ -935,7 +986,7 @@ def _run_bc_dagger(
             optimizer_kwargs={"lr": config.learning_rate},
             custom_logger=custom_logger,
         )
-        bc_trainer.train(n_epochs=config.bc_n_epochs)
+        inner_log = _inner_train(bc_trainer, config, round_num=round_num, is_dagger=False)
         policy = bc_trainer.policy
 
         l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
@@ -952,6 +1003,7 @@ def _run_bc_dagger(
             "normalized_return": None,
             "disagreement_rate": None,
             "d_eval_size": None,
+            **inner_log,
         }
 
         if eval_data is not None:
