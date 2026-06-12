@@ -353,3 +353,29 @@ def test_ftl_with_small_bc_batch_size(tmp_path):
     result = run_single(config)
     assert result["algo"] == "ftl"
     assert len(result["per_round"]) >= 2
+
+
+def test_compute_val_nll_handles_empty_returns_inf():
+    """_compute_val_nll on a 0-row val slice returns float('inf')."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.zeros((0, env.observation_space.shape[0]), dtype=np.float32)
+    val_acts = np.zeros((0,), dtype=np.int64)
+    assert _compute_val_nll(policy, val_obs, val_acts, batch_size=32) == float("inf")
+
+
+def test_compute_val_nll_finite_on_nonempty():
+    """_compute_val_nll on a small val slice returns a finite, non-negative scalar."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.random.randn(64, env.observation_space.shape[0]).astype(np.float32)
+    val_acts = np.random.randint(0, env.action_space.n, size=64).astype(np.int64)
+    val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
+    assert np.isfinite(val_nll)
+    assert val_nll >= 0.0

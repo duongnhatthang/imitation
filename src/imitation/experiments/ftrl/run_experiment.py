@@ -163,6 +163,40 @@ def _compute_round_eval(
     }
 
 
+def _compute_val_nll(
+    policy,
+    val_obs: np.ndarray,
+    val_acts: np.ndarray,
+    batch_size: int,
+) -> float:
+    """Mean negative log-likelihood of expert actions under the current policy.
+
+    Evaluated on a held-out validation slice with no gradient. Returns
+    ``float('inf')`` if the validation slice is empty so the caller's
+    early-stop check treats it as "no improvement".
+    """
+    import torch as th
+
+    n = int(val_obs.shape[0])
+    if n == 0:
+        return float("inf")
+
+    device = next(policy.parameters()).device
+    total_nll = 0.0
+    total_count = 0
+    policy.eval()
+    with th.no_grad():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            obs_chunk = th.as_tensor(val_obs[start:end]).to(device)
+            acts_chunk = th.as_tensor(val_acts[start:end]).to(device)
+            _, log_prob, _ = policy.evaluate_actions(obs_chunk, acts_chunk)
+            total_nll += float(-log_prob.sum().item())
+            total_count += end - start
+    policy.train()
+    return total_nll / max(total_count, 1)
+
+
 def _should_early_stop(
     rce_history: List[float],
     patience: int,
