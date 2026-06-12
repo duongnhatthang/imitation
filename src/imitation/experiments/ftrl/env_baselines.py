@@ -157,8 +157,8 @@ def compute_baselines(
     expert_policy,
     venv: VecEnv,
     rng: np.random.Generator,
-    n_expert_episodes: int = 20,
-    n_random_episodes: int = 100,
+    n_expert_episodes: int = 500,
+    n_random_episodes: int = 500,
 ) -> Dict[str, float]:
     r"""Compute expert return, random return, and expert self-CE baselines.
 
