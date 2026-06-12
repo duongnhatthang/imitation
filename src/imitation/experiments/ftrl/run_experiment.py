@@ -187,6 +187,28 @@ def _compute_val_nll(
     return float(compute_sampled_action_ce(policy, val_obs, val_acts))
 
 
+def _split_transitions_for_val(
+    n_transitions: int,
+    seed: int,
+    round_num: int,
+    val_frac: float,
+    min_val_size: int,
+):
+    """Return (train_idx, val_idx) numpy arrays or (None, None) on fallback.
+
+    Fallback (None, None) triggers when val_frac * n_transitions < min_val_size.
+    Deterministic for a given (seed, round_num) pair.
+    """
+    n_val = int(val_frac * n_transitions)
+    if n_val < min_val_size:
+        return None, None
+    rng = np.random.default_rng(seed + round_num)
+    perm = rng.permutation(n_transitions)
+    val_idx = np.sort(perm[:n_val])
+    train_idx = np.sort(perm[n_val:])
+    return train_idx, val_idx
+
+
 def _should_early_stop(
     rce_history: List[float],
     patience: int,

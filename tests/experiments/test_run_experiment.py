@@ -413,3 +413,45 @@ def test_compute_val_nll_handles_batch_size_larger_than_n():
     val_acts = np.random.randint(0, env.action_space.n, size=7).astype(np.int64)
     val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=64)
     assert np.isfinite(val_nll) and val_nll >= 0.0
+
+
+def test_split_transitions_for_val_deterministic_and_sized():
+    """Split is deterministic for same (seed, round_num)."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    n = 500  # large enough to avoid fallback
+    train_idx_a, val_idx_a = _split_transitions_for_val(
+        n_transitions=n, seed=42, round_num=3, val_frac=0.1, min_val_size=32,
+    )
+    train_idx_b, val_idx_b = _split_transitions_for_val(
+        n_transitions=n, seed=42, round_num=3, val_frac=0.1, min_val_size=32,
+    )
+    np.testing.assert_array_equal(train_idx_a, train_idx_b)
+    np.testing.assert_array_equal(val_idx_a, val_idx_b)
+    assert val_idx_a.shape[0] == 50  # 10% of 500
+
+
+def test_split_transitions_for_val_returns_none_when_too_small():
+    """Returns (None, None) when val slice would be below min_val_size."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    # n=100, val_frac=0.1 → n_val=10 < min_val_size=32 → fallback
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=100, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is None
+    assert val_idx is None
+
+
+def test_split_transitions_for_val_partition_no_overlap():
+    """Train and val indices partition [0, n) with no overlap."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    n = 500
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=n, seed=7, round_num=2, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is not None and val_idx is not None
+    assert set(train_idx).isdisjoint(set(val_idx))
+    assert set(train_idx) | set(val_idx) == set(range(n))
+    assert val_idx.shape[0] == 50  # 10% of 500
