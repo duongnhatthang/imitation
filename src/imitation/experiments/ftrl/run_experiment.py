@@ -1252,6 +1252,13 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         outer_early_stop=args.outer_early_stop,
                         outer_early_stop_patience=args.outer_early_stop_patience,
                         outer_early_stop_min_delta=args.outer_early_stop_min_delta,
+                        outer_early_stop_disagreement_ceiling=args.outer_early_stop_disagreement_ceiling,
+                        inner_early_stop=args.inner_early_stop,
+                        inner_early_stop_patience=args.inner_early_stop_patience,
+                        inner_early_stop_min_delta=args.inner_early_stop_min_delta,
+                        inner_early_stop_val_frac=args.inner_early_stop_val_frac,
+                        inner_early_stop_min_val_size=args.inner_early_stop_min_val_size,
+                        inner_early_stop_min_epochs=args.inner_early_stop_min_epochs,
                     )
                 )
     return configs
@@ -1286,8 +1293,8 @@ def main():
     parser.add_argument(
         "--samples-per-round",
         type=int,
-        default=50,
-        help="Min timesteps per DAgger round",
+        default=1,
+        help="Min timesteps per DAgger round (default: 1)",
     )
     # Python 3.8 doesn't have argparse.BooleanOptionalAction, so we pair
     # store_true / store_false on a shared dest.
@@ -1321,6 +1328,53 @@ def main():
         type=float,
         default=0.005,
         help="Min improvement to count as progress for outer ES (default 0.005).",
+    )
+    parser.add_argument(
+        "--outer-early-stop-disagreement-ceiling",
+        type=float,
+        default=0.05,
+        help=(
+            "Outer ES only fires when the rolling-mean disagreement_rate is "
+            "<= this ceiling (default 0.05 = '<=5%% disagreement')."
+        ),
+    )
+    parser.add_argument(
+        "--inner-early-stop",
+        dest="inner_early_stop",
+        action="store_true",
+        default=True,
+        help="Enable val-split early stopping inside BC train (default: True).",
+    )
+    parser.add_argument(
+        "--no-inner-early-stop",
+        dest="inner_early_stop",
+        action="store_false",
+        help="Disable inner-loop early stopping (use full bc_n_epochs).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-patience",
+        type=int, default=5,
+        help="Epochs without val-NLL improvement before stopping (default 5).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-min-delta",
+        type=float, default=1e-4,
+        help="Min absolute val-NLL improvement to count as progress (default 1e-4).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-val-frac",
+        type=float, default=0.1,
+        help="Fraction of D^t held out for val (default 0.1).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-min-val-size",
+        type=int, default=32,
+        help="Below this val-set size, fall back to fixed bc_n_epochs (default 32).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-min-epochs",
+        type=int, default=3,
+        help="Don't trigger inner ES before this epoch (default 3).",
     )
     parser.add_argument(
         "--policy-mode",
