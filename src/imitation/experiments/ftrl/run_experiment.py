@@ -18,7 +18,7 @@ import os
 import pathlib
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch as th
@@ -193,16 +193,21 @@ def _split_transitions_for_val(
     round_num: int,
     val_frac: float,
     min_val_size: int,
-):
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Return (train_idx, val_idx) numpy arrays or (None, None) on fallback.
 
-    Fallback (None, None) triggers when val_frac * n_transitions < min_val_size.
-    Deterministic for a given (seed, round_num) pair.
+    ``n_val = floor(val_frac * n_transitions)``. Fallback ``(None, None)``
+    triggers when ``n_val < min_val_size`` (strict). When ``n_val ==
+    min_val_size`` the split proceeds.
+
+    Deterministic for a given ``(seed, round_num)`` pair via the documented
+    ``SeedSequence`` list-seed form, which avoids the collision pattern of
+    arithmetic seed combination (e.g. seed=2/round=0 and seed=1/round=1).
     """
     n_val = int(val_frac * n_transitions)
     if n_val < min_val_size:
         return None, None
-    rng = np.random.default_rng(seed + round_num)
+    rng = np.random.default_rng([int(seed), int(round_num)])
     perm = rng.permutation(n_transitions)
     val_idx = np.sort(perm[:n_val])
     train_idx = np.sort(perm[n_val:])

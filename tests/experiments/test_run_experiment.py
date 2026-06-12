@@ -455,3 +455,27 @@ def test_split_transitions_for_val_partition_no_overlap():
     assert set(train_idx).isdisjoint(set(val_idx))
     assert set(train_idx) | set(val_idx) == set(range(n))
     assert val_idx.shape[0] == 50  # 10% of 500
+
+
+def test_split_transitions_for_val_boundary_equals_min_val():
+    """n_val == min_val_size should NOT trigger fallback (strict <)."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    # n=320, val_frac=0.1, min_val=32 → n_val = floor(32.0) = 32 → split, not fallback
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=320, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is not None and val_idx is not None
+    assert val_idx.shape[0] == 32
+    assert train_idx.shape[0] == 288
+
+
+def test_split_transitions_for_val_boundary_one_below_min_val():
+    """n_val == min_val_size - 1 SHOULD trigger fallback."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    # n=319, val_frac=0.1, min_val=32 → n_val = floor(31.9) = 31 → fallback
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=319, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is None and val_idx is None
