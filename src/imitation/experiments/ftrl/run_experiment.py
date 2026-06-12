@@ -107,15 +107,22 @@ class ExperimentConfig:
     expert_cache_dir: pathlib.Path
     learning_rate: float = 1e-3
     result_name_override: Optional[str] = None
+    # --- Outer-loop early stop: cross-round disagreement_rate plateau ---
     outer_early_stop: bool = True
     outer_early_stop_patience: int = 5
     outer_early_stop_min_delta: float = 0.005
+    # Stop only when the rolling-mean disagreement_rate is <= this ceiling
+    # (i.e. the policy already agrees with the expert at least ~95% of the time).
     outer_early_stop_disagreement_ceiling: float = 0.05
+    # --- Inner-loop early stop: per-round val-NLL plateau on held-out split ---
     inner_early_stop: bool = True
     inner_early_stop_patience: int = 5
     inner_early_stop_min_delta: float = 1e-4
     inner_early_stop_val_frac: float = 0.1
-    inner_early_stop_min_val: int = 32
+    # Minimum held-out val-set size below which we fall back to a fixed
+    # bc_n_epochs budget (matches the `min_val_size` parameter of
+    # `_split_transitions_for_val`).
+    inner_early_stop_min_val_size: int = 32
     inner_early_stop_min_epochs: int = 3
     subsample_strategy: str = "uniform"  # "uniform" or "prefix"
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
