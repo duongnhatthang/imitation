@@ -479,3 +479,32 @@ def test_split_transitions_for_val_boundary_one_below_min_val():
         n_transitions=319, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
     )
     assert train_idx is None and val_idx is None
+
+
+def test_experiment_config_accepts_new_es_fields(tmp_path):
+    """ExperimentConfig accepts renamed outer-ES + new inner-ES fields."""
+    config = _make_config(
+        "ftrl",
+        tmp_path,
+        outer_early_stop=False,
+        outer_early_stop_patience=7,
+        outer_early_stop_disagreement_ceiling=0.10,
+        inner_early_stop=False,
+        inner_early_stop_min_val=64,
+    )
+    assert config.outer_early_stop is False
+    assert config.outer_early_stop_patience == 7
+    assert config.outer_early_stop_disagreement_ceiling == 0.10
+    assert config.inner_early_stop is False
+    assert config.inner_early_stop_min_val == 64
+
+    # Defaults that the test didn't override.
+    config_defaults = _make_config("ftrl", tmp_path)
+    assert config_defaults.outer_early_stop is True
+    assert config_defaults.outer_early_stop_disagreement_ceiling == 0.05
+    assert config_defaults.inner_early_stop is True
+    assert config_defaults.inner_early_stop_patience == 5
+    assert config_defaults.inner_early_stop_min_delta == 1e-4
+    assert config_defaults.inner_early_stop_val_frac == 0.1
+    assert config_defaults.inner_early_stop_min_val == 32
+    assert config_defaults.inner_early_stop_min_epochs == 3

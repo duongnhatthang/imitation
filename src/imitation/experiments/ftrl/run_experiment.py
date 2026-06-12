@@ -107,9 +107,16 @@ class ExperimentConfig:
     expert_cache_dir: pathlib.Path
     learning_rate: float = 1e-3
     result_name_override: Optional[str] = None
-    early_stop: bool = False
-    early_stop_patience: int = 5
-    early_stop_min_delta: float = 0.005
+    outer_early_stop: bool = True
+    outer_early_stop_patience: int = 5
+    outer_early_stop_min_delta: float = 0.005
+    outer_early_stop_disagreement_ceiling: float = 0.05
+    inner_early_stop: bool = True
+    inner_early_stop_patience: int = 5
+    inner_early_stop_min_delta: float = 1e-4
+    inner_early_stop_val_frac: float = 0.1
+    inner_early_stop_min_val: int = 32
+    inner_early_stop_min_epochs: int = 3
     subsample_strategy: str = "uniform"  # "uniform" or "prefix"
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
 
