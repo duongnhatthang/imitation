@@ -278,25 +278,25 @@ def _inner_train(
 
     # --- inner_early_stop=True: held-out-val early stopping ---
 
-    # 1. For DAgger callers, load this round's demos without training. We rely
-    #    on the composition of three behaviors documented in spec §3.3:
-    #    (a) extend_and_update first calls _try_load_demos which aggregates new
-    #        demos into self._all_demos and rebinds bc_trainer's loader,
-    #    (b) BatchIteratorWithEpochEndCallback accepts n_epochs=0 (passes the
-    #        XOR-with-n_batches check at bc.py:47-57),
-    #    (c) the outer for-loop in batch_iterator() runs zero iterations under
-    #        islice(count(), 0), so no gradient steps and no per-epoch
-    #        AssertionError fires. round_num is still incremented.
-    #    If bc.py ever raises on n_epochs <= 0, this needs to switch to an
-    #    explicit extend-only helper on the DAgger trainer.
-    #    For BC callers, the trainer already has the full dataset.
+    # DAgger limitation: FTRLTrainer.extend_and_update wraps the parent's
+    # extend_and_update with L2-schedule updates and per-round-loss tracking
+    # (see ftrl.py:321-375). Bypassing it to insert a val split would lose
+    # that bookkeeping AND BC.train(n_epochs=0) crashes (UnboundLocalError
+    # in bc.py:507). Pragmatic call: for DAgger paths we currently fall
+    # back to the fixed-budget path even when inner_early_stop=True. The
+    # outer-loop ES (between rounds, on disagreement_rate) handles the
+    # rough equivalent. Wiring inner ES into DAgger needs an extend-only
+    # helper on the FTRL trainer; tracked as follow-up.
     if is_dagger:
-        trainer_or_bc.extend_and_update({"n_epochs": 0})
-        bc_trainer = trainer_or_bc.bc_trainer
-    else:
-        bc_trainer = trainer_or_bc
+        trainer_or_bc.extend_and_update({"n_epochs": max_epochs})
+        return {
+            "inner_es_stop_epoch": max_epochs,
+            "inner_es_val_nll_best": None,
+            "inner_es_val_nll_trajectory": [],
+            "inner_es_fallback": "dagger_fixed_budget",
+        }
 
-    # 2. Extract the full transitions from the BC trainer's data loader.
+    bc_trainer = trainer_or_bc
     full_transitions = bc_trainer._demo_data_loader.dataset
 
     # 3. Decide val split.
@@ -738,7 +738,13 @@ def _run_dagger_variant(
         format_strs=[],
     )
 
-    # Create BC trainer
+    # Create BC trainer. Cap batch_size at samples_per_round so round 0 (which
+    # has exactly samples_per_round transitions) can form at least one batch.
+    # _try_load_demos in dagger.py raises ValueError if len(transitions) <
+    # batch_size, which would otherwise prevent any DAgger run with
+    # samples_per_round < bc_batch_size (the new --samples-per-round=1 default
+    # would always trip this).
+    initial_batch_size = max(1, min(config.bc_batch_size, config.samples_per_round))
     bc_trainer = bc.BC(
         observation_space=venv.observation_space,
         action_space=venv.action_space,
@@ -746,7 +752,7 @@ def _run_dagger_variant(
         policy=policy,
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
-        batch_size=config.bc_batch_size,
+        batch_size=initial_batch_size,
     )
 
     # Create scratch dir for this run. Clear any stale contents from a
