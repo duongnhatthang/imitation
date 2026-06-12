@@ -278,26 +278,21 @@ def _inner_train(
 
     # --- inner_early_stop=True: held-out-val early stopping ---
 
-    # DAgger limitation: FTRLTrainer.extend_and_update wraps the parent's
-    # extend_and_update with L2-schedule updates and per-round-loss tracking
-    # (see ftrl.py:321-375). Bypassing it to insert a val split would lose
-    # that bookkeeping AND BC.train(n_epochs=0) crashes (UnboundLocalError
-    # in bc.py:507). Pragmatic call: for DAgger paths we currently fall
-    # back to the fixed-budget path even when inner_early_stop=True. The
-    # outer-loop ES (between rounds, on disagreement_rate) handles the
-    # rough equivalent. Wiring inner ES into DAgger needs an extend-only
-    # helper on the FTRL trainer; tracked as follow-up.
+    # For DAgger callers we use FTRLTrainer.extend_only (loads this round's
+    # demos, updates L2 weight, advances round_num, no training). We track
+    # current_round so the post-train per-round metrics get appended to the
+    # right slot. BC callers already hold the full dataset on their trainer.
     if is_dagger:
-        trainer_or_bc.extend_and_update({"n_epochs": max_epochs})
-        return {
-            "inner_es_stop_epoch": max_epochs,
-            "inner_es_val_nll_best": None,
-            "inner_es_val_nll_trajectory": [],
-            "inner_es_fallback": "dagger_fixed_budget",
-        }
-
-    bc_trainer = trainer_or_bc
-    full_transitions = bc_trainer._demo_data_loader.dataset
+        dagger_current_round = trainer_or_bc.extend_only()
+        bc_trainer = trainer_or_bc.bc_trainer
+        # DAgger's _try_load_demos rebuilds the loader as a th_data.DataLoader,
+        # then set_demonstrations wraps it in _WrappedDataLoader (no .dataset).
+        # Use _all_demos directly.
+        full_transitions = rollout.flatten_trajectories(trainer_or_bc._all_demos)
+    else:
+        dagger_current_round = None
+        bc_trainer = trainer_or_bc
+        full_transitions = bc_trainer._demo_data_loader.dataset
 
     # 3. Decide val split.
     train_idx, val_idx = _split_transitions_for_val(
@@ -311,6 +306,8 @@ def _inner_train(
     if train_idx is None:
         # Dataset too small for a meaningful val split → fixed budget on full set.
         bc_trainer.train(n_epochs=max_epochs, progress_bar=False)
+        if is_dagger and dagger_current_round is not None:
+            trainer_or_bc.track_round_loss(dagger_current_round)
         return {
             "inner_es_stop_epoch": max_epochs,
             "inner_es_val_nll_best": None,
@@ -390,6 +387,12 @@ def _inner_train(
     #    extend_and_update and bc_dagger's fresh bc_trainer rebuild it from
     #    scratch — but kept for forward compatibility).
     bc_trainer.set_demonstrations(full_transitions)
+
+    # 9. For DAgger callers, append per-round metrics now that training is
+    #    done. extend_only deferred this step so we could insert the val
+    #    split + ES loop between data load and metric tracking.
+    if is_dagger and dagger_current_round is not None:
+        trainer_or_bc.track_round_loss(dagger_current_round)
 
     # Compute the actually-best logged val NLL across the trajectory. This
     # differs from `best_val` when the very first val_nll was finite but
