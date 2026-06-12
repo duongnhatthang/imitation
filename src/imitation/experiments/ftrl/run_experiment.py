@@ -228,13 +228,13 @@ def _split_transitions_for_val(
     return train_idx, val_idx
 
 
-def _should_early_stop(
-    rce_history: List[float],
+def _should_outer_early_stop(
+    disagreement_history: List[float],
     patience: int,
     min_delta: float,
-    expert_ce_floor: Optional[float] = None,
+    disagreement_ceiling: float,
 ) -> bool:
-    """Return True if rollout_ce has plateaued AND is near expert-level.
+    """Return True if disagreement_rate has plateaued AND is below the ceiling.
 
     Two-criterion stop, both must hold:
 
@@ -243,25 +243,22 @@ def _should_early_stop(
        immediately before that window. If the improvement is less than
        ``min_delta``, the signal has plateaued. Requires at least
        ``2 * patience`` eval points before the first check.
-       Using means rather than mins makes the check noise-robust — a
-       single lucky-low early eval no longer pins a false "best ever".
 
-    2. **Absolute sanity gate.** If ``expert_ce_floor`` is provided, also
-       require the current rolling mean to be within ``2 * expert_ce_floor``
-       of zero. Prevents early-stopping while rollout_ce is still
-       clearly far from expert-level (as happened on noisy LunarLander
-       BC (growing dataset) runs with the old min-based criterion).
+    2. **Absolute disagreement ceiling.** Only allow stopping if the
+       current rolling mean is at or below ``disagreement_ceiling``
+       (default 0.05 = "agrees with expert at least 95% of the time").
+       Prevents stopping on a high-disagreement plateau.
     """
-    if patience < 1 or len(rce_history) < 2 * patience:
+    if patience < 1 or len(disagreement_history) < 2 * patience:
         return False
-    window = rce_history[-patience:]
-    prior = rce_history[-2 * patience : -patience]
+    window = disagreement_history[-patience:]
+    prior = disagreement_history[-2 * patience : -patience]
     current_mean = float(np.mean(window))
     prior_mean = float(np.mean(prior))
     plateau = (prior_mean - current_mean) < min_delta
     if not plateau:
         return False
-    if expert_ce_floor is not None and current_mean > 2.0 * expert_ce_floor:
+    if current_mean > disagreement_ceiling:
         return False
     return True
 
@@ -596,14 +593,14 @@ def _run_dagger_variant(
         custom_logger=custom_logger,
     )
 
-    rce_history: List[float] = []
+    disagreement_history: List[float] = []
     per_round: List[Dict[str, Any]] = []
 
     # Round 0: evaluate the fresh (untrained) policy.
     round0_eval = _compute_round_eval(
         bc_trainer.policy, expert_policy, venv, baselines,
     )
-    rce_history.append(round0_eval["rollout_cross_entropy"])
+    disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
         {
             "round": 0,
@@ -629,19 +626,19 @@ def _run_dagger_variant(
             eval_data = _compute_round_eval(
                 bc_trainer.policy, expert_policy, venv, baselines,
             )
-            rce_history.append(eval_data["rollout_cross_entropy"])
+            disagreement_history.append(eval_data["disagreement_rate"])
 
-            if config.outer_early_stop and _should_early_stop(
-                rce_history,
+            if config.outer_early_stop and _should_outer_early_stop(
+                disagreement_history,
                 config.outer_early_stop_patience,
                 config.outer_early_stop_min_delta,
-                expert_ce_floor=baselines.get("expert_self_ce"),
+                disagreement_ceiling=config.outer_early_stop_disagreement_ceiling,
             ):
                 stopped_early = True
                 logger.info(
                     f"{config.algo}/{config.env_name}/seed{config.seed}: "
                     f"early stop at round {round_num} "
-                    f"(rollout_ce plateau over "
+                    f"(disagreement plateau over "
                     f"{config.outer_early_stop_patience} eval points)"
                 )
 
@@ -859,14 +856,14 @@ def _run_bc_dagger(
             venv.observation_space, venv.action_space
         )
 
-    rce_history: List[float] = []
+    disagreement_history: List[float] = []
     per_round: List[Dict[str, Any]] = []
 
     # Round 0: evaluate fresh policy.
     round0_eval = _compute_round_eval(
         policy, expert_policy, venv, baselines,
     )
-    rce_history.append(round0_eval["rollout_cross_entropy"])
+    disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
         {
             "round": 0,
@@ -891,19 +888,19 @@ def _run_bc_dagger(
             eval_data = _compute_round_eval(
                 policy, expert_policy, venv, baselines,
             )
-            rce_history.append(eval_data["rollout_cross_entropy"])
+            disagreement_history.append(eval_data["disagreement_rate"])
 
-            if config.outer_early_stop and _should_early_stop(
-                rce_history,
+            if config.outer_early_stop and _should_outer_early_stop(
+                disagreement_history,
                 config.outer_early_stop_patience,
                 config.outer_early_stop_min_delta,
-                expert_ce_floor=baselines.get("expert_self_ce"),
+                disagreement_ceiling=config.outer_early_stop_disagreement_ceiling,
             ):
                 stopped_early = True
                 logger.info(
                     f"bc_dagger/{config.env_name}/seed{config.seed}: "
                     f"early stop at round {round_num} "
-                    f"(rollout_ce plateau over "
+                    f"(disagreement plateau over "
                     f"{config.outer_early_stop_patience} eval points)"
                 )
 
@@ -1120,8 +1117,8 @@ def main():
         action="store_true",
         default=True,
         help=(
-            "Enable outer-loop early stopping on rollout_ce plateau "
-            "(default: True). Task 5 will switch the signal to disagreement_rate."
+            "Enable outer-loop early stopping on disagreement_rate plateau "
+            "(default: True)."
         ),
     )
     parser.add_argument(

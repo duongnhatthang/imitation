@@ -514,3 +514,27 @@ def test_experiment_config_accepts_new_es_fields(tmp_path):
         _make_config("ftrl", tmp_path, early_stop=True)
     with pytest.raises(TypeError):
         _make_config("ftrl", tmp_path, inner_early_stop_min_val=64)
+
+
+def test_should_outer_early_stop_fires_on_plateau_below_ceiling():
+    """Disagreement plateau below ceiling → fires."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    history = [0.02] * 10
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is True
+
+
+def test_should_outer_early_stop_blocked_above_ceiling():
+    """Even with plateau, blocked by ceiling."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    history = [0.30] * 10
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is False
+
+
+def test_should_outer_early_stop_needs_2x_patience_points():
+    """Doesn't fire before 2*patience points are available."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    history = [0.02] * 9  # less than 2*5
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is False
