@@ -134,7 +134,7 @@ def _compute_round_eval(
     eval_res = eval_policy_rollout(
         policy,
         venv,
-        n_episodes=10,
+        n_episodes=100,
         deterministic=True,
         expert_policy=expert_policy,
     )
