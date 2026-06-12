@@ -14,6 +14,7 @@ import dataclasses
 import gc
 import json
 import logging
+import math
 import multiprocessing
 import os
 import pathlib
@@ -277,8 +278,17 @@ def _inner_train(
 
     # --- inner_early_stop=True: held-out-val early stopping ---
 
-    # 1. For DAgger callers, load this round's demos without training (n_epochs=0
-    #    skips gradient steps but still aggregates demos and advances round_num).
+    # 1. For DAgger callers, load this round's demos without training. We rely
+    #    on the composition of three behaviors documented in spec §3.3:
+    #    (a) extend_and_update first calls _try_load_demos which aggregates new
+    #        demos into self._all_demos and rebinds bc_trainer's loader,
+    #    (b) BatchIteratorWithEpochEndCallback accepts n_epochs=0 (passes the
+    #        XOR-with-n_batches check at bc.py:47-57),
+    #    (c) the outer for-loop in batch_iterator() runs zero iterations under
+    #        islice(count(), 0), so no gradient steps and no per-epoch
+    #        AssertionError fires. round_num is still incremented.
+    #    If bc.py ever raises on n_epochs <= 0, this needs to switch to an
+    #    explicit extend-only helper on the DAgger trainer.
     #    For BC callers, the trainer already has the full dataset.
     if is_dagger:
         trainer_or_bc.extend_and_update({"n_epochs": 0})
@@ -367,19 +377,29 @@ def _inner_train(
             stop_epoch = epoch + 1
             break
 
-    # 7. Restore best weights (if we ever saw an improvement).
+    # 7. Restore best weights (if we ever saw an improvement). Note: only the
+    #    policy state_dict is restored. The BC optimizer (Adam) keeps its
+    #    accumulated momentum state from epochs after the best one — this is a
+    #    known compromise of restore-best patterns. Acceptable for warm-start
+    #    DAgger; revisit if we observe instability in wave-1 traces.
     if best_state is not None:
         bc_trainer.policy.load_state_dict(best_state)
 
-    # 8. Restore the BC trainer's data loader to the full dataset for any
-    #    downstream operations (e.g. next round's extend_and_update will call
-    #    set_demonstrations itself; for BC fixed, restore here so post-round
-    #    bookkeeping sees the full set).
+    # 8. Defensive: restore the full data loader so any downstream code that
+    #    consults it (currently none in this branch — both DAgger's next
+    #    extend_and_update and bc_dagger's fresh bc_trainer rebuild it from
+    #    scratch — but kept for forward compatibility).
     bc_trainer.set_demonstrations(full_transitions)
 
+    # Compute the actually-best logged val NLL across the trajectory. This
+    # differs from `best_val` when the very first val_nll was finite but
+    # subsequent ones never beat it by `min_delta` — in that case `best_state`
+    # stays None but the trajectory still has finite values worth reporting.
+    finite_traj = [v for v in val_nll_trajectory if math.isfinite(v)]
+    val_nll_best = min(finite_traj) if finite_traj else None
     return {
         "inner_es_stop_epoch": stop_epoch,
-        "inner_es_val_nll_best": (None if best_val == float("inf") else best_val),
+        "inner_es_val_nll_best": val_nll_best,
         "inner_es_val_nll_trajectory": val_nll_trajectory,
         "inner_es_fallback": None,
     }
