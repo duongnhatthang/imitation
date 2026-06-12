@@ -174,27 +174,17 @@ def _compute_val_nll(
     Evaluated on a held-out validation slice with no gradient. Returns
     ``float('inf')`` if the validation slice is empty so the caller's
     early-stop check treats it as "no improvement".
+
+    Thin wrapper over ``eval_utils.compute_sampled_action_ce`` that adds
+    the empty-slice ``inf`` convention. ``batch_size`` is accepted for
+    backwards-compatible call sites but ignored — the underlying helper
+    chooses its own batching.
     """
-    import torch as th
-
-    n = int(val_obs.shape[0])
-    if n == 0:
+    del batch_size  # underlying helper handles batching
+    if int(val_obs.shape[0]) == 0:
         return float("inf")
-
-    device = next(policy.parameters()).device
-    total_nll = 0.0
-    total_count = 0
-    policy.eval()
-    with th.no_grad():
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            obs_chunk = th.as_tensor(val_obs[start:end]).to(device)
-            acts_chunk = th.as_tensor(val_acts[start:end]).to(device)
-            _, log_prob, _ = policy.evaluate_actions(obs_chunk, acts_chunk)
-            total_nll += float(-log_prob.sum().item())
-            total_count += end - start
-    policy.train()
-    return total_nll / max(total_count, 1)
+    from imitation.experiments.ftrl.eval_utils import compute_sampled_action_ce
+    return float(compute_sampled_action_ce(policy, val_obs, val_acts))
 
 
 def _should_early_stop(

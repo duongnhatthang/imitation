@@ -379,3 +379,37 @@ def test_compute_val_nll_finite_on_nonempty():
     val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
     assert np.isfinite(val_nll)
     assert val_nll >= 0.0
+
+
+def test_compute_val_nll_preserves_policy_mode():
+    """_compute_val_nll restores the caller's policy mode (train/eval)."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.random.randn(8, env.observation_space.shape[0]).astype(np.float32)
+    val_acts = np.random.randint(0, env.action_space.n, size=8).astype(np.int64)
+
+    # Caller in eval mode → still in eval after.
+    policy.eval()
+    _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
+    assert not policy.training, "policy.training must remain False when caller was eval"
+
+    # Caller in train mode → still in train after.
+    policy.train()
+    _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
+    assert policy.training, "policy.training must remain True when caller was train"
+
+
+def test_compute_val_nll_handles_batch_size_larger_than_n():
+    """Single partial batch when batch_size > n_val."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.random.randn(7, env.observation_space.shape[0]).astype(np.float32)
+    val_acts = np.random.randint(0, env.action_space.n, size=7).astype(np.int64)
+    val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=64)
+    assert np.isfinite(val_nll) and val_nll >= 0.0
