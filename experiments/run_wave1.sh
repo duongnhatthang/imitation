@@ -49,7 +49,7 @@ echo "[wave1] generating plots ..." | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir "$RESULTS_DIR" \
-    --out-dir "$PLOTS_DIR" \
+    --output-dir "$PLOTS_DIR" \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[wave1] complete. JSONs:"
