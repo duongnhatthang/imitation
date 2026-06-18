@@ -170,6 +170,7 @@ experiments/sync_results.sh
 
 .worktrees/
 experiments/expert_cache_ent_default/
+experiments/expert_cache_matrix/
 
 # Internal dev docs and experiment logs (not shipped)
 docs/superpowers/

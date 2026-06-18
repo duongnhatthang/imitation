@@ -1,0 +1,74 @@
+[
+  {
+    "env": "CartPole-v1",
+    "seed": 0,
+    "n_Doffline": 3000,
+    "n_Deval": 25000,
+    "bc_normalized_return": 1.0,
+    "expert_normalized_return": 1.0,
+    "expert_ce_on_Doffline": 0.22422618103027345,
+    "bc_ce_on_Doffline": 0.06401732889811199,
+    "expert_ce_on_Deval": 0.22579683227539063,
+    "bc_ce_on_Deval": 0.0669593497467041
+  },
+  {
+    "env": "CartPole-v1",
+    "seed": 1,
+    "n_Doffline": 3000,
+    "n_Deval": 25000,
+    "bc_normalized_return": 1.0,
+    "expert_normalized_return": 1.0,
+    "expert_ce_on_Doffline": 0.2582907918294271,
+    "bc_ce_on_Doffline": 0.062130648295084634,
+    "expert_ce_on_Deval": 0.2570398193359375,
+    "bc_ce_on_Deval": 0.06741220825195313
+  },
+  {
+    "env": "CartPole-v1",
+    "seed": 2,
+    "n_Doffline": 3000,
+    "n_Deval": 25000,
+    "bc_normalized_return": 1.0,
+    "expert_normalized_return": 1.0,
+    "expert_ce_on_Doffline": 0.25433955891927085,
+    "bc_ce_on_Doffline": 0.08073711903889974,
+    "expert_ce_on_Deval": 0.2352349850463867,
+    "bc_ce_on_Deval": 0.5502237463378906
+  },
+  {
+    "env": "Acrobot-v1",
+    "seed": 0,
+    "n_Doffline": 3000,
+    "n_Deval": 4263,
+    "bc_normalized_return": 1.0017874396135267,
+    "expert_normalized_return": 0.9972946859903381,
+    "expert_ce_on_Doffline": 0.022458597819010415,
+    "bc_ce_on_Doffline": 0.010056455612182618,
+    "expert_ce_on_Deval": 0.02152715511174373,
+    "bc_ce_on_Deval": 0.011943929748526209
+  },
+  {
+    "env": "Acrobot-v1",
+    "seed": 1,
+    "n_Doffline": 3000,
+    "n_Deval": 3971,
+    "bc_normalized_return": 1.0158937198067632,
+    "expert_normalized_return": 1.0080193236714976,
+    "expert_ce_on_Doffline": 0.02842854881286621,
+    "bc_ce_on_Doffline": 0.012741403897603353,
+    "expert_ce_on_Deval": 0.02942232868287762,
+    "bc_ce_on_Deval": 0.016179269460669936
+  },
+  {
+    "env": "Acrobot-v1",
+    "seed": 2,
+    "n_Doffline": 3000,
+    "n_Deval": 4319,
+    "bc_normalized_return": 0.9990821256038648,
+    "expert_normalized_return": 1.011014492753623,
+    "expert_ce_on_Doffline": 0.013411766688028971,
+    "bc_ce_on_Doffline": 0.008503671328226724,
+    "expert_ce_on_Deval": 0.018315385022243988,
+    "bc_ce_on_Deval": 0.01873961756918877
+  }
+]
