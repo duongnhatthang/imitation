@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Learning-curves sweep over the classical MDPs.
+# Learning-curves sweep over the 8 classical MDPs.
 #
-# Scope: 3 envs × 4 algos × 5 seeds = 60 runs, CPU-only (these MDPs ignore
-# GPU per run_experiment.py device selection).
+# Scope: classical env-group × 4 algos × 5 seeds = 160 runs, CPU-only
+# (these MDPs ignore GPU per run_experiment.py device selection).
 #
 # Settings: samples_per_round=1, n_rounds=1000, bc_n_epochs=20,
-# inner-ES on, outer-ES on with disagreement_rate signal.
+# inner-ES on, outer-ES OFF (every run goes to the full 1000 rounds so
+# the learning curves are directly comparable).
 #
 # Output paths come from experiments/paths.sh (override EXP_LC_CLASSICAL to
 # redirect a single run, e.g. to experiments/smoke/<name> for a smoke test).
+#
+# Extra args ($@) forward to run_experiment, so you can pass --force-rerun,
+# --seeds 3, --envs CartPole-v1, etc. without editing the script.
 #
 # Stop-and-review gate: after this completes, review the PNGs in
 # $EXP_LC_CLASSICAL/plots/ before any further env scaling.
@@ -34,7 +38,7 @@ echo "[learning_curves] start time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$L
 echo "[learning_curves] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.run_experiment \
-    --envs Blackjack-v1 FrozenLake-v1 CartPole-v1 \
+    --env-group classical \
     --algos ftl ftrl bc bc_dagger \
     --seeds 5 \
     --samples-per-round 1 \
@@ -43,9 +47,10 @@ python -m imitation.experiments.ftrl.run_experiment \
     --eval-interval 10 \
     --output-dir "$RESULTS_DIR" \
     --inner-early-stop \
-    --outer-early-stop \
+    --no-outer-early-stop \
     --n-workers "$WORKERS" \
     --n-gpus 0 \
+    "$@" \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[learning_curves] sweep done at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE"
