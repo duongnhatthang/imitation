@@ -258,10 +258,10 @@ def main():
     )
     parser.add_argument("--envs", nargs="+", required=True)
     parser.add_argument(
-        "--results-dir", type=str, default="experiments/lr_sweep",
+        "--results-dir", type=str, default="experiments/lr_sweep/classical",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="experiments/plots_lr_sweep",
+        "--output-dir", type=str, default="experiments/lr_sweep/classical/plots",
     )
     args = parser.parse_args()
 

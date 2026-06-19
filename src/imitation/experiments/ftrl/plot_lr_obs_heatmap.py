@@ -317,7 +317,7 @@ def main():
     parser.add_argument(
         "--output-path",
         type=str,
-        default="experiments/plots_lr_obs_heatmap/lr_obs_heatmap.png",
+        default="experiments/lr_obs_heatmap/classical/plots/lr_obs_heatmap.png",
     )
     parser.add_argument(
         "--saturation-metric",
