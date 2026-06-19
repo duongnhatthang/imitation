@@ -353,26 +353,74 @@ class FTRLTrainer(dagger.SimpleDAggerTrainer):
         new_round = super().extend_and_update(bc_train_kwargs)
 
         # Compute per-round metrics on current round's data
-        if self.track_per_round_loss:
-            round_dir = self._demo_dir_path_for_round(current_round)
-            demo_paths = self._get_demo_paths(round_dir)
-            round_demos = []
-            from imitation.data import serialize
-
-            for p in demo_paths:
-                trajs = serialize.load(p)
-                round_demos.extend(trajs)
-            round_transitions = rollout.flatten_trajectories(round_demos)
-
-            round_metrics = self._compute_round_loss(round_transitions)
-            self.per_round_metrics.append(round_metrics)
-            logging.info(
-                f"Round {current_round} metrics: "
-                f"CE={round_metrics.cross_entropy:.4f}, "
-                f"L2={round_metrics.l2_norm:.4f}",
-            )
+        self.track_round_loss(current_round)
 
         return new_round
+
+    def extend_only(self) -> int:
+        """Aggregate this round's demos without training.
+
+        Performs everything ``extend_and_update`` does *except* the BC training
+        step: L2 weight update, optional reinit, demo aggregation via
+        ``_try_load_demos``, and round-counter advancement. The caller is
+        responsible for any training and for calling :meth:`track_round_loss`
+        after training so per-round metrics line up.
+
+        Returns:
+            The pre-advancement round number (the round whose demos were just
+            loaded). The new round counter is ``self.round_num`` (one greater).
+        """
+        current_round = self.round_num
+
+        self._update_l2_weight(current_round)
+        logging.info(
+            f"FTRL round {current_round} (extend_only): "
+            f"l2_weight={self.bc_trainer.loss_calculator.l2_weight}",
+        )
+
+        if not self.warm_start and current_round > 0:
+            self._reinitialize_trainable_params()
+            logging.info(f"Reinitialized trainable params for round {current_round}")
+
+        # Replicates the load-half of dagger.SimpleDAggerTrainer.extend_and_update:
+        # aggregate new demos into self._all_demos, rebind bc_trainer's loader,
+        # advance round_num.
+        self._try_load_demos()
+        self.round_num += 1
+
+        return current_round
+
+    def track_round_loss(self, current_round: int) -> None:
+        """Compute and store per-round metrics on demos for ``current_round``.
+
+        No-op when ``self.track_per_round_loss`` is False. Designed to be called
+        either internally from :meth:`extend_and_update` after the training
+        step, or externally by inner-loop early-stop code after its own
+        training pass.
+
+        Args:
+            current_round: The round whose demos to score (pre-increment
+                round number, e.g. the return value of :meth:`extend_only`).
+        """
+        if not self.track_per_round_loss:
+            return
+        from imitation.data import serialize
+
+        round_dir = self._demo_dir_path_for_round(current_round)
+        demo_paths = self._get_demo_paths(round_dir)
+        round_demos = []
+        for p in demo_paths:
+            trajs = serialize.load(p)
+            round_demos.extend(trajs)
+        round_transitions = rollout.flatten_trajectories(round_demos)
+
+        round_metrics = self._compute_round_loss(round_transitions)
+        self.per_round_metrics.append(round_metrics)
+        logging.info(
+            f"Round {current_round} metrics: "
+            f"CE={round_metrics.cross_entropy:.4f}, "
+            f"L2={round_metrics.l2_norm:.4f}",
+        )
 
     def get_metrics(self) -> List[RoundMetrics]:
         """Return per-round metrics collected during training.

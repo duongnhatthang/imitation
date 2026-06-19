@@ -9,16 +9,18 @@ Usage:
 """
 
 import argparse
+import copy
 import dataclasses
 import gc
 import json
 import logging
+import math
 import multiprocessing
 import os
 import pathlib
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch as th
@@ -107,9 +109,24 @@ class ExperimentConfig:
     expert_cache_dir: pathlib.Path
     learning_rate: float = 1e-3
     result_name_override: Optional[str] = None
-    early_stop: bool = False
-    early_stop_patience: int = 5
-    early_stop_min_delta: float = 0.005
+    # --- Outer-loop early stop: cross-round disagreement_rate plateau ---
+    outer_early_stop: bool = True
+    outer_early_stop_patience: int = 5
+    # Plateau threshold in disagreement_rate units (0.005 ≈ 0.5 pp absolute).
+    outer_early_stop_min_delta: float = 0.005
+    # Stop only when the rolling-mean disagreement_rate is <= this ceiling
+    # (i.e. the policy already agrees with the expert at least ~95% of the time).
+    outer_early_stop_disagreement_ceiling: float = 0.05
+    # --- Inner-loop early stop: per-round val-NLL plateau on held-out split ---
+    inner_early_stop: bool = True
+    inner_early_stop_patience: int = 5
+    inner_early_stop_min_delta: float = 1e-4
+    inner_early_stop_val_frac: float = 0.1
+    # Minimum held-out val-set size below which we fall back to a fixed
+    # bc_n_epochs budget (matches the `min_val_size` parameter of
+    # `_split_transitions_for_val`).
+    inner_early_stop_min_val_size: int = 32
+    inner_early_stop_min_epochs: int = 3
     subsample_strategy: str = "uniform"  # "uniform" or "prefix"
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
 
@@ -163,13 +180,241 @@ def _compute_round_eval(
     }
 
 
-def _should_early_stop(
-    rce_history: List[float],
+def _compute_val_nll(
+    policy,
+    val_obs: np.ndarray,
+    val_acts: np.ndarray,
+    batch_size: int,
+) -> float:
+    """Mean negative log-likelihood of expert actions under the current policy.
+
+    Evaluated on a held-out validation slice with no gradient. Returns
+    ``float('inf')`` if the validation slice is empty so the caller's
+    early-stop check treats it as "no improvement".
+
+    Thin wrapper over ``eval_utils.compute_sampled_action_ce`` that adds
+    the empty-slice ``inf`` convention. ``batch_size`` is accepted for
+    backwards-compatible call sites but ignored — the underlying helper
+    chooses its own batching.
+    """
+    del batch_size  # underlying helper handles batching
+    if int(val_obs.shape[0]) == 0:
+        return float("inf")
+    from imitation.experiments.ftrl.eval_utils import compute_sampled_action_ce
+    return float(compute_sampled_action_ce(policy, val_obs, val_acts))
+
+
+def _split_transitions_for_val(
+    n_transitions: int,
+    seed: int,
+    round_num: int,
+    val_frac: float,
+    min_val_size: int,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return (train_idx, val_idx) numpy arrays or (None, None) on fallback.
+
+    ``n_val = floor(val_frac * n_transitions)``. Fallback ``(None, None)``
+    triggers when ``n_val < min_val_size`` (strict). When ``n_val ==
+    min_val_size`` the split proceeds.
+
+    Deterministic for a given ``(seed, round_num)`` pair via the documented
+    ``SeedSequence`` list-seed form, which avoids the collision pattern of
+    arithmetic seed combination (e.g. seed=2/round=0 and seed=1/round=1).
+    """
+    n_val = int(val_frac * n_transitions)
+    if n_val < min_val_size:
+        return None, None
+    rng = np.random.default_rng([int(seed), int(round_num)])
+    perm = rng.permutation(n_transitions)
+    val_idx = np.sort(perm[:n_val])
+    train_idx = np.sort(perm[n_val:])
+    return train_idx, val_idx
+
+
+def _inner_train(
+    trainer_or_bc,
+    config: "ExperimentConfig",
+    round_num: int,
+    is_dagger: bool,
+) -> Dict[str, Any]:
+    """Run one round of inner BC training, with optional val-split early stopping.
+
+    For ``inner_early_stop=False`` (this task) runs the underlying BC training
+    once with ``n_epochs=config.bc_n_epochs``. For DAgger callers this routes
+    through ``extend_and_update`` so the round counter advances and demos
+    aggregate; for BC / BC-DAgger callers it calls ``bc_trainer.train`` directly.
+
+    The val-split early-stop branch lands in Task 7.
+
+    Args:
+        trainer_or_bc: A ``SimpleDAggerTrainer`` (or subclass) if ``is_dagger``;
+            otherwise a ``BC`` instance.
+        config: Full experiment config; reads ``bc_n_epochs`` and the
+            ``inner_early_stop_*`` family.
+        round_num: Current DAgger round (used for val-split seeding when
+            ``inner_early_stop=True``).
+        is_dagger: ``True`` routes to ``extend_and_update``; ``False`` routes to
+            ``bc_trainer.train``.
+
+    Returns:
+        Dict with keys ``inner_es_stop_epoch`` (int, equals ``bc_n_epochs`` when
+        early-stop didn't fire), ``inner_es_val_nll_best`` (float or None),
+        ``inner_es_val_nll_trajectory`` (list[float]), ``inner_es_fallback``
+        (str | None).
+    """
+    max_epochs = int(config.bc_n_epochs)
+
+    if not config.inner_early_stop:
+        if is_dagger:
+            trainer_or_bc.extend_and_update({"n_epochs": max_epochs})
+        else:
+            trainer_or_bc.train(n_epochs=max_epochs, progress_bar=False)
+        return {
+            "inner_es_stop_epoch": max_epochs,
+            "inner_es_val_nll_best": None,
+            "inner_es_val_nll_trajectory": [],
+            "inner_es_fallback": None,
+        }
+
+    # --- inner_early_stop=True: held-out-val early stopping ---
+
+    # For DAgger callers we use FTRLTrainer.extend_only (loads this round's
+    # demos, updates L2 weight, advances round_num, no training). We track
+    # current_round so the post-train per-round metrics get appended to the
+    # right slot. BC callers already hold the full dataset on their trainer.
+    if is_dagger:
+        dagger_current_round = trainer_or_bc.extend_only()
+        bc_trainer = trainer_or_bc.bc_trainer
+        # DAgger's _try_load_demos rebuilds the loader as a th_data.DataLoader,
+        # then set_demonstrations wraps it in _WrappedDataLoader (no .dataset).
+        # Use _all_demos directly.
+        full_transitions = rollout.flatten_trajectories(trainer_or_bc._all_demos)
+    else:
+        dagger_current_round = None
+        bc_trainer = trainer_or_bc
+        full_transitions = bc_trainer._demo_data_loader.dataset
+
+    # 3. Decide val split.
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=len(full_transitions),
+        seed=int(config.seed),
+        round_num=int(round_num),
+        val_frac=float(config.inner_early_stop_val_frac),
+        min_val_size=int(config.inner_early_stop_min_val_size),
+    )
+
+    if train_idx is None:
+        # Dataset too small for a meaningful val split → fixed budget on full set.
+        bc_trainer.train(n_epochs=max_epochs, progress_bar=False)
+        if is_dagger and dagger_current_round is not None:
+            trainer_or_bc.track_round_loss(dagger_current_round)
+        return {
+            "inner_es_stop_epoch": max_epochs,
+            "inner_es_val_nll_best": None,
+            "inner_es_val_nll_trajectory": [],
+            "inner_es_fallback": "dataset_too_small",
+        }
+
+    # 4. Carve the train and val slices.
+    if isinstance(full_transitions, types.TransitionsMinimal):
+        # TransitionsMinimal.__getitem__ only accepts int/slice; build new
+        # dataclass instances by field-wise gather (same pattern as
+        # _collect_and_subsample_transitions).
+        train_subset = dataclasses.replace(
+            full_transitions,
+            **{
+                f.name: getattr(full_transitions, f.name)[train_idx]
+                for f in dataclasses.fields(full_transitions)
+            },
+        )
+        val_subset = dataclasses.replace(
+            full_transitions,
+            **{
+                f.name: getattr(full_transitions, f.name)[val_idx]
+                for f in dataclasses.fields(full_transitions)
+            },
+        )
+        val_obs = np.asarray(val_subset.obs)
+        val_acts = np.asarray(val_subset.acts)
+    else:
+        # List-of-dicts fallback.
+        train_subset = [full_transitions[int(i)] for i in train_idx]
+        val_subset = [full_transitions[int(i)] for i in val_idx]
+        val_obs = np.stack([t["obs"] for t in val_subset]).astype(np.float32)
+        val_acts = np.stack([t["acts"] for t in val_subset])
+
+    # 5. Re-bind BC trainer to train-only.
+    bc_trainer.set_demonstrations(train_subset)
+
+    # 6. Loop epochs with val-NLL early stop.
+    patience = int(config.inner_early_stop_patience)
+    min_delta = float(config.inner_early_stop_min_delta)
+    min_epochs = int(config.inner_early_stop_min_epochs)
+    best_val = float("inf")
+    best_state = None
+    patience_ctr = 0
+    val_nll_trajectory: List[float] = []
+    stop_epoch = max_epochs
+    for epoch in range(max_epochs):
+        bc_trainer.train(n_epochs=1, progress_bar=False, reset_tensorboard=False)
+        val_nll = _compute_val_nll(
+            bc_trainer.policy,
+            val_obs,
+            val_acts,
+            batch_size=int(config.bc_batch_size),
+        )
+        val_nll_trajectory.append(float(val_nll))
+        if val_nll + min_delta < best_val:
+            best_val = float(val_nll)
+            best_state = copy.deepcopy(bc_trainer.policy.state_dict())
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
+        if epoch + 1 >= min_epochs and patience_ctr >= patience:
+            stop_epoch = epoch + 1
+            break
+
+    # 7. Restore best weights (if we ever saw an improvement). Note: only the
+    #    policy state_dict is restored. The BC optimizer (Adam) keeps its
+    #    accumulated momentum state from epochs after the best one — this is a
+    #    known compromise of restore-best patterns. Acceptable for warm-start
+    #    DAgger; revisit if we observe instability in wave-1 traces.
+    if best_state is not None:
+        bc_trainer.policy.load_state_dict(best_state)
+
+    # 8. Defensive: restore the full data loader so any downstream code that
+    #    consults it (currently none in this branch — both DAgger's next
+    #    extend_and_update and bc_dagger's fresh bc_trainer rebuild it from
+    #    scratch — but kept for forward compatibility).
+    bc_trainer.set_demonstrations(full_transitions)
+
+    # 9. For DAgger callers, append per-round metrics now that training is
+    #    done. extend_only deferred this step so we could insert the val
+    #    split + ES loop between data load and metric tracking.
+    if is_dagger and dagger_current_round is not None:
+        trainer_or_bc.track_round_loss(dagger_current_round)
+
+    # Compute the actually-best logged val NLL across the trajectory. This
+    # differs from `best_val` when the very first val_nll was finite but
+    # subsequent ones never beat it by `min_delta` — in that case `best_state`
+    # stays None but the trajectory still has finite values worth reporting.
+    finite_traj = [v for v in val_nll_trajectory if math.isfinite(v)]
+    val_nll_best = min(finite_traj) if finite_traj else None
+    return {
+        "inner_es_stop_epoch": stop_epoch,
+        "inner_es_val_nll_best": val_nll_best,
+        "inner_es_val_nll_trajectory": val_nll_trajectory,
+        "inner_es_fallback": None,
+    }
+
+
+def _should_outer_early_stop(
+    disagreement_history: List[float],
     patience: int,
     min_delta: float,
-    expert_ce_floor: Optional[float] = None,
+    disagreement_ceiling: float,
 ) -> bool:
-    """Return True if rollout_ce has plateaued AND is near expert-level.
+    """Return True if disagreement_rate has plateaued AND is below the ceiling.
 
     Two-criterion stop, both must hold:
 
@@ -178,25 +423,22 @@ def _should_early_stop(
        immediately before that window. If the improvement is less than
        ``min_delta``, the signal has plateaued. Requires at least
        ``2 * patience`` eval points before the first check.
-       Using means rather than mins makes the check noise-robust — a
-       single lucky-low early eval no longer pins a false "best ever".
 
-    2. **Absolute sanity gate.** If ``expert_ce_floor`` is provided, also
-       require the current rolling mean to be within ``2 * expert_ce_floor``
-       of zero. Prevents early-stopping while rollout_ce is still
-       clearly far from expert-level (as happened on noisy LunarLander
-       BC (growing dataset) runs with the old min-based criterion).
+    2. **Absolute disagreement ceiling.** Only allow stopping if the
+       current rolling mean is at or below ``disagreement_ceiling``
+       (default 0.05 = "agrees with expert at least 95% of the time").
+       Prevents stopping on a high-disagreement plateau.
     """
-    if patience < 1 or len(rce_history) < 2 * patience:
+    if patience < 1 or len(disagreement_history) < 2 * patience:
         return False
-    window = rce_history[-patience:]
-    prior = rce_history[-2 * patience : -patience]
+    window = disagreement_history[-patience:]
+    prior = disagreement_history[-2 * patience : -patience]
     current_mean = float(np.mean(window))
     prior_mean = float(np.mean(prior))
     plateau = (prior_mean - current_mean) < min_delta
     if not plateau:
         return False
-    if expert_ce_floor is not None and current_mean > 2.0 * expert_ce_floor:
+    if current_mean > disagreement_ceiling:
         return False
     return True
 
@@ -499,7 +741,13 @@ def _run_dagger_variant(
         format_strs=[],
     )
 
-    # Create BC trainer
+    # Create BC trainer. Cap batch_size at samples_per_round so round 0 (which
+    # has exactly samples_per_round transitions) can form at least one batch.
+    # _try_load_demos in dagger.py raises ValueError if len(transitions) <
+    # batch_size, which would otherwise prevent any DAgger run with
+    # samples_per_round < bc_batch_size (the new --samples-per-round=1 default
+    # would always trip this).
+    initial_batch_size = max(1, min(config.bc_batch_size, config.samples_per_round))
     bc_trainer = bc.BC(
         observation_space=venv.observation_space,
         action_space=venv.action_space,
@@ -507,7 +755,7 @@ def _run_dagger_variant(
         policy=policy,
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
-        batch_size=config.bc_batch_size,
+        batch_size=initial_batch_size,
     )
 
     # Create scratch dir for this run. Clear any stale contents from a
@@ -531,14 +779,14 @@ def _run_dagger_variant(
         custom_logger=custom_logger,
     )
 
-    rce_history: List[float] = []
+    disagreement_history: List[float] = []
     per_round: List[Dict[str, Any]] = []
 
     # Round 0: evaluate the fresh (untrained) policy.
     round0_eval = _compute_round_eval(
         bc_trainer.policy, expert_policy, venv, baselines,
     )
-    rce_history.append(round0_eval["rollout_cross_entropy"])
+    disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
         {
             "round": 0,
@@ -564,20 +812,20 @@ def _run_dagger_variant(
             eval_data = _compute_round_eval(
                 bc_trainer.policy, expert_policy, venv, baselines,
             )
-            rce_history.append(eval_data["rollout_cross_entropy"])
+            disagreement_history.append(eval_data["disagreement_rate"])
 
-            if config.early_stop and _should_early_stop(
-                rce_history,
-                config.early_stop_patience,
-                config.early_stop_min_delta,
-                expert_ce_floor=baselines.get("expert_self_ce"),
+            if config.outer_early_stop and _should_outer_early_stop(
+                disagreement_history,
+                config.outer_early_stop_patience,
+                config.outer_early_stop_min_delta,
+                disagreement_ceiling=config.outer_early_stop_disagreement_ceiling,
             ):
                 stopped_early = True
                 logger.info(
                     f"{config.algo}/{config.env_name}/seed{config.seed}: "
                     f"early stop at round {round_num} "
-                    f"(rollout_ce plateau over "
-                    f"{config.early_stop_patience} eval points)"
+                    f"(disagreement plateau over "
+                    f"{config.outer_early_stop_patience} eval points)"
                 )
 
         # --- 2. Collect expert demos for this round ---
@@ -601,7 +849,7 @@ def _run_dagger_variant(
             _truncate_round_demos(round_dir, config.samples_per_round, rng)
 
         # --- 3. Train on all accumulated demos ---
-        trainer.extend_and_update({})
+        inner_log = _inner_train(trainer, config, round_num=round_num, is_dagger=True)
         cum_obs += config.samples_per_round
 
         metrics = list(trainer.get_metrics())
@@ -617,6 +865,7 @@ def _run_dagger_variant(
             "normalized_return": None,
             "disagreement_rate": None,
             "d_eval_size": None,
+            **inner_log,
         }
 
         if eval_data is not None:
@@ -720,7 +969,7 @@ def _run_bc(
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
     )
-    bc_trainer.train(n_epochs=config.bc_n_epochs)
+    inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
 
     eval_data = _compute_round_eval(
         bc_trainer.policy, expert_policy, venv, baselines,
@@ -738,6 +987,7 @@ def _run_bc(
             "train_cross_entropy": None,
             "l2_norm": round(l2_norm, 6),
             "total_loss": None,
+            **inner_log,
             **eval_data,
         }
     ]
@@ -757,7 +1007,7 @@ def _run_bc_dagger(
     aggregated D_eval^t buffer construction as FTL/FTRL+DAgger (spec §3.4).
 
     A round-0 eval (fresh policy, before any training) is also emitted,
-    and the outer round loop early-stops when rollout_ce plateaus.
+    and the outer round loop early-stops when disagreement_rate plateaus.
     """
     total_timesteps = config.n_rounds * config.samples_per_round
 
@@ -794,14 +1044,14 @@ def _run_bc_dagger(
             venv.observation_space, venv.action_space
         )
 
-    rce_history: List[float] = []
+    disagreement_history: List[float] = []
     per_round: List[Dict[str, Any]] = []
 
     # Round 0: evaluate fresh policy.
     round0_eval = _compute_round_eval(
         policy, expert_policy, venv, baselines,
     )
-    rce_history.append(round0_eval["rollout_cross_entropy"])
+    disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
         {
             "round": 0,
@@ -826,20 +1076,20 @@ def _run_bc_dagger(
             eval_data = _compute_round_eval(
                 policy, expert_policy, venv, baselines,
             )
-            rce_history.append(eval_data["rollout_cross_entropy"])
+            disagreement_history.append(eval_data["disagreement_rate"])
 
-            if config.early_stop and _should_early_stop(
-                rce_history,
-                config.early_stop_patience,
-                config.early_stop_min_delta,
-                expert_ce_floor=baselines.get("expert_self_ce"),
+            if config.outer_early_stop and _should_outer_early_stop(
+                disagreement_history,
+                config.outer_early_stop_patience,
+                config.outer_early_stop_min_delta,
+                disagreement_ceiling=config.outer_early_stop_disagreement_ceiling,
             ):
                 stopped_early = True
                 logger.info(
                     f"bc_dagger/{config.env_name}/seed{config.seed}: "
                     f"early stop at round {round_num} "
-                    f"(rollout_ce plateau over "
-                    f"{config.early_stop_patience} eval points)"
+                    f"(disagreement plateau over "
+                    f"{config.outer_early_stop_patience} eval points)"
                 )
 
         # --- 2. Train on growing prefix of expert data ---
@@ -872,7 +1122,7 @@ def _run_bc_dagger(
             optimizer_kwargs={"lr": config.learning_rate},
             custom_logger=custom_logger,
         )
-        bc_trainer.train(n_epochs=config.bc_n_epochs)
+        inner_log = _inner_train(bc_trainer, config, round_num=round_num, is_dagger=False)
         policy = bc_trainer.policy
 
         l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
@@ -889,6 +1139,7 @@ def _run_bc_dagger(
             "normalized_return": None,
             "disagreement_rate": None,
             "d_eval_size": None,
+            **inner_log,
         }
 
         if eval_data is not None:
@@ -1007,9 +1258,16 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         output_dir=pathlib.Path(args.output_dir),
                         expert_cache_dir=pathlib.Path(args.expert_cache_dir),
                         learning_rate=args.learning_rate,
-                        early_stop=args.early_stop,
-                        early_stop_patience=args.early_stop_patience,
-                        early_stop_min_delta=args.early_stop_min_delta,
+                        outer_early_stop=args.outer_early_stop,
+                        outer_early_stop_patience=args.outer_early_stop_patience,
+                        outer_early_stop_min_delta=args.outer_early_stop_min_delta,
+                        outer_early_stop_disagreement_ceiling=args.outer_early_stop_disagreement_ceiling,
+                        inner_early_stop=args.inner_early_stop,
+                        inner_early_stop_patience=args.inner_early_stop_patience,
+                        inner_early_stop_min_delta=args.inner_early_stop_min_delta,
+                        inner_early_stop_val_frac=args.inner_early_stop_val_frac,
+                        inner_early_stop_min_val_size=args.inner_early_stop_min_val_size,
+                        inner_early_stop_min_epochs=args.inner_early_stop_min_epochs,
                     )
                 )
     return configs
@@ -1044,29 +1302,88 @@ def main():
     parser.add_argument(
         "--samples-per-round",
         type=int,
-        default=50,
-        help="Min timesteps per DAgger round",
+        default=1,
+        help="Min timesteps per DAgger round (default: 1)",
     )
+    # Python 3.8 doesn't have argparse.BooleanOptionalAction, so we pair
+    # store_true / store_false on a shared dest.
     parser.add_argument(
-        "--early-stop",
+        "--outer-early-stop",
+        dest="outer_early_stop",
         action="store_true",
-        default=False,
-        help="Enable early stopping on rollout_ce plateau",
-    )
-    parser.add_argument(
-        "--early-stop-patience",
-        type=int,
-        default=5,
+        default=True,
         help=(
-            "Stop training when rollout_ce has not improved by "
-            "--early-stop-min-delta over this many consecutive eval points."
+            "Enable outer-loop early stopping on disagreement_rate plateau "
+            "(default: True)."
         ),
     )
     parser.add_argument(
-        "--early-stop-min-delta",
+        "--no-outer-early-stop",
+        dest="outer_early_stop",
+        action="store_false",
+        help="Disable outer-loop early stopping.",
+    )
+    parser.add_argument(
+        "--outer-early-stop-patience",
+        type=int,
+        default=5,
+        help=(
+            "Stop training when the tracked signal has not improved by "
+            "--outer-early-stop-min-delta over this many consecutive eval points."
+        ),
+    )
+    parser.add_argument(
+        "--outer-early-stop-min-delta",
         type=float,
         default=0.005,
-        help="Minimum improvement in rollout_ce to count as progress",
+        help="Min improvement to count as progress for outer ES (default 0.005).",
+    )
+    parser.add_argument(
+        "--outer-early-stop-disagreement-ceiling",
+        type=float,
+        default=0.05,
+        help=(
+            "Outer ES only fires when the rolling-mean disagreement_rate is "
+            "<= this ceiling (default 0.05 = '<=5%% disagreement')."
+        ),
+    )
+    parser.add_argument(
+        "--inner-early-stop",
+        dest="inner_early_stop",
+        action="store_true",
+        default=True,
+        help="Enable val-split early stopping inside BC train (default: True).",
+    )
+    parser.add_argument(
+        "--no-inner-early-stop",
+        dest="inner_early_stop",
+        action="store_false",
+        help="Disable inner-loop early stopping (use full bc_n_epochs).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-patience",
+        type=int, default=5,
+        help="Epochs without val-NLL improvement before stopping (default 5).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-min-delta",
+        type=float, default=1e-4,
+        help="Min absolute val-NLL improvement to count as progress (default 1e-4).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-val-frac",
+        type=float, default=0.1,
+        help="Fraction of D^t held out for val (default 0.1).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-min-val-size",
+        type=int, default=32,
+        help="Below this val-set size, fall back to fixed bc_n_epochs (default 32).",
+    )
+    parser.add_argument(
+        "--inner-early-stop-min-epochs",
+        type=int, default=3,
+        help="Don't trigger inner ES before this epoch (default 3).",
     )
     parser.add_argument(
         "--policy-mode",

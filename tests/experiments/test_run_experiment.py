@@ -13,7 +13,12 @@ from imitation.experiments.ftrl.run_experiment import (
 
 
 def _make_config(algo, tmp_path, **overrides):
-    """Helper to create an ExperimentConfig for testing."""
+    """Helper to create an ExperimentConfig for testing.
+
+    Inner / outer early-stop default to OFF in the fixture so the existing
+    smoke tests exercise deterministic fixed-budget behavior. Tests targeting
+    early-stop semantics opt in explicitly.
+    """
     defaults = dict(
         algo=algo,
         env_name="CartPole-v1",
@@ -29,6 +34,8 @@ def _make_config(algo, tmp_path, **overrides):
         eval_interval=5,
         output_dir=tmp_path / "results",
         expert_cache_dir=tmp_path / "experts",
+        inner_early_stop=False,
+        outer_early_stop=False,
     )
     defaults.update(overrides)
     return ExperimentConfig(**defaults)
@@ -353,3 +360,288 @@ def test_ftl_with_small_bc_batch_size(tmp_path):
     result = run_single(config)
     assert result["algo"] == "ftl"
     assert len(result["per_round"]) >= 2
+
+
+def test_compute_val_nll_handles_empty_returns_inf():
+    """_compute_val_nll on a 0-row val slice returns float('inf')."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.zeros((0, env.observation_space.shape[0]), dtype=np.float32)
+    val_acts = np.zeros((0,), dtype=np.int64)
+    assert _compute_val_nll(policy, val_obs, val_acts, batch_size=32) == float("inf")
+
+
+def test_compute_val_nll_finite_on_nonempty():
+    """_compute_val_nll on a small val slice returns a finite, non-negative scalar."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.random.randn(64, env.observation_space.shape[0]).astype(np.float32)
+    val_acts = np.random.randint(0, env.action_space.n, size=64).astype(np.int64)
+    val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
+    assert np.isfinite(val_nll)
+    assert val_nll >= 0.0
+
+
+def test_compute_val_nll_preserves_policy_mode():
+    """_compute_val_nll restores the caller's policy mode (train/eval)."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.random.randn(8, env.observation_space.shape[0]).astype(np.float32)
+    val_acts = np.random.randint(0, env.action_space.n, size=8).astype(np.int64)
+
+    # Caller in eval mode → still in eval after.
+    policy.eval()
+    _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
+    assert not policy.training, "policy.training must remain False when caller was eval"
+
+    # Caller in train mode → still in train after.
+    policy.train()
+    _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
+    assert policy.training, "policy.training must remain True when caller was train"
+
+
+def test_compute_val_nll_handles_batch_size_larger_than_n():
+    """Single partial batch when batch_size > n_val."""
+    from imitation.experiments.ftrl.run_experiment import _compute_val_nll
+    from imitation.policies.base import FeedForward32Policy
+    import gymnasium as gym
+    env = gym.make("CartPole-v1")
+    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    val_obs = np.random.randn(7, env.observation_space.shape[0]).astype(np.float32)
+    val_acts = np.random.randint(0, env.action_space.n, size=7).astype(np.int64)
+    val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=64)
+    assert np.isfinite(val_nll) and val_nll >= 0.0
+
+
+def test_split_transitions_for_val_deterministic_and_sized():
+    """Split is deterministic for same (seed, round_num)."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    n = 500  # large enough to avoid fallback
+    train_idx_a, val_idx_a = _split_transitions_for_val(
+        n_transitions=n, seed=42, round_num=3, val_frac=0.1, min_val_size=32,
+    )
+    train_idx_b, val_idx_b = _split_transitions_for_val(
+        n_transitions=n, seed=42, round_num=3, val_frac=0.1, min_val_size=32,
+    )
+    np.testing.assert_array_equal(train_idx_a, train_idx_b)
+    np.testing.assert_array_equal(val_idx_a, val_idx_b)
+    assert val_idx_a.shape[0] == 50  # 10% of 500
+
+
+def test_split_transitions_for_val_returns_none_when_too_small():
+    """Returns (None, None) when val slice would be below min_val_size."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    # n=100, val_frac=0.1 → n_val=10 < min_val_size=32 → fallback
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=100, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is None
+    assert val_idx is None
+
+
+def test_split_transitions_for_val_partition_no_overlap():
+    """Train and val indices partition [0, n) with no overlap."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    n = 500
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=n, seed=7, round_num=2, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is not None and val_idx is not None
+    assert set(train_idx).isdisjoint(set(val_idx))
+    assert set(train_idx) | set(val_idx) == set(range(n))
+    assert val_idx.shape[0] == 50  # 10% of 500
+
+
+def test_split_transitions_for_val_boundary_equals_min_val():
+    """n_val == min_val_size should NOT trigger fallback (strict <)."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    # n=320, val_frac=0.1, min_val=32 → n_val = floor(32.0) = 32 → split, not fallback
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=320, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is not None and val_idx is not None
+    assert val_idx.shape[0] == 32
+    assert train_idx.shape[0] == 288
+
+
+def test_split_transitions_for_val_boundary_one_below_min_val():
+    """n_val == min_val_size - 1 SHOULD trigger fallback."""
+    from imitation.experiments.ftrl.run_experiment import _split_transitions_for_val
+
+    # n=319, val_frac=0.1, min_val=32 → n_val = floor(31.9) = 31 → fallback
+    train_idx, val_idx = _split_transitions_for_val(
+        n_transitions=319, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+    )
+    assert train_idx is None and val_idx is None
+
+
+def test_experiment_config_accepts_new_es_fields(tmp_path):
+    """ExperimentConfig accepts renamed outer-ES + new inner-ES fields."""
+    config = _make_config(
+        "ftrl",
+        tmp_path,
+        outer_early_stop=False,
+        outer_early_stop_patience=7,
+        outer_early_stop_disagreement_ceiling=0.10,
+        inner_early_stop=False,
+        inner_early_stop_min_val_size=64,
+    )
+    assert config.outer_early_stop is False
+    assert config.outer_early_stop_patience == 7
+    assert config.outer_early_stop_disagreement_ceiling == 0.10
+    assert config.inner_early_stop is False
+    assert config.inner_early_stop_min_val_size == 64
+
+    # Production defaults asserted directly on the dataclass (bypassing
+    # _make_config which turns ES off in its fixture). This pins the
+    # production defaults regardless of what the test helper sets.
+    config_defaults = ExperimentConfig(
+        algo="ftrl",
+        env_name="CartPole-v1",
+        seed=0,
+        policy_mode="end_to_end",
+        n_rounds=3,
+        samples_per_round=300,
+        l2_lambda=1e-4,
+        l2_decay=False,
+        warm_start=True,
+        beta_rampdown=2,
+        bc_n_epochs=2,
+        eval_interval=5,
+        output_dir=tmp_path / "results",
+        expert_cache_dir=tmp_path / "experts",
+    )
+    assert config_defaults.outer_early_stop is True
+    assert config_defaults.outer_early_stop_disagreement_ceiling == 0.05
+    assert config_defaults.inner_early_stop is True
+    assert config_defaults.inner_early_stop_patience == 5
+    assert config_defaults.inner_early_stop_min_delta == 1e-4
+    assert config_defaults.inner_early_stop_val_frac == 0.1
+    assert config_defaults.inner_early_stop_min_val_size == 32
+    assert config_defaults.inner_early_stop_min_epochs == 3
+
+    # The old (pre-rename) names must NOT accept silently.
+    with pytest.raises(TypeError):
+        _make_config("ftrl", tmp_path, early_stop=True)
+    with pytest.raises(TypeError):
+        _make_config("ftrl", tmp_path, inner_early_stop_min_val=64)
+
+
+def test_should_outer_early_stop_fires_on_plateau_below_ceiling():
+    """Disagreement plateau below ceiling → fires."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    history = [0.02] * 10
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is True
+
+
+def test_should_outer_early_stop_blocked_above_ceiling():
+    """Even with plateau, blocked by ceiling."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    history = [0.30] * 10
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is False
+
+
+def test_should_outer_early_stop_needs_2x_patience_points():
+    """Doesn't fire before 2*patience points are available."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    history = [0.02] * 9  # less than 2*5
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is False
+
+
+def test_should_outer_early_stop_blocked_when_still_improving():
+    """Strictly-decreasing history below ceiling should NOT fire (plateau gate)."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    # Strictly improving from 0.10 → 0.02 over 10 evals; all below ceiling.
+    history = [0.10, 0.08, 0.07, 0.06, 0.05, 0.04, 0.04, 0.03, 0.03, 0.02]
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is False
+
+
+def test_should_outer_early_stop_fires_at_exact_ceiling():
+    """current_mean == ceiling allows stopping (>= semantics, > comparison)."""
+    from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+    # Flat at exactly the ceiling → plateau + current_mean == ceiling → fires.
+    history = [0.05] * 10
+    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
+                                    disagreement_ceiling=0.05) is True
+
+
+def test_inner_train_fixed_budget_records_stop_epoch(tmp_path):
+    """With inner_early_stop=False, each per-round dict records stop_epoch == bc_n_epochs."""
+    config = _make_config(
+        "bc",
+        tmp_path,
+        bc_n_epochs=3,
+        n_rounds=2,
+        inner_early_stop=False,
+        outer_early_stop=False,
+    )
+    result = run_single(config)
+    assert len(result["per_round"]) >= 1
+    for m in result["per_round"]:
+        assert m.get("inner_es_stop_epoch") == 3, f"Expected stop_epoch=3, got {m.get('inner_es_stop_epoch')}"
+        assert m.get("inner_es_fallback") in (None, "")
+
+
+def test_inner_train_early_stop_records_stop_epoch(tmp_path):
+    """With inner_early_stop=True and a large enough dataset, BC fixed records
+    inner_es_stop_epoch <= bc_n_epochs and a non-empty val NLL trajectory.
+    """
+    config = _make_config(
+        "bc",
+        tmp_path,
+        bc_n_epochs=20,
+        n_rounds=2,
+        inner_early_stop=True,
+        inner_early_stop_patience=3,
+        inner_early_stop_min_epochs=2,
+        inner_early_stop_val_frac=0.1,
+        inner_early_stop_min_val_size=32,
+        outer_early_stop=False,
+    )
+    result = run_single(config)
+    assert len(result["per_round"]) >= 1
+    for m in result["per_round"]:
+        stop_ep = m.get("inner_es_stop_epoch")
+        assert stop_ep is not None and isinstance(stop_ep, int)
+        assert 1 <= stop_ep <= 20
+        traj = m.get("inner_es_val_nll_trajectory", [])
+        # Either we stopped early (traj length == stop_ep) or hit the cap.
+        assert isinstance(traj, list)
+        assert len(traj) == stop_ep
+
+
+def test_inner_train_fallback_on_small_dataset(tmp_path):
+    """With val_frac × |D| < min_val_size, falls back to fixed budget and
+    logs inner_es_fallback="dataset_too_small".
+    """
+    config = _make_config(
+        "bc",
+        tmp_path,
+        bc_n_epochs=4,
+        n_rounds=2,
+        inner_early_stop=True,
+        inner_early_stop_val_frac=0.1,
+        inner_early_stop_min_val_size=10_000,  # forces fallback
+        outer_early_stop=False,
+    )
+    result = run_single(config)
+    for m in result["per_round"]:
+        assert m.get("inner_es_fallback") == "dataset_too_small"
+        assert m.get("inner_es_stop_epoch") == 4
