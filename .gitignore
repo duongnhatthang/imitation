@@ -162,9 +162,12 @@ dmypy.json
 .vscode/
 
 # FTRL experiment artifacts
-experiments/results/
+experiments/learning_curves/
+experiments/lr_obs_heatmap/
+experiments/smoke/
 experiments/expert_cache/
-experiments/plots/
+experiments/calibration/
+experiments/_archive/
 experiments/setup_server.sh
 experiments/sync_results.sh
 

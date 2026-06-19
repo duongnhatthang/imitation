@@ -9,7 +9,7 @@ Produces a single figure with 3 rows (envs) × 2 columns (metrics):
 Usage:
     python -m imitation.experiments.ftrl.plot_lr_obs_heatmap \
         --envs CartPole-v1 Blackjack-v1 FrozenLake-v1 \
-        --results-dir experiments/lr_obs_sweep
+        --results-dir experiments/lr_obs_heatmap/classical
 """
 
 import argparse
@@ -313,11 +313,11 @@ def main():
         description="Plot 2-D LR × samples_per_round heatmap",
     )
     parser.add_argument("--envs", nargs="+", required=True)
-    parser.add_argument("--results-dir", type=str, default="experiments/lr_obs_sweep")
+    parser.add_argument("--results-dir", type=str, default="experiments/lr_obs_heatmap/classical")
     parser.add_argument(
         "--output-path",
         type=str,
-        default="experiments/plots_lr_obs_heatmap/lr_obs_heatmap.png",
+        default="experiments/lr_obs_heatmap/classical/plots/lr_obs_heatmap.png",
     )
     parser.add_argument(
         "--saturation-metric",

@@ -364,7 +364,7 @@ def main():
         ),
     )
     parser.add_argument(
-        "--output-dir", type=str, default="experiments/lr_obs_sweep",
+        "--output-dir", type=str, default="experiments/lr_obs_heatmap/classical",
     )
     parser.add_argument(
         "--expert-cache-dir", type=str, default="experiments/expert_cache",
@@ -373,7 +373,7 @@ def main():
     parser.add_argument("--n-gpus", type=int, default=0)
     parser.add_argument(
         "--calibration-file", type=str,
-        default="experiments/lr_calibration.json",
+        default="experiments/calibration/lr_calibration.json",
         help="Path to save/update calibration results",
     )
     args = parser.parse_args()
