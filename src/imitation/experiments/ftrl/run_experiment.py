@@ -1209,17 +1209,10 @@ def _worker_init(gpu_queue):
 def _run_single_wrapper(args):
     """Wrapper for multiprocessing.Pool.map (unpacks config)."""
     config = args
-    # Resume support: skip already-completed experiments whose config matches.
-    if _is_already_done(config):
-        out_file = _result_path(config)
-        try:
-            with open(out_file) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-        except (json.JSONDecodeError, IOError):
-            pass  # corrupted, re-run
-
+    # Resume / --force-rerun filtering is handled in main() before configs are
+    # dispatched to the pool, so the worker just runs unconditionally. An
+    # earlier per-worker _is_already_done short-circuit here defeated
+    # --force-rerun by returning the cached JSON inside the worker.
     try:
         return run_single(config)
     except Exception as e:
