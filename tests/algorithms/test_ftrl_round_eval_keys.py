@@ -43,3 +43,10 @@ def test_round_eval_has_breakdown_keys():
     ]:
         assert k in out
     assert out["n_correct"] + out["n_wrong"] == out["d_eval_size"]
+
+
+def test_nan_to_none_maps_nan_and_rounds():
+    from imitation.experiments.ftrl.run_experiment import _nan_to_none
+
+    assert _nan_to_none(float("nan")) is None
+    assert _nan_to_none(0.1234567) == 0.123457

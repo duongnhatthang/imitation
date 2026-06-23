@@ -131,6 +131,16 @@ class ExperimentConfig:
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
 
 
+def _nan_to_none(value: float) -> Optional[float]:
+    """Map NaN to None (JSON null) and round finite floats to 6 dp.
+
+    Empty CE/confidence buckets in the per-round breakdown are NaN; emitting
+    None keeps the JSON spec-valid and matches the existing convention for
+    absent float metrics. Downstream consumers already filter None.
+    """
+    return None if math.isnan(value) else round(float(value), 6)
+
+
 def _compute_round_eval(
     policy,
     expert_policy,
@@ -141,7 +151,12 @@ def _compute_round_eval(
 
     Returns a dict with ``rollout_cross_entropy``,
     ``expert_rollout_cross_entropy``, ``normalized_return``,
-    ``disagreement_rate``, ``d_eval_size``.
+    ``disagreement_rate``, ``d_eval_size``, ``rollout_ce_correct``,
+    ``rollout_ce_wrong``, ``n_correct``, ``n_wrong``, ``conf_correct``,
+    ``conf_wrong``. The CE and confidence breakdown values
+    (``rollout_ce_correct``, ``rollout_ce_wrong``, ``conf_correct``,
+    ``conf_wrong``) are ``None`` when the corresponding bucket is empty
+    (e.g. the learner agrees or disagrees on every evaluated state).
     """
     from imitation.experiments.ftrl.eval_utils import (
         compute_ce_breakdown,
@@ -178,12 +193,12 @@ def _compute_round_eval(
         "normalized_return": round(float(norm_ret), 6),
         "disagreement_rate": round(float(eval_res.current_round_disagreement), 6),
         "d_eval_size": int(obs.shape[0]),
-        "rollout_ce_correct": round(float(breakdown.ce_correct), 6),
-        "rollout_ce_wrong": round(float(breakdown.ce_wrong), 6),
+        "rollout_ce_correct": _nan_to_none(breakdown.ce_correct),
+        "rollout_ce_wrong": _nan_to_none(breakdown.ce_wrong),
         "n_correct": int(breakdown.n_correct),
         "n_wrong": int(breakdown.n_wrong),
-        "conf_correct": round(float(breakdown.conf_correct), 6),
-        "conf_wrong": round(float(breakdown.conf_wrong), 6),
+        "conf_correct": _nan_to_none(breakdown.conf_correct),
+        "conf_wrong": _nan_to_none(breakdown.conf_wrong),
     }
 
 
