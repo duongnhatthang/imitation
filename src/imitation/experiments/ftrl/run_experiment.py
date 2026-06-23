@@ -144,6 +144,7 @@ def _compute_round_eval(
     ``disagreement_rate``, ``d_eval_size``.
     """
     from imitation.experiments.ftrl.eval_utils import (
+        compute_ce_breakdown,
         compute_sampled_action_ce,
         eval_policy_rollout,
     )
@@ -157,9 +158,11 @@ def _compute_round_eval(
     )
     obs = eval_res.rollout_batch.obs
     expert_acts = eval_res.rollout_batch.expert_actions
+    learner_acts = eval_res.rollout_batch.learner_actions
 
     rollout_ce = compute_sampled_action_ce(policy, obs, expert_acts)
     expert_rollout_ce = compute_sampled_action_ce(expert_policy, obs, expert_acts)
+    breakdown = compute_ce_breakdown(policy, obs, expert_acts, learner_acts)
 
     expert_ret = baselines["expert_return"]
     random_ret = baselines["random_return"]
@@ -173,10 +176,14 @@ def _compute_round_eval(
         "rollout_cross_entropy": round(float(rollout_ce), 6),
         "expert_rollout_cross_entropy": round(float(expert_rollout_ce), 6),
         "normalized_return": round(float(norm_ret), 6),
-        "disagreement_rate": round(
-            float(eval_res.current_round_disagreement), 6
-        ),
+        "disagreement_rate": round(float(eval_res.current_round_disagreement), 6),
         "d_eval_size": int(obs.shape[0]),
+        "rollout_ce_correct": round(float(breakdown.ce_correct), 6),
+        "rollout_ce_wrong": round(float(breakdown.ce_wrong), 6),
+        "n_correct": int(breakdown.n_correct),
+        "n_wrong": int(breakdown.n_wrong),
+        "conf_correct": round(float(breakdown.conf_correct), 6),
+        "conf_wrong": round(float(breakdown.conf_wrong), 6),
     }
 
 
@@ -201,6 +208,7 @@ def _compute_val_nll(
     if int(val_obs.shape[0]) == 0:
         return float("inf")
     from imitation.experiments.ftrl.eval_utils import compute_sampled_action_ce
+
     return float(compute_sampled_action_ce(policy, val_obs, val_acts))
 
 
@@ -469,7 +477,10 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         # Atari CNN policies expect CHW obs (transposed from HWC).
         # VecTransposeImage handles this so BC/DAgger see the same obs space
         # as the policy.
-        from stable_baselines3.common.vec_env import is_vecenv_wrapped, VecTransposeImage
+        from stable_baselines3.common.vec_env import (
+            VecTransposeImage,
+            is_vecenv_wrapped,
+        )
 
         if not is_vecenv_wrapped(venv, VecTransposeImage):
             venv = VecTransposeImage(venv)
@@ -784,7 +795,10 @@ def _run_dagger_variant(
 
     # Round 0: evaluate the fresh (untrained) policy.
     round0_eval = _compute_round_eval(
-        bc_trainer.policy, expert_policy, venv, baselines,
+        bc_trainer.policy,
+        expert_policy,
+        venv,
+        baselines,
     )
     disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
@@ -810,7 +824,10 @@ def _run_dagger_variant(
         eval_data: Optional[Dict[str, Any]] = None
         if should_eval:
             eval_data = _compute_round_eval(
-                bc_trainer.policy, expert_policy, venv, baselines,
+                bc_trainer.policy,
+                expert_policy,
+                venv,
+                baselines,
             )
             disagreement_history.append(eval_data["disagreement_rate"])
 
@@ -972,12 +989,13 @@ def _run_bc(
     inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
 
     eval_data = _compute_round_eval(
-        bc_trainer.policy, expert_policy, venv, baselines,
+        bc_trainer.policy,
+        expert_policy,
+        venv,
+        baselines,
     )
 
-    l2_norms = [
-        th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()
-    ]
+    l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
     l2_norm = sum(l2_norms) / 2
 
     return [
@@ -1049,7 +1067,10 @@ def _run_bc_dagger(
 
     # Round 0: evaluate fresh policy.
     round0_eval = _compute_round_eval(
-        policy, expert_policy, venv, baselines,
+        policy,
+        expert_policy,
+        venv,
+        baselines,
     )
     disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
@@ -1074,7 +1095,10 @@ def _run_bc_dagger(
         eval_data: Optional[Dict[str, Any]] = None
         if should_eval:
             eval_data = _compute_round_eval(
-                policy, expert_policy, venv, baselines,
+                policy,
+                expert_policy,
+                venv,
+                baselines,
             )
             disagreement_history.append(eval_data["disagreement_rate"])
 
@@ -1122,7 +1146,9 @@ def _run_bc_dagger(
             optimizer_kwargs={"lr": config.learning_rate},
             custom_logger=custom_logger,
         )
-        inner_log = _inner_train(bc_trainer, config, round_num=round_num, is_dagger=False)
+        inner_log = _inner_train(
+            bc_trainer, config, round_num=round_num, is_dagger=False
+        )
         policy = bc_trainer.policy
 
         l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
@@ -1355,27 +1381,32 @@ def main():
     )
     parser.add_argument(
         "--inner-early-stop-patience",
-        type=int, default=5,
+        type=int,
+        default=5,
         help="Epochs without val-NLL improvement before stopping (default 5).",
     )
     parser.add_argument(
         "--inner-early-stop-min-delta",
-        type=float, default=1e-4,
+        type=float,
+        default=1e-4,
         help="Min absolute val-NLL improvement to count as progress (default 1e-4).",
     )
     parser.add_argument(
         "--inner-early-stop-val-frac",
-        type=float, default=0.1,
+        type=float,
+        default=0.1,
         help="Fraction of D^t held out for val (default 0.1).",
     )
     parser.add_argument(
         "--inner-early-stop-min-val-size",
-        type=int, default=32,
+        type=int,
+        default=32,
         help="Below this val-set size, fall back to fixed bc_n_epochs (default 32).",
     )
     parser.add_argument(
         "--inner-early-stop-min-epochs",
-        type=int, default=3,
+        type=int,
+        default=3,
         help="Don't trigger inner ES before this epoch (default 3).",
     )
     parser.add_argument(
@@ -1503,7 +1534,9 @@ def main():
             if len(parts) == 2 and parts[1].isdigit():
                 file_seed = int(parts[1])
                 if file_seed not in expected_seeds:
-                    logger.info(f"Removing stale result: {f} (seed {file_seed} not in current run)")
+                    logger.info(
+                        f"Removing stale result: {f} (seed {file_seed} not in current run)"
+                    )
                     f.unlink()
 
     total_requested = len(all_configs)
@@ -1539,8 +1572,9 @@ def main():
     for env_name in args.envs:
         rng = np.random.default_rng(0)
         if env_utils.is_atari(env_name):
-            from imitation.experiments.ftrl.atari_utils import make_atari_venv
             from stable_baselines3.common.vec_env import VecTransposeImage
+
+            from imitation.experiments.ftrl.atari_utils import make_atari_venv
 
             venv = make_atari_venv(env_name, n_envs=1, seed=0)
             venv = VecTransposeImage(venv)
