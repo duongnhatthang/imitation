@@ -87,51 +87,54 @@ def _profile_one_env(env_name: str, cache_dir: str, seed: int) -> dict:
     rng = np.random.default_rng(seed)
     venv = env_utils.make_env(env_name, n_envs=1, rng=rng)
 
-    expert_policy = experts.get_or_train_expert(
-        env_name,
-        venv,
-        cache_dir=pathlib.Path(cache_dir),
-        rng=rng,
-        seed=seed,
-    )
+    try:
+        expert_policy = experts.get_or_train_expert(
+            env_name,
+            venv,
+            cache_dir=pathlib.Path(cache_dir),
+            rng=rng,
+            seed=seed,
+        )
 
-    # Expert-state rollout: pass expert_policy so rollout_batch.obs is populated.
-    er = eval_utils.eval_policy_rollout(
-        expert_policy,
-        venv,
-        n_episodes=50,
-        deterministic=True,
-        expert_policy=expert_policy,
-    )
-    expert_obs = er.rollout_batch.obs
+        # Expert-state rollout: pass expert_policy so rollout_batch.obs is populated.
+        er = eval_utils.eval_policy_rollout(
+            expert_policy,
+            venv,
+            n_episodes=50,
+            deterministic=True,
+            expert_policy=expert_policy,
+        )
+        expert_obs = er.rollout_batch.obs
 
-    # Frozen-linear-learner rollout (untrained head -> exercises shifted states).
-    learner = policy_utils.create_linear_policy(expert_policy)
-    lr = eval_utils.eval_policy_rollout(
-        learner,
-        venv,
-        n_episodes=50,
-        deterministic=True,
-        expert_policy=expert_policy,
-    )
-    learner_obs = lr.rollout_batch.obs
+        # Frozen-linear-learner rollout (untrained head -> exercises shifted states).
+        learner = policy_utils.create_linear_policy(expert_policy)
+        lr = eval_utils.eval_policy_rollout(
+            learner,
+            venv,
+            n_episodes=50,
+            deterministic=True,
+            expert_policy=expert_policy,
+        )
+        learner_obs = lr.rollout_batch.obs
 
-    m_exp = action_margins(expert_policy, expert_obs)
-    m_learn = action_margins(expert_policy, learner_obs)
+        m_exp = action_margins(expert_policy, expert_obs)
+        m_learn = action_margins(expert_policy, learner_obs)
 
-    space = venv.observation_space
-    obs_type = "discrete" if isinstance(space, gym.spaces.Discrete) else "box"
-    n_actions = int(venv.action_space.n)
-    return {
-        "env": env_name,
-        "obs_type": obs_type,
-        "obs_dim": int(np.prod(space.shape)) if space.shape else 0,
-        "n_actions": n_actions,
-        "small_margin_frac_expert_lt0.1": small_margin_fraction(m_exp, 0.1),
-        "small_margin_frac_learner_lt0.1": small_margin_fraction(m_learn, 0.1),
-        "small_margin_frac_learner_lt0.25": small_margin_fraction(m_learn, 0.25),
-        "_margins_learner": m_learn,
-    }
+        space = venv.observation_space
+        obs_type = "discrete" if isinstance(space, gym.spaces.Discrete) else "box"
+        n_actions = int(venv.action_space.n)
+        return {
+            "env": env_name,
+            "obs_type": obs_type,
+            "obs_dim": int(np.prod(space.shape)) if space.shape else 0,
+            "n_actions": n_actions,
+            "small_margin_frac_expert_lt0.1": small_margin_fraction(m_exp, 0.1),
+            "small_margin_frac_learner_lt0.1": small_margin_fraction(m_learn, 0.1),
+            "small_margin_frac_learner_lt0.25": small_margin_fraction(m_learn, 0.25),
+            "_margins_learner": m_learn,
+        }
+    finally:
+        venv.close()
 
 
 def main() -> None:
