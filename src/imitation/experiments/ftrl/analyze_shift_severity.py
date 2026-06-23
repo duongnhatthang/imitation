@@ -4,6 +4,7 @@ import argparse
 import csv
 import glob
 import json
+import math
 import os
 from typing import Dict, List
 
@@ -24,7 +25,7 @@ def shift_severity(per_round: List[dict]) -> float:
     """Mean rollout CE divided by mean expert-state CE over evaluated rounds."""
     roll = _mean(per_round, "rollout_cross_entropy")
     exp = _mean(per_round, "expert_rollout_cross_entropy")
-    return roll / exp if exp not in (0.0, float("nan")) else float("nan")
+    return roll / exp if exp != 0.0 and not math.isnan(exp) else float("nan")
 
 
 def _algo_auc_and_severity(results_dir, env, algo):
@@ -33,7 +34,8 @@ def _algo_auc_and_severity(results_dir, env, algo):
     )
     ce_aucs, sevs = [], []
     for f in files:
-        pr = json.load(open(f))["per_round"]
+        with open(f) as fh:
+            pr = json.load(fh)["per_round"]
         ce_aucs.append(_mean(pr, "rollout_cross_entropy"))
         sevs.append(shift_severity(pr))
     return (
