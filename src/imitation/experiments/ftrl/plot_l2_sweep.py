@@ -39,7 +39,8 @@ def aggregate_lambda_auc(base_dir: str) -> Dict[str, Dict[float, Dict[str, float
             env = os.path.basename(env_dir)
             seed_metrics = []
             for f in sorted(glob.glob(os.path.join(env_dir, "*_seed*.json"))):
-                pr = json.load(open(f))["per_round"]
+                with open(f) as fh:
+                    pr = json.load(fh)["per_round"]
                 seed_metrics.append(
                     {
                         "rollout_ce_auc": _auc(pr, "rollout_cross_entropy"),
@@ -66,16 +67,17 @@ def _plot_auc_vs_lambda(agg, metric_key, ylabel, out_path):
         # Plot lambda=0 at a small positive x for the log axis.
         xs = [l if l > 0 else 1e-5 for l in lams]
         (line,) = plt.plot(xs, ys, marker="o", label=env)
-        best_i = int(np.nanargmin(ys))
-        plt.scatter(
-            [xs[best_i]],
-            [ys[best_i]],
-            s=160,
-            facecolors="none",
-            edgecolors=line.get_color(),
-            linewidths=2,
-            zorder=5,
-        )
+        if not np.all(np.isnan(ys)):
+            best_i = int(np.nanargmin(ys))
+            plt.scatter(
+                [xs[best_i]],
+                [ys[best_i]],
+                s=160,
+                facecolors="none",
+                edgecolors=line.get_color(),
+                linewidths=2,
+                zorder=5,
+            )
     plt.xscale("log")
     plt.xlabel("L2 lambda (lambda=0 shown at 1e-5)")
     plt.ylabel(ylabel)
