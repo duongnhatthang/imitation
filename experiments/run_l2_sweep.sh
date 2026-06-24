@@ -9,6 +9,16 @@
 # --seeds 1 for a smoke test, or --force-rerun).
 set -euo pipefail
 
+# Cap per-process math-library threads to 1. run_experiment fans out N worker
+# processes; without this each worker's torch/BLAS defaults to one thread PER
+# CORE, so N workers x C cores oversubscribes the CPU (e.g. 8x10=80 threads on
+# 10 cores), making every run 5-50x slower under contention. These tiny MLP
+# policies get no benefit from intra-op parallelism, so 1 thread/worker is both
+# faster and contention-robust. Children inherit these via the environment.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
