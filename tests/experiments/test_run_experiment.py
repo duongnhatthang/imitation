@@ -645,3 +645,47 @@ def test_inner_train_fallback_on_small_dataset(tmp_path):
     for m in result["per_round"]:
         assert m.get("inner_es_fallback") == "dataset_too_small"
         assert m.get("inner_es_stop_epoch") == 4
+
+
+def test_is_already_done_resume_is_n_rounds_aware(tmp_path):
+    """Resume skips matching configs but RE-RUNS when n_rounds changed.
+
+    This is the mechanism Way-1 round-extension relies on: re-running at a
+    higher --n-rounds must NOT reuse the shorter run's JSON (it re-runs),
+    while a re-run at the same n_rounds is skipped (resume).
+    """
+    import json
+
+    from imitation.experiments.ftrl.run_experiment import (
+        _is_already_done,
+        _result_path,
+    )
+
+    cfg20 = _make_config("ftl", tmp_path, n_rounds=20, samples_per_round=1)
+
+    # No JSON yet → not done.
+    assert _is_already_done(cfg20) is False
+
+    # Write a result JSON whose stored config matches the 20-round run.
+    out = _result_path(cfg20)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(
+            {
+                "config": {
+                    "samples_per_round": cfg20.samples_per_round,
+                    "n_rounds": cfg20.n_rounds,
+                    "eval_interval": cfg20.eval_interval,
+                },
+                "per_round": [],
+            },
+            f,
+        )
+
+    # Same n_rounds → resume (skip).
+    assert _is_already_done(cfg20) is True
+
+    # Higher n_rounds at the same (algo, env, seed) path → re-run (extend).
+    cfg200 = _make_config("ftl", tmp_path, n_rounds=200, samples_per_round=1)
+    assert _result_path(cfg200) == out  # path is independent of n_rounds
+    assert _is_already_done(cfg200) is False

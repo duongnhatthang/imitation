@@ -29,6 +29,19 @@
 #
 # Stop-and-review gate: after this completes, review the PNGs in
 # $EXP_LC_ATARI/plots/ before any further env scaling.
+#
+# Resume / extend (Way 1 — re-run fresh): the runner is n_rounds-aware. Re-running
+# this script:
+#   * same N_ROUNDS, same dir  -> resumes (skips completed (algo,env,seed) JSONs;
+#     safe after an interruption/reboot).
+#   * higher N_ROUNDS          -> re-runs those configs to the new depth (the
+#     shorter run's JSON is NOT reused). Rounds 1..k are statistically identical
+#     whether you target k or 2k, so this yields a valid deeper curve.
+# To extend only some games to more rounds (e.g. 100 -> 200), set both:
+#   N_ROUNDS=200 ENVS="SeaquestNoFrameskip-v4 MsPacmanNoFrameskip-v4" \
+#     EXP_LC_ATARI=experiments/learning_curves/atari_r200 ./experiments/run_atari_curves.sh
+# (Use a fresh EXP_LC_ATARI dir to keep the shallower run for comparison, or the
+# same dir to overwrite those envs in place.)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
