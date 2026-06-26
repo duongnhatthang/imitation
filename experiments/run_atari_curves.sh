@@ -15,11 +15,16 @@
 # the smoke run's measured per-round wall-clock so 140 runs finish in <= ~1 day.
 #
 # Output dir comes from experiments/paths.sh (EXP_LC_ATARI). Override per run,
-# e.g. for a smoke test:
-#   EXP_LC_ATARI="$EXP_SMOKE_ATARI" N_ROUNDS=20 N_GPUS=1 \
-#     ./experiments/run_atari_curves.sh --envs PongNoFrameskip-v4 --seeds 1 --force-rerun
+# e.g. for a smoke test on a single game (ENVS replaces --env-group; the two are
+# mutually exclusive in run_experiment):
+#   EXP_LC_ATARI="$EXP_SMOKE_ATARI" ENVS=PongNoFrameskip-v4 N_ROUNDS=20 N_GPUS=1 \
+#     ./experiments/run_atari_curves.sh --seeds 1 --force-rerun
 #
-# Extra args ($@) forward to run_experiment, so you can pass --envs, --seeds,
+# Env selection: by default the whole atari-zoo group; set ENVS="A B C" (space-
+# separated game IDs) to run a subset instead. Do NOT pass --envs/--env-group in
+# $@ — use ENVS so the script keeps the two mutually-exclusive flags consistent.
+#
+# Extra args ($@) forward to run_experiment, so you can pass --seeds,
 # --force-rerun, etc. without editing the script.
 #
 # Stop-and-review gate: after this completes, review the PNGs in
@@ -34,6 +39,15 @@ source experiments/paths.sh
 
 N_ROUNDS="${N_ROUNDS:-50}"
 N_GPUS="${N_GPUS:-4}"
+ENVS="${ENVS:-}"
+# Env selection is mutually exclusive in run_experiment: a named group OR an
+# explicit list. ENVS (space-separated IDs) overrides the default atari-zoo group.
+if [ -n "$ENVS" ]; then
+    # shellcheck disable=SC2206  # word-splitting is intentional for the list
+    ENV_SEL=(--envs $ENVS)
+else
+    ENV_SEL=(--env-group atari-zoo)
+fi
 RESULTS_DIR="$EXP_LC_ATARI"
 PLOTS_DIR="$EXP_LC_ATARI/plots"
 LOG_FILE="$EXP_LC_ATARI/run.log"
@@ -48,7 +62,7 @@ echo "[atari_curves] start: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE"
 echo "[atari_curves] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.run_experiment \
-    --env-group atari-zoo \
+    "${ENV_SEL[@]}" \
     --policy-mode linear \
     --algos ftl ftrl bc bc_dagger \
     --seeds 5 \
