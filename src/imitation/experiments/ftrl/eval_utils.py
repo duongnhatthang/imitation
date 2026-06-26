@@ -23,6 +23,8 @@ __all__ = [
     "EvalResult",
     "eval_policy_rollout",
     "compute_sampled_action_ce",
+    "CEBreakdown",
+    "compute_ce_breakdown",
 ]
 
 
@@ -137,12 +139,8 @@ def eval_policy_rollout(
             expert_actions=expert_arr,
             learner_actions=learner_arr,
         )
-        current_round_disagreement = float(
-            np.mean(expert_arr != learner_arr)
-        )
-        current_round_ce = compute_sampled_action_ce(
-            policy, obs_arr, expert_arr
-        )
+        current_round_disagreement = float(np.mean(expert_arr != learner_arr))
+        current_round_ce = compute_sampled_action_ce(policy, obs_arr, expert_arr)
 
     return EvalResult(
         mean_return=float(np.mean(episode_returns)),
@@ -204,3 +202,91 @@ def compute_sampled_action_ce(
         if was_training:
             policy.train()
     return total / max(n, 1)
+
+
+@dataclasses.dataclass
+class CEBreakdown:
+    """Sampled-action CE split by whether the learner's argmax matches expert.
+
+    `ce_correct`/`conf_correct` cover states where the learner's deterministic
+    action equals the expert's; `ce_wrong`/`conf_wrong` cover the rest. CE is the
+    mean of -log pi(a*|s) within the bucket; confidence is the mean max softmax
+    probability. Empty buckets report NaN (count 0).
+    """
+
+    ce_correct: float
+    ce_wrong: float
+    n_correct: int
+    n_wrong: int
+    conf_correct: float
+    conf_wrong: float
+
+
+def compute_ce_breakdown(
+    policy: BasePolicy,
+    obs: np.ndarray,
+    expert_actions: np.ndarray,
+    learner_actions: np.ndarray,
+    batch_size: int = 2048,
+) -> CEBreakdown:
+    """Split sampled-action CE into correct- vs wrong-argmax buckets.
+
+    Args:
+        policy: Policy with `.evaluate_actions` and `.get_distribution`.
+        obs: Rollout state buffer, shape (N, *obs_shape).
+        expert_actions: Expert argmax actions, shape (N,).
+        learner_actions: Learner deterministic actions, shape (N,).
+        batch_size: Mini-batch size for the forward pass.
+
+    Returns:
+        CEBreakdown with per-bucket mean CE, counts, and mean confidence.
+    """
+    correct_mask = np.asarray(learner_actions) == np.asarray(expert_actions)
+    wrong_mask = ~correct_mask
+
+    was_training = policy.training
+    policy.eval()
+    device = policy.device
+
+    ce_sum = {"correct": 0.0, "wrong": 0.0}
+    conf_sum = {"correct": 0.0, "wrong": 0.0}
+    n = int(obs.shape[0])
+    try:
+        with th.no_grad():
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                batch_obs = obs[start:end]
+                batch_acts = expert_actions[start:end]
+                tensor_obs = types.map_maybe_dict(
+                    lambda x: util.safe_to_tensor(x).to(device),
+                    types.maybe_unwrap_dictobs(batch_obs),
+                )
+                tensor_acts = util.safe_to_tensor(batch_acts).to(device)
+                _, log_prob, _ = policy.evaluate_actions(tensor_obs, tensor_acts)
+                neglogp = (-log_prob).cpu().numpy()
+                probs = policy.get_distribution(tensor_obs).distribution.probs
+                max_prob = probs.max(dim=1).values.cpu().numpy()
+
+                cm = correct_mask[start:end]
+                ce_sum["correct"] += float(neglogp[cm].sum())
+                ce_sum["wrong"] += float(neglogp[~cm].sum())
+                conf_sum["correct"] += float(max_prob[cm].sum())
+                conf_sum["wrong"] += float(max_prob[~cm].sum())
+    finally:
+        if was_training:
+            policy.train()
+
+    n_correct = int(correct_mask.sum())
+    n_wrong = int(wrong_mask.sum())
+
+    def _mean(total: float, count: int) -> float:
+        return total / count if count > 0 else float("nan")
+
+    return CEBreakdown(
+        ce_correct=_mean(ce_sum["correct"], n_correct),
+        ce_wrong=_mean(ce_sum["wrong"], n_wrong),
+        n_correct=n_correct,
+        n_wrong=n_wrong,
+        conf_correct=_mean(conf_sum["correct"], n_correct),
+        conf_wrong=_mean(conf_sum["wrong"], n_wrong),
+    )
