@@ -132,27 +132,49 @@ def get_atari_env_id(name: str) -> str:
     )
 
 
+# Hard per-episode step ceiling for Atari envs (in base frames, applied via a
+# TimeLimit on the underlying env *before* AtariWrapper's frame-skip of 4, so the
+# agent-step bound is ~MAX_EPISODE_STEPS / 4). Without this, a policy that learns
+# to survive on a long-episode game (Seaquest, MsPacman) produces a
+# never-terminating episode, and DAgger rollout collection — which waits for at
+# least one *complete* episode (min_episodes=1) and has no step cap of its own —
+# blocks the worker forever. 10000 base frames (~2500 agent steps) is well above a
+# normal single-life Atari episode but finite, so legitimate episodes terminate
+# naturally and only pathological survivors get truncated.
+DEFAULT_ATARI_MAX_EPISODE_STEPS = 10000
+
+
 def make_atari_venv(
     env_name: str,
     n_envs: int,
     seed: int = 0,
+    max_episode_steps: int = DEFAULT_ATARI_MAX_EPISODE_STEPS,
 ) -> VecEnv:
     """Create a vectorized Atari environment with standard wrappers.
 
-    Applies: AtariWrapper (frame skip, grayscale, resize 84x84) ->
-    VecFrameStack(4) -> RolloutInfoWrapper.
+    Applies: TimeLimit(max_episode_steps) -> AtariWrapper (frame skip, grayscale,
+    resize 84x84) -> VecFrameStack(4).
 
     Args:
         env_name: Full Atari env ID (e.g. "PongNoFrameskip-v4").
         n_envs: Number of parallel environments.
         seed: Random seed.
+        max_episode_steps: Hard per-episode ceiling in base frames, applied via a
+            TimeLimit so no episode can run forever (see
+            ``DEFAULT_ATARI_MAX_EPISODE_STEPS``). Pass ``None`` to disable (not
+            recommended — risks an infinite-episode hang in rollout collection).
 
     Returns:
         A VecEnv ready for PPO training or FTRL experiments.
     """
     from stable_baselines3.common.env_util import make_atari_env
 
-    venv = make_atari_env(env_name, n_envs=n_envs, seed=seed)
+    env_kwargs = (
+        {"max_episode_steps": max_episode_steps}
+        if max_episode_steps is not None
+        else None
+    )
+    venv = make_atari_env(env_name, n_envs=n_envs, seed=seed, env_kwargs=env_kwargs)
     venv = VecFrameStack(venv, n_stack=4)
     return venv
 
