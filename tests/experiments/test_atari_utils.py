@@ -64,3 +64,45 @@ class TestAtariExpertRouting:
                 cache_dir=tmp_path,
                 rng=rng,
             )
+
+
+class TestMakeAtariVenvEpisodeCap:
+    """The per-episode TimeLimit prevents infinite-episode rollout hangs."""
+
+    def _make_or_skip(self, **kw):
+        from imitation.experiments.ftrl.atari_utils import make_atari_venv
+
+        try:
+            return make_atari_venv("PongNoFrameskip-v4", n_envs=1, seed=0, **kw)
+        except Exception as e:  # pragma: no cover - depends on ROM availability
+            pytest.skip(f"Atari ROMs unavailable: {type(e).__name__}: {e}")
+
+    def test_episode_truncates_within_cap(self):
+        """A random policy episode ends at ~max_episode_steps/4 agent steps.
+
+        AtariWrapper frame-skips 4, and the TimeLimit counts base frames, so the
+        agent-step bound is roughly max_episode_steps / 4. We assert the episode
+        DID terminate within that bound (the property that breaks the hang).
+        """
+        venv = self._make_or_skip(max_episode_steps=2000)
+        try:
+            venv.reset()
+            agent_cap = 2000 // 4
+            ended = False
+            for _ in range(agent_cap + 5):
+                _, _, dones, _ = venv.step([venv.action_space.sample()])
+                if dones[0]:
+                    ended = True
+                    break
+            assert ended, "episode must terminate within the TimeLimit cap"
+        finally:
+            venv.close()
+
+    def test_default_cap_is_finite(self):
+        """The default cap is a finite positive int (no infinite episodes)."""
+        from imitation.experiments.ftrl.atari_utils import (
+            DEFAULT_ATARI_MAX_EPISODE_STEPS,
+        )
+
+        assert isinstance(DEFAULT_ATARI_MAX_EPISODE_STEPS, int)
+        assert DEFAULT_ATARI_MAX_EPISODE_STEPS > 0

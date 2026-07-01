@@ -6,7 +6,8 @@ Generates per-environment figures with 4 subplots (linear x-axis by default):
   3. On-policy disagreement rate (log y, floor 1e-3)
   4. Cumulative regret vs expert pi* (linear y)
 
-Uses IQM + 95% stratified bootstrap CI (via rliable) instead of mean +/- std.
+Bands default to IQM + 95% stratified bootstrap CI (via rliable); pass
+``--band sem`` for mean +/- 1 SEM instead (narrower, parametric).
 Supports incremental generation -- can plot partial results as experiments complete.
 
 Usage:
@@ -91,6 +92,7 @@ def _env_category(env_name: str) -> str:
     """Route env to 'atari' or 'classical' output subdir."""
     return "atari" if "NoFrameskip" in env_name else "classical"
 
+
 LOSS_SUBTITLE_LINES = [
     (
         r"Loss: $\ell_t(\pi^t) = -\frac{1}{|D_{\mathrm{eval}}^t|}"
@@ -137,6 +139,56 @@ def _compute_iqm_and_ci(
     return float(scores["a"][0]), float(cis["a"][0, 0]), float(cis["a"][1, 0])
 
 
+def _compute_mean_and_sem(
+    values_by_seed: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Compute the across-seed mean and a ±1 SEM band.
+
+    SEM = sample std (ddof=1) / sqrt(n). This is a narrower, parametric
+    alternative to the IQM + bootstrap-CI band; the center is the plain
+    mean (not the IQM), so the two band modes are not centered identically.
+
+    Args:
+        values_by_seed: 1D array of values, one per seed.
+
+    Returns:
+        (mean, mean - sem, mean + sem). For n < 2 the band collapses to
+        the point estimate.
+    """
+    vals = np.asarray(values_by_seed, dtype=float)
+    n = len(vals)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    mean = float(np.mean(vals))
+    if n < 2:
+        return mean, mean, mean
+    sem = float(np.std(vals, ddof=1) / np.sqrt(n))
+    return mean, mean - sem, mean + sem
+
+
+def _compute_center_and_band(
+    values_by_seed: np.ndarray,
+    band: str,
+) -> Tuple[float, float, float]:
+    """Dispatch to the chosen aggregation: ``ci`` (IQM+bootstrap) or ``sem``.
+
+    Args:
+        values_by_seed: 1D array of values, one per seed.
+        band: ``"ci"`` for IQM + 95% bootstrap CI, ``"sem"`` for mean ± 1 SEM.
+
+    Returns:
+        (center, low, high).
+
+    Raises:
+        ValueError: If ``band`` is not ``"ci"`` or ``"sem"``.
+    """
+    if band == "ci":
+        return _compute_iqm_and_ci(values_by_seed)
+    if band == "sem":
+        return _compute_mean_and_sem(values_by_seed)
+    raise ValueError(f"Unknown band type: {band!r} (expected 'ci' or 'sem')")
+
+
 def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
     """Load all JSON result files into a DataFrame.
 
@@ -153,7 +205,8 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
     results_path = pathlib.Path(results_dir)
 
     for json_file in sorted(
-        p for p in results_path.rglob("*.json")
+        p
+        for p in results_path.rglob("*.json")
         if not any(part.startswith("_archive") for part in p.parts)
     ):
         try:
@@ -178,9 +231,7 @@ def load_results(results_dir: pathlib.Path) -> pd.DataFrame:
                 "n_observations": m.get("n_observations", 0),
                 "train_cross_entropy": m.get("train_cross_entropy"),
                 "rollout_cross_entropy": m.get("rollout_cross_entropy"),
-                "expert_rollout_cross_entropy": m.get(
-                    "expert_rollout_cross_entropy"
-                ),
+                "expert_rollout_cross_entropy": m.get("expert_rollout_cross_entropy"),
                 "l2_norm": m.get("l2_norm"),
                 "total_loss": m.get("total_loss"),
                 "normalized_return": (
@@ -221,9 +272,7 @@ def _check_stale_data(df: pd.DataFrame) -> None:
     for (algo, env), group in df.groupby(["algo", "env"]):
         per_seed_rounds = {}
         for seed, seed_df in group.groupby("seed"):
-            obs_by_round = dict(
-                zip(seed_df["round"], seed_df["n_observations"])
-            )
+            obs_by_round = dict(zip(seed_df["round"], seed_df["n_observations"]))
             per_seed_rounds[seed] = obs_by_round
 
         seeds = list(per_seed_rounds.keys())
@@ -272,9 +321,7 @@ def compute_cumulative_loss(df: pd.DataFrame) -> pd.DataFrame:
         df["cum_expert_loss"] = df.groupby(["algo", "env", "seed"])[
             "_erce_filled"
         ].cumsum()
-        df.loc[
-            df["expert_rollout_cross_entropy"].isna(), "cum_expert_loss"
-        ] = np.nan
+        df.loc[df["expert_rollout_cross_entropy"].isna(), "cum_expert_loss"] = np.nan
         df.drop(columns=["_erce_filled"], inplace=True)
     return df
 
@@ -307,9 +354,7 @@ def compute_cumulative_regret(df: pd.DataFrame) -> pd.DataFrame:
         # Fallback: treat expert loss as constant expert_self_ce per eval
         # point. Count eval points seen so far per run.
         df["_is_eval"] = df["rollout_cross_entropy"].notna().astype(int)
-        df["_eval_count"] = df.groupby(["algo", "env", "seed"])[
-            "_is_eval"
-        ].cumsum()
+        df["_eval_count"] = df.groupby(["algo", "env", "seed"])["_is_eval"].cumsum()
         df["cum_regret"] = df["cum_loss"] - df["_eval_count"] * df["expert_self_ce"]
         df.drop(columns=["_is_eval", "_eval_count"], inplace=True)
     return df
@@ -324,8 +369,9 @@ def _plot_metric(
     allowed_algos: Optional[set] = None,
     log_x: bool = False,
     y_clip_floor: Optional[float] = None,
+    band: str = "ci",
 ):
-    """Plot a metric with IQM and 95% bootstrap CI bands across seeds.
+    """Plot a metric's center line with an uncertainty band across seeds.
 
     Args:
         ax: Matplotlib axes to plot on.
@@ -340,6 +386,8 @@ def _plot_metric(
         y_clip_floor: If set, values below this floor are clipped up to
             the floor before plotting. Useful for log-y plots where the
             natural metric can be zero or slightly negative.
+        band: Uncertainty band type — ``"ci"`` (IQM + 95% stratified
+            bootstrap CI, the default) or ``"sem"`` (mean ± 1 SEM).
     """
     algos = sorted(
         df["algo"].unique(),
@@ -364,7 +412,7 @@ def _plot_metric(
         complete_rounds = set(seed_counts[seed_counts == n_seeds].index)
         rounds = sorted(r for r in valid_df["round"].unique() if r in complete_rounds)
 
-        x_vals, iqm_vals, ci_lows, ci_highs = [], [], [], []
+        x_vals, center_vals, band_lows, band_highs = [], [], [], []
         for rnd in rounds:
             rnd_df = valid_df[valid_df["round"] == rnd]
             values = rnd_df[metric].values
@@ -372,24 +420,24 @@ def _plot_metric(
                 continue
             if y_clip_floor is not None:
                 values = np.maximum(values, y_clip_floor)
-            iqm, ci_lo, ci_hi = _compute_iqm_and_ci(values)
+            center, band_lo, band_hi = _compute_center_and_band(values, band)
             mean_obs = rnd_df["n_observations"].mean()
             x_vals.append(mean_obs)
-            iqm_vals.append(iqm)
-            ci_lows.append(ci_lo)
-            ci_highs.append(ci_hi)
+            center_vals.append(center)
+            band_lows.append(band_lo)
+            band_highs.append(band_hi)
         if not x_vals:
             continue
         color = ALGO_COLORS.get(algo, "#888888")
         linestyle = ALGO_LINESTYLES.get(algo, "-")
         label = ALGO_LABELS.get(algo, algo)
         if y_clip_floor is not None:
-            iqm_vals = [max(v, y_clip_floor) for v in iqm_vals]
-            ci_lows = [max(v, y_clip_floor) for v in ci_lows]
-            ci_highs = [max(v, y_clip_floor) for v in ci_highs]
+            center_vals = [max(v, y_clip_floor) for v in center_vals]
+            band_lows = [max(v, y_clip_floor) for v in band_lows]
+            band_highs = [max(v, y_clip_floor) for v in band_highs]
         ax.plot(
             x_vals,
-            iqm_vals,
+            center_vals,
             color=color,
             linestyle=linestyle,
             label=label,
@@ -397,7 +445,7 @@ def _plot_metric(
             marker="o" if linestyle == "-" else None,
             markersize=3,
         )
-        ax.fill_between(x_vals, ci_lows, ci_highs, color=color, alpha=0.12)
+        ax.fill_between(x_vals, band_lows, band_highs, color=color, alpha=0.12)
 
     if log_scale:
         ax.set_yscale("log")
@@ -420,6 +468,7 @@ def plot_env(
     output_path: pathlib.Path,
     show_expert_on_loss: bool = True,
     calibration: Optional[Dict[str, Any]] = None,
+    band: str = "ci",
 ) -> None:
     """Generate a 4-subplot figure for one environment.
 
@@ -480,10 +529,13 @@ def plot_env(
         t_sat_str = f"T_sat={t_sat} obs" if t_sat is not None else "T_sat=N/A"
         cal_line = f"\nCalibrated: {lr_str},  {t_sat_str},  max_obs=2×T_sat"
 
+    band_desc = "IQM + 95% stratified bootstrap CI" if band == "ci" else "mean ± 1 SEM"
+    band_line = f"\nBands: {band_desc} across seeds"
+
     fig.text(
         0.5,
         0.955,
-        subtitle_text + cal_line,
+        subtitle_text + cal_line + band_line,
         ha="center",
         va="top",
         fontsize=10,
@@ -498,6 +550,7 @@ def plot_env(
         r"Rollout CE on $D_{\mathrm{eval}}^t$",
         log_scale=True,
         allowed_algos=LOSS_SUBPLOT_ALGOS,
+        band=band,
     )
     if show_expert_on_loss:
         expert_self_ce_vals = env_df.get("expert_self_ce")
@@ -523,6 +576,7 @@ def plot_env(
         "Normalized Return",
         log_scale=True,
         y_clip_floor=1e-3,
+        band=band,
     )
     ax2.axhline(
         y=1.0,
@@ -544,6 +598,7 @@ def plot_env(
         log_scale=True,
         y_clip_floor=1e-3,
         allowed_algos={"ftl", "ftrl", "bc_dagger", "bc"},
+        band=band,
     )
 
     # Subplot 4: Cumulative regret vs expert. Linear y (regret can be negative).
@@ -553,12 +608,18 @@ def plot_env(
         "cum_regret",
         r"Cumulative Regret (vs Expert $\pi^*$)",
         allowed_algos=LOSS_SUBPLOT_ALGOS,
+        band=band,
     )
 
     _draw_bc_hlines(
         [ax1, ax2, ax3, ax4],
         env_df,
-        ["rollout_cross_entropy", "normalized_return", "disagreement_rate", "cum_regret"],
+        [
+            "rollout_cross_entropy",
+            "normalized_return",
+            "disagreement_rate",
+            "cum_regret",
+        ],
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -576,6 +637,7 @@ def plot_all(
     envs: Optional[List[str]] = None,
     show_expert_on_loss: bool = True,
     calibration_data: Optional[Dict[str, Any]] = None,
+    band: str = "ci",
 ) -> List[pathlib.Path]:
     """Generate plots for all environments.
 
@@ -585,6 +647,8 @@ def plot_all(
         envs: Optional list of envs to filter. If None, plots all found.
         show_expert_on_loss: Forwarded to ``plot_env``.
         calibration_data: Optional dict from lr_calibration.json, keyed by env.
+        band: Uncertainty band type forwarded to ``plot_env`` — ``"ci"`` or
+            ``"sem"``.
 
     Returns:
         List of saved plot file paths.
@@ -608,9 +672,12 @@ def plot_all(
         )
         cal = (calibration_data or {}).get(env_name)
         plot_env(
-            df, env_name, out_path,
+            df,
+            env_name,
+            out_path,
             show_expert_on_loss=show_expert_on_loss,
             calibration=cal,
+            band=band,
         )
         saved_paths.append(out_path)
 
@@ -658,6 +725,13 @@ def main():
         default=None,
         help="Path to lr_calibration.json for displaying LR and T_sat in titles",
     )
+    parser.add_argument(
+        "--band",
+        choices=["ci", "sem"],
+        default="ci",
+        help="Uncertainty band: 'ci' (IQM + 95%% bootstrap CI, default) or "
+        "'sem' (mean ± 1 SEM)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -676,6 +750,7 @@ def main():
         envs=args.envs,
         show_expert_on_loss=args.show_expert_on_loss,
         calibration_data=calibration_data,
+        band=args.band,
     )
     if paths:
         logger.info(f"Generated {len(paths)} plots in {args.output_dir}")

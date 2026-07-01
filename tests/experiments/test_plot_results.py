@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 
 from imitation.experiments.ftrl.plot_results import (
+    _compute_center_and_band,
+    _compute_mean_and_sem,
     compute_cumulative_loss,
     compute_cumulative_regret,
     load_results,
@@ -218,3 +220,47 @@ def test_plot_incremental(tmp_path):
     assert len(paths) == 2
     for p in paths:
         assert p.exists()
+
+
+def test_compute_mean_and_sem():
+    """mean ± SEM: center is the mean, half-width is std(ddof=1)/sqrt(n)."""
+    values = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    mean, lo, hi = _compute_mean_and_sem(values)
+    expected_sem = np.std(values, ddof=1) / np.sqrt(len(values))
+    assert mean == pytest.approx(3.0)
+    assert lo == pytest.approx(3.0 - expected_sem)
+    assert hi == pytest.approx(3.0 + expected_sem)
+    # SEM band is symmetric about the mean.
+    assert (hi - mean) == pytest.approx(mean - lo)
+
+
+def test_compute_mean_and_sem_single_value():
+    """A single seed collapses the band to the point estimate (no div-by-zero)."""
+    mean, lo, hi = _compute_mean_and_sem(np.array([2.5]))
+    assert mean == lo == hi == pytest.approx(2.5)
+
+
+def test_compute_center_and_band_dispatch():
+    """ci -> IQM+bootstrap, sem -> mean±SEM; unknown band raises."""
+    values = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    sem_center, _, _ = _compute_center_and_band(values, "sem")
+    assert sem_center == pytest.approx(3.0)  # mean center
+    # ci path returns a finite center and an ordered interval.
+    ci_center, ci_lo, ci_hi = _compute_center_and_band(values, "ci")
+    assert ci_lo <= ci_center <= ci_hi
+    with pytest.raises(ValueError, match="Unknown band"):
+        _compute_center_and_band(values, "stderr")
+
+
+def test_plot_all_band_sem(tmp_path):
+    """plot_all with band='sem' produces PNGs (SEM path renders end-to-end)."""
+    results_dir = tmp_path / "results"
+    plots_dir = tmp_path / "plots_sem"
+    _populate_results(results_dir)
+
+    paths = plot_all(results_dir, plots_dir, band="sem")
+
+    assert len(paths) == 2
+    for p in paths:
+        assert p.exists()
+        assert p.stat().st_size > 1000
