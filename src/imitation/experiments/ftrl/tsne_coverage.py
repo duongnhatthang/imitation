@@ -8,7 +8,7 @@ sparse-offline / dense-interactive contrast independent of the layout.
 """
 
 import dataclasses
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.spatial import ConvexHull
@@ -32,7 +32,7 @@ def fit_shared_tsne(
 ) -> TSNEResult:
     """Fit t-SNE across a small grid; keep the most trustworthy embedding."""
     n = len(features)
-    best: TSNEResult = None
+    best: Optional[TSNEResult] = None
     for perplexity in perplexities:
         # t-SNE requires perplexity < n_samples.
         perp = min(perplexity, max(5.0, (n - 1) / 3.0))

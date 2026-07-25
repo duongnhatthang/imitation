@@ -38,9 +38,7 @@ class PooledStates:
     rounds: np.ndarray  # [Ntot] int
 
 
-def scratch_demo_root(
-    results_dir, algo: str, env_name: str, seed: int
-) -> pathlib.Path:
+def scratch_demo_root(results_dir, algo: str, env_name: str, seed: int) -> pathlib.Path:
     """Return the demos root for one run cell."""
     cell = f"{algo}_{env_name}_seed{seed}"
     return pathlib.Path(results_dir) / "scratch" / cell / "demos"

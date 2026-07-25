@@ -1,7 +1,6 @@
 # tests/experiments/test_aggregate_runtime.py
 import json
 
-import numpy as np
 import pandas as pd
 
 from imitation.experiments.ftrl import aggregate_runtime

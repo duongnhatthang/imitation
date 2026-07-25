@@ -7,7 +7,7 @@ recoverability, and figures must state this provenance.
 """
 
 import pathlib
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -45,7 +45,7 @@ def recoverability(dqn: DQN, obs: np.ndarray) -> np.ndarray:
 
 
 def get_or_train_dqn_reference(
-    env_name: str, cache_dir, total_timesteps: int = None, seed: int = 0
+    env_name: str, cache_dir, total_timesteps: Optional[int] = None, seed: int = 0
 ) -> DQN:
     """Load a cached DQN reference expert or train and cache one."""
     cache_dir = pathlib.Path(cache_dir)

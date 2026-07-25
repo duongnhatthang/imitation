@@ -1,5 +1,5 @@
 import numpy as np
-import pytest
+
 from imitation.data import serialize, types
 from imitation.experiments.ftrl import coverage_data
 
@@ -9,11 +9,16 @@ def _make_traj(n, d, val):
     obs = np.full((n + 1, d), float(val), dtype=np.float32)
     acts = np.zeros((n,), dtype=np.int64)
     rews = np.zeros((n,), dtype=np.float32)
-    return types.TrajectoryWithRew(obs=obs, acts=acts, infos=None, terminal=True, rews=rews)
+    return types.TrajectoryWithRew(
+        obs=obs, acts=acts, infos=None, terminal=True, rews=rews
+    )
 
 
 def _write_demo(root, algo, env, seed, round_num, traj):
-    d = coverage_data.scratch_demo_root(root, algo, env, seed) / f"round-{round_num:03d}"
+    d = (
+        coverage_data.scratch_demo_root(root, algo, env, seed)
+        / f"round-{round_num:03d}"
+    )
     d.mkdir(parents=True, exist_ok=True)
     serialize.save(d / f"demo-{round_num}.npz", [traj])
 
@@ -23,7 +28,7 @@ def test_load_algo_states_parses_round_and_drops_final_obs(tmp_path):
     _write_demo(tmp_path, "ftrl", "CartPole-v1", 0, 2, _make_traj(2, 4, 2.0))
     cs = coverage_data.load_algo_states(tmp_path, "CartPole-v1", "ftrl", 0)
     assert cs.algo == "ftrl"
-    assert cs.obs.shape == (5, 4)          # 3 + 2 states, final obs dropped
+    assert cs.obs.shape == (5, 4)  # 3 + 2 states, final obs dropped
     assert sorted(set(cs.rounds.tolist())) == [0, 2]
     assert (cs.rounds == 0).sum() == 3 and (cs.rounds == 2).sum() == 2
 
@@ -35,7 +40,9 @@ def test_load_algo_states_missing_returns_none(tmp_path):
 def test_pool_and_standardize(tmp_path):
     _write_demo(tmp_path, "bc", "CartPole-v1", 0, 0, _make_traj(4, 4, 5.0))
     _write_demo(tmp_path, "ftrl", "CartPole-v1", 0, 1, _make_traj(4, 4, 9.0))
-    states = coverage_data.load_env_states(tmp_path, "CartPole-v1", 0, algos=["bc", "ftrl"])
+    states = coverage_data.load_env_states(
+        tmp_path, "CartPole-v1", 0, algos=["bc", "ftrl"]
+    )
     pooled = coverage_data.pool(states)
     assert pooled.obs.shape == (8, 4)
     assert set(pooled.algo.tolist()) == {"bc", "ftrl"}
