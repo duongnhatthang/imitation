@@ -37,6 +37,28 @@ def test_load_algo_states_missing_returns_none(tmp_path):
     assert coverage_data.load_algo_states(tmp_path, "CartPole-v1", "bc", 0) is None
 
 
+def test_save_transitions_as_demos_roundtrips(tmp_path):
+    from imitation.experiments.ftrl import run_experiment
+
+    obs = np.arange(12, dtype=np.float32).reshape(4, 3)
+    trans = types.Transitions(
+        obs=obs,
+        acts=np.zeros(4, dtype=np.int64),
+        infos=np.array([{}] * 4),
+        next_obs=obs + 1.0,
+        dones=np.zeros(4, dtype=bool),
+    )
+    scratch = tmp_path / "scratch" / "bc_CartPole-v1_seed0"
+    run_experiment._save_transitions_as_demos(
+        trans, scratch, 0, np.random.default_rng(0)
+    )
+    cs = coverage_data.load_algo_states(tmp_path, "CartPole-v1", "bc", 0)
+    assert cs is not None
+    assert cs.obs.shape == (4, 3)
+    assert (cs.rounds == 0).all()
+    assert np.allclose(cs.obs, obs)  # obs[:-1] of the synthetic traj == original states
+
+
 def test_pool_and_standardize(tmp_path):
     _write_demo(tmp_path, "bc", "CartPole-v1", 0, 0, _make_traj(4, 4, 5.0))
     _write_demo(tmp_path, "ftrl", "CartPole-v1", 0, 1, _make_traj(4, 4, 9.0))

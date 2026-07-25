@@ -107,9 +107,17 @@ def build_and_plot(
         raise FileNotFoundError(
             f"No scratch demos for {env_name} seed {seed} under {results_dir}"
         )
+    found = sorted(s.algo for s in states)
+    expected = list(coverage_data.ALL_ALGOS)
+    missing = [a for a in expected if a not in found]
+    if missing:
+        print(
+            f"WARNING: no scratch demos for {missing} in {env_name}; "
+            f"figure will only include {found}."
+        )
     pooled = coverage_data.pool(states)
     feats_full = coverage_data.standardize_features(pooled.obs)
-    feats, algo, rounds, idx = tsne_coverage.subsample(
+    feats, algo, rounds, _ = tsne_coverage.subsample(
         feats_full, pooled.algo, pooled.rounds, cap=cap, seed=seeds[0]
     )
     sub = coverage_data.PooledStates(obs=feats, algo=algo, rounds=rounds)

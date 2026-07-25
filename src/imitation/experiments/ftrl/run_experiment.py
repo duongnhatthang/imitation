@@ -173,9 +173,7 @@ def _compute_round_eval(
         "rollout_cross_entropy": round(float(rollout_ce), 6),
         "expert_rollout_cross_entropy": round(float(expert_rollout_ce), 6),
         "normalized_return": round(float(norm_ret), 6),
-        "disagreement_rate": round(
-            float(eval_res.current_round_disagreement), 6
-        ),
+        "disagreement_rate": round(float(eval_res.current_round_disagreement), 6),
         "d_eval_size": int(obs.shape[0]),
     }
 
@@ -201,6 +199,7 @@ def _compute_val_nll(
     if int(val_obs.shape[0]) == 0:
         return float("inf")
     from imitation.experiments.ftrl.eval_utils import compute_sampled_action_ce
+
     return float(compute_sampled_action_ce(policy, val_obs, val_acts))
 
 
@@ -469,7 +468,10 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         # Atari CNN policies expect CHW obs (transposed from HWC).
         # VecTransposeImage handles this so BC/DAgger see the same obs space
         # as the policy.
-        from stable_baselines3.common.vec_env import is_vecenv_wrapped, VecTransposeImage
+        from stable_baselines3.common.vec_env import (
+            VecTransposeImage,
+            is_vecenv_wrapped,
+        )
 
         if not is_vecenv_wrapped(venv, VecTransposeImage):
             venv = VecTransposeImage(venv)
@@ -701,6 +703,36 @@ def _uniform_round_demos(
         _save_dagger_demo(traj, j, round_dir, rng, prefix="uniform")
 
 
+def _save_transitions_as_demos(transitions, scratch_dir, round_num, rng):
+    """Persist a batch of transitions as a DAgger-format demo for coverage viz.
+
+    Wraps the transitions' observations into a single synthetic trajectory whose
+    ``obs[:-1]`` are exactly the batch's states, saved under
+    ``{scratch_dir}/demos/round-{round_num:03d}/`` so ``coverage_data`` can load
+    the states and their arrival round uniformly across all algorithms.
+
+    Args:
+        transitions: An imitation ``Transitions`` batch (may be empty).
+        scratch_dir: Per-run scratch directory ``{output_dir}/scratch/{cell}``.
+        round_num: Arrival round to encode in the demo directory name.
+        rng: RNG used for the demo filename (matches ``_save_dagger_demo``).
+    """
+    if len(transitions) == 0:
+        return
+    obs = np.asarray(transitions.obs)
+    next_obs = np.asarray(transitions.next_obs)
+    full_obs = np.concatenate([obs, next_obs[-1:]], axis=0)  # T+1 rows
+    traj = types.Trajectory(
+        obs=full_obs,
+        acts=np.asarray(transitions.acts),
+        infos=None,
+        terminal=True,
+    )
+    demo_dir = pathlib.Path(scratch_dir) / "demos" / f"round-{round_num:03d}"
+    demo_dir.mkdir(parents=True, exist_ok=True)
+    _save_dagger_demo(traj, 0, demo_dir, rng)
+
+
 def _run_dagger_variant(
     config: ExperimentConfig,
     venv,
@@ -784,7 +816,10 @@ def _run_dagger_variant(
 
     # Round 0: evaluate the fresh (untrained) policy.
     round0_eval = _compute_round_eval(
-        bc_trainer.policy, expert_policy, venv, baselines,
+        bc_trainer.policy,
+        expert_policy,
+        venv,
+        baselines,
     )
     disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
@@ -810,7 +845,10 @@ def _run_dagger_variant(
         eval_data: Optional[Dict[str, Any]] = None
         if should_eval:
             eval_data = _compute_round_eval(
-                bc_trainer.policy, expert_policy, venv, baselines,
+                bc_trainer.policy,
+                expert_policy,
+                venv,
+                baselines,
             )
             disagreement_history.append(eval_data["disagreement_rate"])
 
@@ -955,6 +993,13 @@ def _run_bc(
             rng=rng,
         )
 
+    bc_scratch = (
+        config.output_dir / "scratch" / f"bc_{config.env_name}_seed{config.seed}"
+    )
+    if bc_scratch.exists():
+        shutil.rmtree(bc_scratch)
+    _save_transitions_as_demos(all_transitions, bc_scratch, 0, rng)
+
     custom_logger = imit_logger.configure(
         str(config.output_dir / "tb" / f"bc_{config.env_name}_{config.seed}"),
         format_strs=[],
@@ -972,12 +1017,13 @@ def _run_bc(
     inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
 
     eval_data = _compute_round_eval(
-        bc_trainer.policy, expert_policy, venv, baselines,
+        bc_trainer.policy,
+        expert_policy,
+        venv,
+        baselines,
     )
 
-    l2_norms = [
-        th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()
-    ]
+    l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
     l2_norm = sum(l2_norms) / 2
 
     return [
@@ -1034,6 +1080,17 @@ def _run_bc_dagger(
         rng=rng,
     )
 
+    bcd_scratch = (
+        config.output_dir / "scratch" / f"bc_dagger_{config.env_name}_seed{config.seed}"
+    )
+    if bcd_scratch.exists():
+        shutil.rmtree(bcd_scratch)
+    spr = config.samples_per_round
+    for _round in range(1, config.n_rounds + 1):
+        _save_transitions_as_demos(
+            all_transitions[(_round - 1) * spr : _round * spr], bcd_scratch, _round, rng
+        )
+
     warm_start = env_utils.is_atari(config.env_name)
 
     # Build the initial fresh policy for round 0.
@@ -1049,7 +1106,10 @@ def _run_bc_dagger(
 
     # Round 0: evaluate fresh policy.
     round0_eval = _compute_round_eval(
-        policy, expert_policy, venv, baselines,
+        policy,
+        expert_policy,
+        venv,
+        baselines,
     )
     disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
@@ -1074,7 +1134,10 @@ def _run_bc_dagger(
         eval_data: Optional[Dict[str, Any]] = None
         if should_eval:
             eval_data = _compute_round_eval(
-                policy, expert_policy, venv, baselines,
+                policy,
+                expert_policy,
+                venv,
+                baselines,
             )
             disagreement_history.append(eval_data["disagreement_rate"])
 
@@ -1122,7 +1185,9 @@ def _run_bc_dagger(
             optimizer_kwargs={"lr": config.learning_rate},
             custom_logger=custom_logger,
         )
-        inner_log = _inner_train(bc_trainer, config, round_num=round_num, is_dagger=False)
+        inner_log = _inner_train(
+            bc_trainer, config, round_num=round_num, is_dagger=False
+        )
         policy = bc_trainer.policy
 
         l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
@@ -1355,27 +1420,32 @@ def main():
     )
     parser.add_argument(
         "--inner-early-stop-patience",
-        type=int, default=5,
+        type=int,
+        default=5,
         help="Epochs without val-NLL improvement before stopping (default 5).",
     )
     parser.add_argument(
         "--inner-early-stop-min-delta",
-        type=float, default=1e-4,
+        type=float,
+        default=1e-4,
         help="Min absolute val-NLL improvement to count as progress (default 1e-4).",
     )
     parser.add_argument(
         "--inner-early-stop-val-frac",
-        type=float, default=0.1,
+        type=float,
+        default=0.1,
         help="Fraction of D^t held out for val (default 0.1).",
     )
     parser.add_argument(
         "--inner-early-stop-min-val-size",
-        type=int, default=32,
+        type=int,
+        default=32,
         help="Below this val-set size, fall back to fixed bc_n_epochs (default 32).",
     )
     parser.add_argument(
         "--inner-early-stop-min-epochs",
-        type=int, default=3,
+        type=int,
+        default=3,
         help="Don't trigger inner ES before this epoch (default 3).",
     )
     parser.add_argument(
@@ -1503,7 +1573,9 @@ def main():
             if len(parts) == 2 and parts[1].isdigit():
                 file_seed = int(parts[1])
                 if file_seed not in expected_seeds:
-                    logger.info(f"Removing stale result: {f} (seed {file_seed} not in current run)")
+                    logger.info(
+                        f"Removing stale result: {f} (seed {file_seed} not in current run)"
+                    )
                     f.unlink()
 
     total_requested = len(all_configs)
@@ -1539,8 +1611,9 @@ def main():
     for env_name in args.envs:
         rng = np.random.default_rng(0)
         if env_utils.is_atari(env_name):
-            from imitation.experiments.ftrl.atari_utils import make_atari_venv
             from stable_baselines3.common.vec_env import VecTransposeImage
+
+            from imitation.experiments.ftrl.atari_utils import make_atari_venv
 
             venv = make_atari_venv(env_name, n_envs=1, seed=0)
             venv = VecTransposeImage(venv)

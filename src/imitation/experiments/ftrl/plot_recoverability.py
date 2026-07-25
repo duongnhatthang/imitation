@@ -64,6 +64,8 @@ def render_recoverability_figure(
             else ""
         )
         + "\nInteractive IL benefits when mu(s) << J for most s."
+        + "\nNote: mu uses discounted DQN Q-values; the J line is undiscounted"
+        " return -> compare qualitatively."
     )
     ax.text(
         0.98,
@@ -94,6 +96,14 @@ def build_and_plot(
     if not states:
         raise FileNotFoundError(
             f"No scratch demos for {env_name} seed {seed} under {results_dir}"
+        )
+    found = sorted(s.algo for s in states)
+    expected = list(coverage_data.ALL_ALGOS)
+    missing = [a for a in expected if a not in found]
+    if missing:
+        print(
+            f"WARNING: no scratch demos for {missing} in {env_name}; "
+            f"figure will only include {found}."
         )
     obs = coverage_data.pool(states).obs
     dqn = recoverability.get_or_train_dqn_reference(
