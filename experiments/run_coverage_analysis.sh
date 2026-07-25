@@ -16,9 +16,16 @@ PLOTS_DIR="$RESULTS_DIR/plots/coverage"
 CACHE_DIR="${COVERAGE_CACHE_DIR:-experiments/coverage/dqn_cache}"
 mkdir -p "$PLOTS_DIR" "$CACHE_DIR"
 
-SCRATCH_GLOB="$RESULTS_DIR/scratch/ftrl_${ENV}_seed0/demos"
-if [ ! -d "$SCRATCH_GLOB" ]; then
-  echo "[coverage] no scratch demos found; running short CartPole sweep ..."
+# Require every algo's demos (not just ftrl): bc/bc_dagger persist demos too, and a
+# stale ftl/ftrl-only dir would otherwise skip the sweep and drop the offline panels.
+NEED_SWEEP=0
+for algo in ftl ftrl bc bc_dagger; do
+  if [ ! -d "$RESULTS_DIR/scratch/${algo}_${ENV}_seed0/demos" ]; then
+    NEED_SWEEP=1
+  fi
+done
+if [ "$NEED_SWEEP" -eq 1 ]; then
+  echo "[coverage] missing scratch demos for one or more algos; running short CartPole sweep ..."
   python -m imitation.experiments.ftrl.run_experiment \
       --envs "$ENV" \
       --algos ftl ftrl bc bc_dagger \
@@ -34,7 +41,7 @@ if [ ! -d "$SCRATCH_GLOB" ]; then
       --n-gpus 0 \
       "$@"
 else
-  echo "[coverage] reusing existing scratch demos at $SCRATCH_GLOB"
+  echo "[coverage] reusing existing scratch demos in $RESULTS_DIR/scratch/"
 fi
 
 echo "[coverage] t-SNE coverage ..."
