@@ -51,14 +51,18 @@ def render_recoverability_figure(
             horizon_return,
             color="crimson",
             linestyle="--",
-            label=f"horizon return J = {horizon_return:.0f}",
+            label=f"expert / horizon return = {horizon_return:.0f}",
         )
         ax.legend()
     ax.set_title(f"Recoverability constant: {env_name}")
     provenance = (
         "mu from separately-trained DQN reference (not the PPO IL expert)\n"
         f"DQN return = {dqn_return:.0f}"
-        + (f"   |   PPO expert return = {ppo_return:.0f}" if ppo_return else "")
+        + (
+            f"   |   PPO expert return = {ppo_return:.0f}"
+            if ppo_return is not None
+            else ""
+        )
         + "\nInteractive IL benefits when mu(s) << J for most s."
     )
     ax.text(
@@ -77,7 +81,13 @@ def render_recoverability_figure(
 
 
 def build_and_plot(
-    results_dir, env_name, seed, cache_dir, out_path, total_timesteps=None
+    results_dir,
+    env_name,
+    seed,
+    cache_dir,
+    out_path,
+    total_timesteps=None,
+    horizon_return: Optional[float] = None,
 ) -> dict:
     """Train/load DQN reference, compute mu over visited states, render figure."""
     states = coverage_data.load_env_states(results_dir, env_name, seed)
@@ -92,8 +102,9 @@ def build_and_plot(
     mu = recoverability.recoverability(dqn, obs)
     dqn_return = recoverability.reference_return(dqn, env_name)
     ppo_return = expert_return_from_results(results_dir, env_name, seed)
+    line_value = horizon_return if horizon_return is not None else ppo_return
     render_recoverability_figure(
-        mu, out_path, env_name, ppo_return, dqn_return, ppo_return
+        mu, out_path, env_name, line_value, dqn_return, ppo_return
     )
     return {
         "mu_mean": float(mu.mean()),
@@ -112,6 +123,12 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dqn-timesteps", type=int, default=None)
+    parser.add_argument(
+        "--horizon-return",
+        type=float,
+        default=None,
+        help="Reference line value J; defaults to the PPO expert return from results.",
+    )
     args = parser.parse_args(argv)
     out = pathlib.Path(args.output_dir) / (
         f"{args.env.replace('/', '_')}_recoverability.png"
@@ -123,6 +140,7 @@ def main(argv: Optional[list] = None) -> None:
         args.cache_dir,
         out,
         args.dqn_timesteps,
+        horizon_return=args.horizon_return,
     )
     print(
         f"Wrote {out}; mu_median={info['mu_median']:.3f}, "

@@ -17,6 +17,20 @@ def test_render_writes_png_with_annotation(tmp_path):
     assert out.exists()
 
 
+def test_render_with_zero_ppo_return_still_annotates(tmp_path):
+    mu = np.abs(np.random.RandomState(1).randn(200)) * 5
+    out = tmp_path / "CartPole-v1_recoverability_zero.png"
+    plot_recoverability.render_recoverability_figure(
+        mu,
+        out,
+        "CartPole-v1",
+        horizon_return=500.0,
+        dqn_return=480.0,
+        ppo_return=0.0,
+    )
+    assert out.exists()
+
+
 def test_expert_return_from_results(tmp_path):
     import json
 
