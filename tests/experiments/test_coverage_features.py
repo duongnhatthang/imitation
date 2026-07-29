@@ -35,3 +35,18 @@ def test_cnn_features_from_pong_expert():
     obs = np.zeros((6, 4, 84, 84), dtype=np.uint8)
     feats = coverage_features.extract_features(obs, "PongNoFrameskip-v4", expert=expert)
     assert feats.shape == (6, 512)
+
+
+@pytest.mark.expensive
+def test_cnn_features_accept_nhwc():
+    """extract_features handles un-flattened NHWC Atari obs end-to-end."""
+    cache = pathlib.Path("experiments/expert_cache")
+    if not (cache / "PongNoFrameskip-v4" / "model.zip").exists():
+        pytest.skip("Pong expert not cached")
+    expert = coverage_features.load_expert_policy("PongNoFrameskip-v4", cache)
+    # NHWC layout: (N, H, W, C) = (4, 84, 84, 4)
+    obs_nhwc = np.zeros((4, 84, 84, 4), dtype=np.uint8)
+    feats = coverage_features.extract_features(
+        obs_nhwc, "PongNoFrameskip-v4", expert=expert
+    )
+    assert feats.shape == (4, 512), f"expected (4, 512), got {feats.shape}"

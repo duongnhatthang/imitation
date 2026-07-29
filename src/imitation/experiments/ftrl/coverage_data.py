@@ -25,7 +25,9 @@ class CoverageStates:
     """Visited states for one algorithm with per-state arrival round."""
 
     algo: str
-    obs: np.ndarray  # [N, D] float32
+    obs: (
+        np.ndarray
+    )  # [N, ...] native dtype: [N, D] for vector obs, [N, H, W, C] for Atari image obs
     rounds: np.ndarray  # [N] int
 
 
@@ -60,8 +62,9 @@ def load_algo_states(
         round_num = int(match.group(1))
         for npz in sorted(round_dir.glob("*.npz")):
             traj = serialize.load(npz)[0]
-            obs = np.asarray(traj.obs[:-1], dtype=np.float32)
-            obs = obs.reshape(obs.shape[0], -1)
+            obs = np.asarray(traj.obs[:-1])
+            if obs.ndim == 1:
+                obs = obs.reshape(obs.shape[0], -1)
             obs_chunks.append(obs)
             round_chunks.append(np.full(len(obs), round_num, dtype=int))
     if not obs_chunks:

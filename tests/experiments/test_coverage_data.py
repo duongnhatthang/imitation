@@ -59,6 +59,29 @@ def test_save_transitions_as_demos_roundtrips(tmp_path):
     assert np.allclose(cs.obs, obs)  # obs[:-1] of the synthetic traj == original states
 
 
+def _make_image_traj(n):
+    """Trajectory with Atari-shaped (84, 84, 4) uint8 obs; n+1 obs rows."""
+    obs = np.zeros((n + 1, 84, 84, 4), dtype=np.uint8)
+    acts = np.zeros((n,), dtype=np.int64)
+    rews = np.zeros((n,), dtype=np.float32)
+    return types.TrajectoryWithRew(
+        obs=obs, acts=acts, infos=None, terminal=True, rews=rews
+    )
+
+
+def test_load_algo_states_preserves_image_obs(tmp_path):
+    T = 3
+    _write_demo(tmp_path, "ftrl", "PongNoFrameskip-v4", 0, 0, _make_image_traj(T))
+    cs = coverage_data.load_algo_states(tmp_path, "PongNoFrameskip-v4", "ftrl", 0)
+    assert cs is not None
+    # Shape must be (T, H, W, C) — NOT flattened to (T, 28224)
+    assert cs.obs.shape == (T, 84, 84, 4), f"expected (3,84,84,4), got {cs.obs.shape}"
+    # dtype must NOT be float32 (the old bug forced dtype=float32 on every obs)
+    assert (
+        cs.obs.dtype != np.float32
+    ), f"obs dtype was coerced to float32; got {cs.obs.dtype}"
+
+
 def test_pool_and_standardize(tmp_path):
     _write_demo(tmp_path, "bc", "CartPole-v1", 0, 0, _make_traj(4, 4, 5.0))
     _write_demo(tmp_path, "ftrl", "CartPole-v1", 0, 1, _make_traj(4, 4, 9.0))

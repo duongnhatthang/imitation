@@ -103,6 +103,17 @@ def recoverability(dqn: DQN, obs: np.ndarray) -> np.ndarray:
     return mu_from_q(dqn_q_values(dqn, obs))
 
 
+def hub_dqn_q_values(dqn: DQN, obs: np.ndarray) -> np.ndarray:
+    """Per-action Q for Atari obs via SB3 preprocessing (CHW transpose + /255)."""
+    from imitation.experiments.ftrl import coverage_features
+
+    chw = coverage_features.to_chw(np.asarray(obs))
+    obs_t, _ = dqn.policy.obs_to_tensor(chw)
+    with th.no_grad():
+        q = dqn.q_net(obs_t)
+    return q.cpu().numpy()
+
+
 def get_or_train_dqn_reference(
     env_name: str, cache_dir, total_timesteps: Optional[int] = None, seed: int = 0
 ) -> DQN:
@@ -241,7 +252,7 @@ def recoverability_mu(
         return None
     if env_utils.is_atari(env_name):
         dqn = load_hub_dqn(env_name)
-        return recoverability(dqn, obs)
+        return mu_from_q(hub_dqn_q_values(dqn, obs))
     obs_type = env_utils.ENV_CONFIGS.get(env_name, {}).get("obs_type")
     if obs_type == "discrete":  # toy-text: exact env.P mu w.r.t. the PPO expert
         mu_by_state = recoverability_tabular.exact_mu_per_state(env_name, expert_policy)
