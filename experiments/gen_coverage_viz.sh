@@ -10,14 +10,17 @@ RESULTS_DIR="${1:?usage: gen_coverage_viz.sh <results_dir> <env...>}"; shift
 COV_DIR="$RESULTS_DIR/plots/coverage"
 CACHE_DIR="$RESULTS_DIR/dqn_cache"
 SEED="${COVERAGE_SEED:-0}"
+# Where cached PPO experts live (Atari CNN features + toy-text exact-mu expert).
+EXPERT_CACHE="${EXPERT_CACHE:-experiments/expert_cache}"
 mkdir -p "$COV_DIR" "$CACHE_DIR"
 for env in "$@"; do
   echo "[gen_coverage_viz] $env"
   python -m imitation.experiments.ftrl.plot_tsne_coverage \
-      --results-dir "$RESULTS_DIR" --env "$env" --seed "$SEED" --output-dir "$COV_DIR"
+      --results-dir "$RESULTS_DIR" --env "$env" --seed "$SEED" --output-dir "$COV_DIR" \
+      --expert-cache "$EXPERT_CACHE"
   python -m imitation.experiments.ftrl.plot_recoverability \
       --results-dir "$RESULTS_DIR" --env "$env" --seed "$SEED" \
-      --cache-dir "$CACHE_DIR" --output-dir "$COV_DIR"
+      --cache-dir "$CACHE_DIR" --output-dir "$COV_DIR" --expert-cache "$EXPERT_CACHE"
 done
 python -m imitation.experiments.ftrl.aggregate_runtime \
     --results-dir "$RESULTS_DIR" --output-dir "$COV_DIR"
