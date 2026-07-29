@@ -13,8 +13,24 @@ import numpy as np  # noqa: E402
 from imitation.experiments.ftrl import coverage_data, tsne_coverage  # noqa: E402
 
 
+def _auto_point_size(n_points: int) -> float:
+    """Marker size that grows as a panel gets sparser, so few points stay visible.
+
+    ~6 pt for dense panels (>=300 points), scaling up to ~45 pt for very sparse
+    panels so a 30-point smoke run is still legible.
+    """
+    return float(np.clip(1800.0 / max(n_points, 1), 6.0, 45.0))
+
+
 def render_coverage_figure(
-    pooled, tsne_result, out_path, env_name, n_rounds, metrics_2d, metrics_hd
+    pooled,
+    tsne_result,
+    out_path,
+    env_name,
+    n_rounds,
+    metrics_2d,
+    metrics_hd,
+    point_size=None,
 ) -> None:
     """One panel per algorithm on the shared embedding, colored by arrival round.
 
@@ -26,6 +42,7 @@ def render_coverage_figure(
         n_rounds: Total number of data-arrival rounds (for colorbar range).
         metrics_2d: Per-algo dict from coverage_metrics_2d.
         metrics_hd: Per-algo dict from coverage_metrics_highdim.
+        point_size: Fixed marker size; if None, sized per panel by point count.
     """
     algos = sorted(set(pooled.algo.tolist()))
     ncols = min(3, len(algos))
@@ -41,19 +58,21 @@ def render_coverage_figure(
     for i, algo in enumerate(algos):
         ax = axes[i // ncols][i % ncols]
         mask = pooled.algo == algo
+        n_pts = int(mask.sum())
+        size = point_size if point_size is not None else _auto_point_size(n_pts)
         scatter = ax.scatter(
             emb[mask, 0],
             emb[mask, 1],
             c=pooled.rounds[mask],
             cmap="coolwarm",
             norm=norm,
-            s=4,
+            s=size,
             alpha=0.6,
             edgecolors="none",
         )
         cov = metrics_2d.get(algo, {})
         ax.set_title(
-            f"{algo}  (cells={cov.get('occupied_cells', 0)}, "
+            f"{algo}  (n={n_pts}, cells={cov.get('occupied_cells', 0)}, "
             f"kNN={metrics_hd.get(algo, 0):.2f})"
         )
         ax.set_xlim(xlim)
@@ -84,6 +103,7 @@ def build_and_plot(
     perplexities=(15, 30, 50),
     seeds=(0,),
     cap=8000,
+    point_size=None,
 ) -> dict:
     """Load states, fit the shared t-SNE, render, and cache the embedding.
 
@@ -95,6 +115,7 @@ def build_and_plot(
         perplexities: Perplexity values to try; best by trustworthiness is kept.
         seeds: Random seeds for t-SNE.
         cap: Maximum points to subsample before fitting t-SNE.
+        point_size: Fixed marker size; if None, sized per panel by point count.
 
     Returns:
         Dict with keys ``coverage_2d``, ``coverage_highdim``, ``trustworthiness``.
@@ -126,7 +147,14 @@ def build_and_plot(
     metrics_hd = tsne_coverage.coverage_metrics_highdim(feats, algo)
     n_rounds = int(pooled.rounds.max()) if len(pooled.rounds) else 0
     render_coverage_figure(
-        sub, result, out_path, env_name, n_rounds, metrics_2d, metrics_hd
+        sub,
+        result,
+        out_path,
+        env_name,
+        n_rounds,
+        metrics_2d,
+        metrics_hd,
+        point_size=point_size,
     )
     out_path = pathlib.Path(out_path)
     np.savez(
@@ -158,6 +186,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--perplexity", type=float, nargs="+", default=[15, 30, 50])
     parser.add_argument("--tsne-seed", type=int, nargs="+", default=[0])
     parser.add_argument("--cap", type=int, default=8000)
+    parser.add_argument(
+        "--point-size",
+        type=float,
+        default=None,
+        help="Fixed scatter marker size; default auto-sizes per panel by count.",
+    )
     args = parser.parse_args(argv)
     out = pathlib.Path(args.output_dir) / f"{args.env.replace('/', '_')}.png"
     metrics = build_and_plot(
@@ -168,6 +202,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         tuple(args.perplexity),
         tuple(args.tsne_seed),
         args.cap,
+        point_size=args.point_size,
     )
     print(f"Wrote {out}; trustworthiness={metrics['trustworthiness']:.3f}")
 

@@ -2,8 +2,10 @@
 
 mu is computed from a separately-trained DQN reference expert (NOT the PPO
 imitation expert). The figure annotates this provenance and shows DQN vs PPO
-return so both are visibly near-optimal; a reference line at the horizon return
-marks the DAgger benefit threshold mu(s) << J.
+return so both are visibly near-optimal. The horizon return J is undiscounted
+and far larger than the discounted mu, so it is reported as a text note (with a
+discounting caveat) rather than an on-axis line; the DAgger benefit threshold
+mu(s) << J is thus read qualitatively.
 """
 
 import argparse
@@ -39,22 +41,45 @@ def expert_return_from_results(results_dir, env_name, seed) -> Optional[float]:
 def render_recoverability_figure(
     mu, out_path, env_name, horizon_return, dqn_return, ppo_return
 ) -> None:
-    """Histogram of mu(s) with the horizon-return threshold and provenance text."""
+    """Histogram of mu(s) with a median marker and provenance/threshold text.
+
+    The x-axis is fit to the mu range so the (small, discounted) mu values are
+    readable. The horizon return J is undiscounted and orders of magnitude larger
+    than mu, so it is reported as a text note rather than an on-axis line that
+    would crush the histogram.
+    """
     out_path = pathlib.Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    mu = np.asarray(mu, dtype=float)
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(mu, bins=50, color="#4c72b0", alpha=0.85)
     ax.set_xlabel(r"$\mu(s) = \max_a Q^{\pi^E}(s,a) - \min_a Q^{\pi^E}(s,a)$")
     ax.set_ylabel("count (visited states)")
-    if horizon_return is not None:
+
+    # Fit the x-axis to the mu range so the bars fill the panel.
+    mu_hi = float(mu.max()) if mu.size else 1.0
+    ax.set_xlim(0.0, mu_hi * 1.08 if mu_hi > 0 else 1.0)
+
+    # On-scale median marker: the "typical" recoverability of a visited state.
+    if mu.size:
+        mu_median = float(np.median(mu))
         ax.axvline(
-            horizon_return,
-            color="crimson",
+            mu_median,
+            color="#c44e52",
             linestyle="--",
-            label=f"expert / horizon return = {horizon_return:.0f}",
+            linewidth=1.5,
+            label=f"median $\\mu$ = {mu_median:.3f}",
         )
-        ax.legend()
+        ax.legend(loc="upper right")
+
     ax.set_title(f"Recoverability constant: {env_name}")
+
+    # J is undiscounted and off-scale vs mu -> report as a note, not an axvline.
+    j_note = (
+        f"horizon return J = {horizon_return:.0f} (undiscounted, off-scale $\\gg \\mu$)"
+        if horizon_return is not None
+        else "horizon return J: unavailable"
+    )
     provenance = (
         "mu from separately-trained DQN reference (not the PPO IL expert)\n"
         f"DQN return = {dqn_return:.0f}"
@@ -63,21 +88,21 @@ def render_recoverability_figure(
             if ppo_return is not None
             else ""
         )
+        + f"\n{j_note}"
+        + "\nmu uses discounted DQN Q-values; compare mu << J qualitatively."
         + "\nInteractive IL benefits when mu(s) << J for most s."
-        + "\nNote: mu uses discounted DQN Q-values; the J line is undiscounted"
-        " return -> compare qualitatively."
     )
     ax.text(
-        0.98,
-        0.97,
+        0.5,
+        -0.28,
         provenance,
         transform=ax.transAxes,
-        ha="right",
+        ha="center",
         va="top",
         fontsize=8,
         bbox=dict(boxstyle="round", fc="wheat", alpha=0.5),
     )
-    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.34)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -112,9 +137,15 @@ def build_and_plot(
     mu = recoverability.recoverability(dqn, obs)
     dqn_return = recoverability.reference_return(dqn, env_name)
     ppo_return = expert_return_from_results(results_dir, env_name, seed)
-    line_value = horizon_return if horizon_return is not None else ppo_return
+    if ppo_return is not None and dqn_return < 0.9 * ppo_return:
+        print(
+            f"WARNING: DQN reference return ({dqn_return:.0f}) is well below the "
+            f"PPO expert return ({ppo_return:.0f}) for {env_name}; the reference "
+            f"may be under-trained, making mu(s) less reliable."
+        )
+    j_value = horizon_return if horizon_return is not None else ppo_return
     render_recoverability_figure(
-        mu, out_path, env_name, line_value, dqn_return, ppo_return
+        mu, out_path, env_name, j_value, dqn_return, ppo_return
     )
     return {
         "mu_mean": float(mu.mean()),
