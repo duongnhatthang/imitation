@@ -33,6 +33,9 @@ def fit_shared_tsne(
     """Fit t-SNE across a small grid; keep the most trustworthy embedding."""
     n = len(features)
     best: Optional[TSNEResult] = None
+    # trustworthiness requires n_neighbors < n_samples / 2; clamp for small sets
+    # (real runs have thousands of points, but keep this robust for tiny configs).
+    tw_neighbors = max(1, min(n_neighbors, (n // 2) - 1))
     for perplexity in perplexities:
         # t-SNE requires perplexity < n_samples.
         perp = min(perplexity, max(5.0, (n - 1) / 3.0))
@@ -44,9 +47,7 @@ def fit_shared_tsne(
                 random_state=seed,
                 n_iter=1000,
             ).fit_transform(features)
-            tw = float(
-                trustworthiness(features, emb, n_neighbors=min(n_neighbors, n - 1))
-            )
+            tw = float(trustworthiness(features, emb, n_neighbors=tw_neighbors))
             if best is None or tw > best.trustworthiness:
                 best = TSNEResult(emb, float(perp), int(seed), tw)
     return best
