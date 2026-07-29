@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from imitation.experiments.ftrl import recoverability
+from imitation.experiments.ftrl import recoverability, recoverability_tabular
 
 
 def test_mu_from_q_is_max_minus_min():
@@ -43,3 +43,36 @@ def test_dqn_reference_reaches_expert_and_mu_reasonable(tmp_path):
     # V=max_a Q should be on the discounted-return scale (tens), not compressed
     # to single digits as it is when the reference is under-trained.
     assert q.max(axis=1).mean() > 40.0
+
+
+def test_normalized_return_handles_negative_scales():
+    # Acrobot-like: random -500, expert -80, dqn -90 -> normalized ~0.976
+    n = recoverability.normalized_return(-90.0, -500.0, -80.0)
+    assert 0.95 <= n <= 1.0
+
+
+def test_recoverability_mu_dispatch_blackjack_returns_none(tmp_path):
+    obs = np.zeros((4, 45))
+    assert recoverability.recoverability_mu("Blackjack-v1", obs, tmp_path) is None
+
+
+def test_recoverability_mu_toytext_uses_tabular(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        recoverability_tabular,
+        "exact_mu_per_state",
+        lambda env, expert, gamma=0.99: np.array([0.0, 1.0, 2.0, 3.0]),
+    )
+    obs = np.eye(4)[[3, 1]]  # state ids 3, 1
+    mu = recoverability.recoverability_mu(
+        "FrozenLake-v1", obs, tmp_path, expert_policy=object()
+    )
+    assert list(mu) == [3.0, 1.0]
+
+
+@pytest.mark.expensive
+def test_hub_dqn_qnet_shape_pong():
+    dqn = recoverability.load_hub_dqn("PongNoFrameskip-v4")
+    obs = np.zeros((5, 4, 84, 84), dtype=np.uint8)
+    q = recoverability.dqn_q_values(dqn, obs)
+    assert q.shape[0] == 5 and q.shape[1] >= 3  # Pong has 6 actions
+    assert (recoverability.mu_from_q(q) >= 0).all()

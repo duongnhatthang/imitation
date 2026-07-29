@@ -16,7 +16,12 @@ from stable_baselines3 import DQN
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
 
-DQN_DEFAULT_TIMESTEPS: Dict[str, int] = {"CartPole-v1": 50_000}
+DQN_DEFAULT_TIMESTEPS: Dict[str, int] = {
+    "CartPole-v1": 50_000,
+    "Acrobot-v1": 100_000,
+    "MountainCar-v0": 120_000,
+    "LunarLander-v2": 100_000,
+}
 
 # Per-environment DQN constructor kwargs overrides.  The SB3 DQN default
 # learning_starts=50_000 means a 50k-step run never trains, and the default
@@ -36,6 +41,45 @@ _DQN_ENV_KWARGS: Dict[str, Dict[str, Any]] = {
         "gradient_steps": 128,
         "exploration_fraction": 0.16,
         "exploration_final_eps": 0.04,
+        "policy_kwargs": {"net_arch": [256, 256]},
+    },
+    "Acrobot-v1": {
+        "learning_rate": 6.3e-4,
+        "batch_size": 128,
+        "buffer_size": 50_000,
+        "learning_starts": 0,
+        "gamma": 0.99,
+        "target_update_interval": 250,
+        "train_freq": 4,
+        "gradient_steps": -1,
+        "exploration_fraction": 0.12,
+        "exploration_final_eps": 0.1,
+        "policy_kwargs": {"net_arch": [256, 256]},
+    },
+    "MountainCar-v0": {
+        "learning_rate": 4e-3,
+        "batch_size": 128,
+        "buffer_size": 10_000,
+        "learning_starts": 1_000,
+        "gamma": 0.98,
+        "target_update_interval": 600,
+        "train_freq": 16,
+        "gradient_steps": 8,
+        "exploration_fraction": 0.2,
+        "exploration_final_eps": 0.07,
+        "policy_kwargs": {"net_arch": [256, 256]},
+    },
+    "LunarLander-v2": {
+        "learning_rate": 6.3e-4,
+        "batch_size": 128,
+        "buffer_size": 50_000,
+        "learning_starts": 0,
+        "gamma": 0.99,
+        "target_update_interval": 250,
+        "train_freq": 4,
+        "gradient_steps": -1,
+        "exploration_fraction": 0.12,
+        "exploration_final_eps": 0.1,
         "policy_kwargs": {"net_arch": [256, 256]},
     },
 }
@@ -133,3 +177,75 @@ def reference_return(
 ) -> float:
     """Mean greedy episodic return (deterministic given ``seed``)."""
     return float(reference_returns(dqn, env_name, n_episodes, seed).mean())
+
+
+def load_hub_dqn(env_name: str) -> DQN:
+    """Load a pretrained sb3/dqn-<Game> Atari DQN from the HuggingFace hub.
+
+    Args:
+        env_name: Gymnasium environment id (e.g. ``"PongNoFrameskip-v4"``).
+
+    Returns:
+        A DQN model loaded from the HuggingFace hub.
+    """
+    from huggingface_sb3 import load_from_hub
+
+    path = load_from_hub(repo_id=f"sb3/dqn-{env_name}", filename=f"dqn-{env_name}.zip")
+    return DQN.load(path, device="auto")
+
+
+def normalized_return(dqn_return, random_return, expert_return) -> float:
+    """Return normalized to [random=0, expert=1]; robust to negative scales.
+
+    Args:
+        dqn_return: The DQN reference agent's mean episodic return.
+        random_return: The random policy's mean episodic return.
+        expert_return: The expert policy's mean episodic return.
+
+    Returns:
+        Normalized return where 0 corresponds to random and 1 to expert.
+        Robust to environments with negative returns (e.g. Acrobot).
+    """
+    denom = expert_return - random_return
+    if abs(denom) < 1e-8:
+        return 0.0
+    return float((dqn_return - random_return) / denom)
+
+
+def recoverability_mu(
+    env_name: str, obs, cache_dir, expert_policy=None
+) -> Optional[np.ndarray]:
+    """Dispatch mu(s) over visited obs to the right backend for this env family.
+
+    Dispatch logic:
+    - ``Blackjack-v1``: returns ``None`` (stochastic optimum; mu not reliable).
+    - Atari (``NoFrameskip`` envs): loads a pretrained hub DQN and computes mu.
+    - Toy-text (``obs_type == "discrete"``): uses exact tabular policy evaluation
+      w.r.t. the PPO expert (requires ``expert_policy``).
+    - Continuous classical: trains or loads a cached DQN reference and computes mu.
+
+    Args:
+        env_name: Gymnasium environment id.
+        obs: Batch of observations, shape ``[N, ...]``.
+        cache_dir: Directory for caching trained DQN models.
+        expert_policy: Expert policy (required for toy-text / discrete obs envs).
+
+    Returns:
+        Array of shape ``[N]`` with mu(s) per observation, or ``None`` for
+        Blackjack.
+    """
+    from imitation.experiments.ftrl import env_utils, recoverability_tabular
+
+    obs = np.asarray(obs)
+    if env_name == "Blackjack-v1":
+        return None
+    if env_utils.is_atari(env_name):
+        dqn = load_hub_dqn(env_name)
+        return recoverability(dqn, obs)
+    obs_type = env_utils.ENV_CONFIGS.get(env_name, {}).get("obs_type")
+    if obs_type == "discrete":  # toy-text: exact env.P mu w.r.t. the PPO expert
+        mu_by_state = recoverability_tabular.exact_mu_per_state(env_name, expert_policy)
+        ids = recoverability_tabular.state_ids_from_onehot(obs)
+        return mu_by_state[ids]
+    dqn = get_or_train_dqn_reference(env_name, cache_dir)  # continuous classical
+    return recoverability(dqn, obs)
