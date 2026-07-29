@@ -104,6 +104,7 @@ def build_and_plot(
     seeds=(0,),
     cap=8000,
     point_size=None,
+    expert_cache="experiments/expert_cache",
 ) -> dict:
     """Load states, fit the shared t-SNE, render, and cache the embedding.
 
@@ -116,6 +117,8 @@ def build_and_plot(
         seeds: Random seeds for t-SNE.
         cap: Maximum points to subsample before fitting t-SNE.
         point_size: Fixed marker size; if None, sized per panel by point count.
+        expert_cache: Directory containing cached PPO expert policies (used for
+            Atari CNN feature extraction).
 
     Returns:
         Dict with keys ``coverage_2d``, ``coverage_highdim``, ``trustworthiness``.
@@ -123,6 +126,8 @@ def build_and_plot(
     Raises:
         FileNotFoundError: If no scratch demos are found for the given env/seed.
     """
+    from imitation.experiments.ftrl import coverage_features
+
     states = coverage_data.load_env_states(results_dir, env_name, seed)
     if not states:
         raise FileNotFoundError(
@@ -137,7 +142,13 @@ def build_and_plot(
             f"figure will only include {found}."
         )
     pooled = coverage_data.pool(states)
-    feats_full = coverage_data.standardize_features(pooled.obs)
+    if coverage_features.feature_mode(env_name) == "cnn":
+        expert = coverage_features.load_expert_policy(env_name, expert_cache)
+        feats_full = coverage_features.extract_features(
+            pooled.obs, env_name, expert=expert
+        )
+    else:
+        feats_full = coverage_features.extract_features(pooled.obs, env_name)
     feats, algo, rounds, _ = tsne_coverage.subsample(
         feats_full, pooled.algo, pooled.rounds, cap=cap, seed=seeds[0]
     )
@@ -192,6 +203,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default=None,
         help="Fixed scatter marker size; default auto-sizes per panel by count.",
     )
+    parser.add_argument(
+        "--expert-cache",
+        default="experiments/expert_cache",
+        help="Directory containing cached PPO expert policies for Atari CNN features.",
+    )
     args = parser.parse_args(argv)
     out = pathlib.Path(args.output_dir) / f"{args.env.replace('/', '_')}.png"
     metrics = build_and_plot(
@@ -203,6 +219,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         tuple(args.tsne_seed),
         args.cap,
         point_size=args.point_size,
+        expert_cache=args.expert_cache,
     )
     print(f"Wrote {out}; trustworthiness={metrics['trustworthiness']:.3f}")
 

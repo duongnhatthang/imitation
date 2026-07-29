@@ -38,3 +38,15 @@ def test_build_and_plot_writes_png_and_cache(tmp_path):
     assert out.exists()
     assert out.with_suffix(".npz").exists()  # embedding cache
     assert "ftrl" in metrics["coverage_2d"] and "bc" in metrics["coverage_2d"]
+
+
+def test_build_and_plot_scaler_path_unchanged(tmp_path):
+    # reuse the existing _demo helper in this file to write CartPole demos
+    for rnd in range(3):
+        _demo(tmp_path, "ftrl", 0, rnd, 40, val=float(rnd))
+    _demo(tmp_path, "bc", 0, 0, 40, val=0.0)
+    out = tmp_path / "plots" / "CartPole-v1.png"
+    metrics = plot_tsne_coverage.build_and_plot(
+        tmp_path, "CartPole-v1", 0, out, perplexities=(15,), seeds=(0,)
+    )
+    assert out.exists() and "ftrl" in metrics["coverage_2d"]
