@@ -202,7 +202,17 @@ def load_hub_dqn(env_name: str) -> DQN:
     from huggingface_sb3 import load_from_hub
 
     path = load_from_hub(repo_id=f"sb3/dqn-{env_name}", filename=f"dqn-{env_name}.zip")
-    return DQN.load(path, device="auto")
+    # These hub models were saved with an older SB3 whose replay-buffer config
+    # (optimize_memory_usage=True + handle_timeout_termination=True) current SB3
+    # rejects while reconstructing the buffer in load(). We only need q_net for
+    # mu, so override the incompatible flag and the unpicklable schedules.
+    custom_objects = {
+        "learning_rate": 0.0,
+        "lr_schedule": lambda _: 0.0,
+        "exploration_schedule": lambda _: 0.0,
+        "optimize_memory_usage": False,
+    }
+    return DQN.load(path, device="auto", custom_objects=custom_objects)
 
 
 def normalized_return(dqn_return, random_return, expert_return) -> float:
