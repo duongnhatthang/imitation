@@ -7,6 +7,8 @@ evaluation on the environment's transition model, w.r.t. the PPO expert policy.
 import gymnasium as gym
 import numpy as np
 
+from imitation.experiments.ftrl import env_utils
+
 
 def state_ids_from_onehot(obs: np.ndarray) -> np.ndarray:
     """Map one-hot observations back to integer state ids."""
@@ -30,12 +32,17 @@ def exact_mu_per_state(
         env_name: Gymnasium environment id (e.g. ``"FrozenLake-v1"``).
         expert_policy: Expert policy with ``obs_to_tensor`` and ``get_distribution``.
         gamma: Discount factor for policy evaluation.
-        **env_kwargs: Additional keyword arguments forwarded to ``gym.make``
-            (e.g. ``is_slippery=False`` for FrozenLake-v1).
+        **env_kwargs: Additional keyword arguments forwarded to ``gym.make``.
+            If not provided, defaults to the pipeline's ``ENV_CONFIGS`` entry for
+            ``env_name`` so that mu is computed on the same transition model used
+            for demos/expert training (e.g. ``is_slippery=False`` for FrozenLake-v1).
+            An explicit caller-supplied ``env_kwargs`` always takes precedence.
 
     Returns:
         Array of shape ``[nS]`` with mu(s) = max_a Q(s,a) - min_a Q(s,a).
     """
+    if not env_kwargs:
+        env_kwargs = dict(env_utils.ENV_CONFIGS.get(env_name, {}).get("env_kwargs", {}))
     env = gym.make(env_name, **env_kwargs)
     model = env.unwrapped.P
     n_s = env.observation_space.n
