@@ -61,21 +61,9 @@ def test_provenance_label_per_family():
 
 
 def test_build_and_plot_skips_blackjack(tmp_path):
-    import json
-
-    d = tmp_path / "Blackjack-v1"
-    d.mkdir(parents=True)
-    (d / "ftrl_end_to_end_seed0.json").write_text(
-        json.dumps(
-            {
-                "algo": "ftrl",
-                "env": "Blackjack-v1",
-                "seed": 0,
-                "baselines": {"expert_return": 0.5},
-                "per_round": [],
-                "elapsed_seconds": 1.0,
-            }
-        )
+    out = tmp_path / "Blackjack-v1_recoverability.png"
+    result = plot_recoverability.build_and_plot(
+        tmp_path, "Blackjack-v1", 0, tmp_path / "cache", out
     )
-    # No demos -> FileNotFoundError is fine; but Blackjack must be recognized as skip
-    assert plot_recoverability.provenance_label("Blackjack-v1") == "skipped (no env.P)"
+    assert result == {"skipped": True}
+    assert not out.exists()  # skipped -> no figure written

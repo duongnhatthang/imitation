@@ -281,7 +281,7 @@ def build_and_plot(
         ppo_return,
         dqn_return_std,
         provenance_str=prov,
-        show_dqn_return=is_dqn_backend,
+        show_dqn_return=(is_dqn_backend and dqn_return is not None),
     )
     result: dict = {
         "mu_mean": float(mu.mean()),
