@@ -190,18 +190,21 @@ def reference_return(
     return float(reference_returns(dqn, env_name, n_episodes, seed).mean())
 
 
-def load_hub_dqn(env_name: str) -> DQN:
-    """Load a pretrained sb3/dqn-<Game> Atari DQN from the HuggingFace hub.
+def load_hub_dqn(env_name: str, expert_cache="experiments/expert_cache") -> DQN:
+    """Load a pretrained sb3/dqn-<Game> Atari DQN, local cache first, else hub.
+
+    Prefers a pre-downloaded zip at ``{expert_cache}/{env}/dqn-{env}.zip`` so the
+    Atari mu path works on offline compute nodes (the GPU server has no internet);
+    falls back to downloading from the HuggingFace hub when the local copy is
+    absent.
 
     Args:
         env_name: Gymnasium environment id (e.g. ``"PongNoFrameskip-v4"``).
+        expert_cache: Directory holding pre-downloaded hub DQN zips.
 
     Returns:
-        A DQN model loaded from the HuggingFace hub.
+        A DQN model with a usable ``q_net``.
     """
-    from huggingface_sb3 import load_from_hub
-
-    path = load_from_hub(repo_id=f"sb3/dqn-{env_name}", filename=f"dqn-{env_name}.zip")
     # These hub models were saved with an older SB3 whose replay-buffer config
     # (optimize_memory_usage=True + handle_timeout_termination=True) current SB3
     # rejects while reconstructing the buffer in load(). We only need q_net for
@@ -212,6 +215,14 @@ def load_hub_dqn(env_name: str) -> DQN:
         "exploration_schedule": lambda _: 0.0,
         "optimize_memory_usage": False,
     }
+    local = (
+        pathlib.Path(expert_cache) / env_name.replace("/", "_") / f"dqn-{env_name}.zip"
+    )
+    if local.exists():
+        return DQN.load(local, device="auto", custom_objects=custom_objects)
+    from huggingface_sb3 import load_from_hub
+
+    path = load_from_hub(repo_id=f"sb3/dqn-{env_name}", filename=f"dqn-{env_name}.zip")
     return DQN.load(path, device="auto", custom_objects=custom_objects)
 
 
@@ -234,7 +245,11 @@ def normalized_return(dqn_return, random_return, expert_return) -> float:
 
 
 def recoverability_mu(
-    env_name: str, obs, cache_dir, expert_policy=None
+    env_name: str,
+    obs,
+    cache_dir,
+    expert_policy=None,
+    expert_cache="experiments/expert_cache",
 ) -> Optional[np.ndarray]:
     """Dispatch mu(s) over visited obs to the right backend for this env family.
 
@@ -261,7 +276,7 @@ def recoverability_mu(
     if env_name == "Blackjack-v1":
         return None
     if env_utils.is_atari(env_name):
-        dqn = load_hub_dqn(env_name)
+        dqn = load_hub_dqn(env_name, expert_cache)
         return mu_from_q(hub_dqn_q_values(dqn, obs))
     obs_type = env_utils.ENV_CONFIGS.get(env_name, {}).get("obs_type")
     if obs_type == "discrete":  # toy-text: exact env.P mu w.r.t. the PPO expert

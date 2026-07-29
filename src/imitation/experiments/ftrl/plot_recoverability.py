@@ -280,16 +280,16 @@ def build_and_plot(
 
     # Load PPO expert only for toy-text (discrete-obs) envs.
     is_discrete = env_utils.ENV_CONFIGS.get(env_name, {}).get("obs_type") == "discrete"
+    if expert_cache is None:
+        expert_cache = "experiments/expert_cache"
     expert = None
     if is_discrete:
         from imitation.experiments.ftrl import coverage_features
 
-        if expert_cache is None:
-            expert_cache = "experiments/expert_cache"
         expert = coverage_features.load_expert_policy(env_name, expert_cache)
 
     mu = recoverability.recoverability_mu(
-        env_name, obs, cache_dir, expert_policy=expert
+        env_name, obs, cache_dir, expert_policy=expert, expert_cache=expert_cache
     )
     # mu should not be None here (Blackjack was caught above), but guard anyway.
     if mu is None:

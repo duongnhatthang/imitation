@@ -76,3 +76,21 @@ def test_hub_dqn_qnet_shape_pong():
     q = recoverability.dqn_q_values(dqn, obs)
     assert q.shape[0] == 5 and q.shape[1] >= 3  # Pong has 6 actions
     assert (recoverability.mu_from_q(q) >= 0).all()
+
+
+def test_load_hub_dqn_prefers_local_cache(tmp_path, monkeypatch):
+    env = "PongNoFrameskip-v4"
+    local_dir = tmp_path / env
+    local_dir.mkdir(parents=True)
+    local_zip = local_dir / f"dqn-{env}.zip"
+    local_zip.write_bytes(b"stub")
+    captured = {}
+
+    def fake_load(path, device="auto", custom_objects=None):
+        captured["path"] = str(path)
+        return "STUB_DQN"
+
+    monkeypatch.setattr(recoverability.DQN, "load", staticmethod(fake_load))
+    out = recoverability.load_hub_dqn(env, expert_cache=tmp_path)
+    assert out == "STUB_DQN"
+    assert captured["path"] == str(local_zip)  # local used, hub never touched
