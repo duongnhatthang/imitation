@@ -44,6 +44,21 @@ and the DAgger recoverability constant, and summarize wall-clock:
 - **Runtime** (`aggregate_runtime`): `runtime.csv` + grouped bar chart from the
   per-run `elapsed_seconds` already stored in result JSONs.
 
+#### Atari + all-classical (Phase 2)
+
+Recoverability dispatches by env family: exact `env.P` for toy-text (FrozenLake,
+CliffWalking, Taxi), pretrained `sb3/dqn-<Game>` for Atari, per-env tuned DQN for
+continuous classical (CartPole/Acrobot/MountainCar/LunarLander). Blackjack skips μ.
+t-SNE uses the expert CNN features for Atari, StandardScaler otherwise.
+
+Generate viz for an existing sweep:
+```
+./experiments/gen_coverage_viz.sh experiments/learning_curves/classical \
+    CartPole-v1 Acrobot-v1 MountainCar-v0 LunarLander-v2 FrozenLake-v1 CliffWalking-v0 Taxi-v3 Blackjack-v1
+./experiments/gen_coverage_viz.sh experiments/learning_curves/atari \
+    PongNoFrameskip-v4 BreakoutNoFrameskip-v4 QbertNoFrameskip-v4 SeaquestNoFrameskip-v4
+```
+
 ## Hyperparameter tuning
 
 Add a named config containing the hyperparameter search space and other settings to `src/imitation/scripts/config/parallel.py`. (`def example_cartpole_rl():` is an example).
