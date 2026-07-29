@@ -39,7 +39,7 @@ def expert_return_from_results(results_dir, env_name, seed) -> Optional[float]:
 
 
 def render_recoverability_figure(
-    mu, out_path, env_name, horizon_return, dqn_return, ppo_return
+    mu, out_path, env_name, horizon_return, dqn_return, ppo_return, dqn_return_std=None
 ) -> None:
     """Histogram of mu(s) with a median marker and provenance/threshold text.
 
@@ -80,9 +80,12 @@ def render_recoverability_figure(
         if horizon_return is not None
         else "horizon return J: unavailable"
     )
+    dqn_str = f"DQN return = {dqn_return:.0f}"
+    if dqn_return_std is not None:
+        dqn_str += f" +/- {dqn_return_std:.0f} (20 eps)"
     provenance = (
         "mu from separately-trained DQN reference (not the PPO IL expert)\n"
-        f"DQN return = {dqn_return:.0f}"
+        f"{dqn_str}"
         + (
             f"   |   PPO expert return = {ppo_return:.0f}"
             if ppo_return is not None
@@ -135,7 +138,9 @@ def build_and_plot(
         env_name, cache_dir, total_timesteps, seed
     )
     mu = recoverability.recoverability(dqn, obs)
-    dqn_return = recoverability.reference_return(dqn, env_name)
+    rets = recoverability.reference_returns(dqn, env_name)
+    dqn_return = float(rets.mean())
+    dqn_return_std = float(rets.std())
     ppo_return = expert_return_from_results(results_dir, env_name, seed)
     if ppo_return is not None and dqn_return < 0.9 * ppo_return:
         print(
@@ -145,12 +150,13 @@ def build_and_plot(
         )
     j_value = horizon_return if horizon_return is not None else ppo_return
     render_recoverability_figure(
-        mu, out_path, env_name, j_value, dqn_return, ppo_return
+        mu, out_path, env_name, j_value, dqn_return, ppo_return, dqn_return_std
     )
     return {
         "mu_mean": float(mu.mean()),
         "mu_median": float(np.median(mu)),
         "dqn_return": dqn_return,
+        "dqn_return_std": dqn_return_std,
         "ppo_return": ppo_return,
     }
 

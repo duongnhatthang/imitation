@@ -14,7 +14,6 @@ import numpy as np
 import torch as th
 from stable_baselines3 import DQN
 from stable_baselines3.common.callbacks import EvalCallback
-from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 
 DQN_DEFAULT_TIMESTEPS: Dict[str, int] = {"CartPole-v1": 50_000}
@@ -96,9 +95,41 @@ def get_or_train_dqn_reference(
     return model
 
 
-def reference_return(dqn: DQN, env_name: str, n_episodes: int = 20) -> float:
-    """Mean episodic return of the (greedy) DQN reference."""
-    env = Monitor(gym.make(env_name))
-    mean, _ = evaluate_policy(dqn, env, n_eval_episodes=n_episodes, deterministic=True)
+def reference_returns(
+    dqn: DQN, env_name: str, n_episodes: int = 20, seed: int = 0
+) -> np.ndarray:
+    """Per-episode greedy returns over deterministically-seeded episodes.
+
+    Episode ``i`` resets with ``seed + i`` so the result is reproducible across
+    calls (the previous unseeded evaluation fluctuated run to run).
+
+    Args:
+        dqn: The DQN reference expert.
+        env_name: Gymnasium environment id.
+        n_episodes: Number of evaluation episodes.
+        seed: Base seed; episode i uses ``seed + i``.
+
+    Returns:
+        Array of shape ``[n_episodes]`` of episodic returns.
+    """
+    env = gym.make(env_name)
+    returns = []
+    for i in range(n_episodes):
+        obs, _ = env.reset(seed=seed + i)
+        done = False
+        total = 0.0
+        while not done:
+            action, _ = dqn.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, _ = env.step(int(action))
+            total += float(reward)
+            done = terminated or truncated
+        returns.append(total)
     env.close()
-    return float(mean)
+    return np.asarray(returns, dtype=float)
+
+
+def reference_return(
+    dqn: DQN, env_name: str, n_episodes: int = 20, seed: int = 0
+) -> float:
+    """Mean greedy episodic return (deterministic given ``seed``)."""
+    return float(reference_returns(dqn, env_name, n_episodes, seed).mean())
