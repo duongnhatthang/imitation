@@ -52,8 +52,20 @@ def provenance_label(env_name: str) -> str:
     return "trained DQN reference"
 
 
-def expert_return_from_results(results_dir, env_name, seed) -> Optional[float]:
-    """Read baselines.expert_return from any result JSON for this env."""
+def baseline_from_results(results_dir, env_name, seed, key: str) -> Optional[float]:
+    """Read baselines[key] from any result JSON for this env.
+
+    Args:
+        results_dir: Root directory with per-env per-seed JSON result files.
+        env_name: Gymnasium environment id.
+        seed: Experiment seed (unused beyond directory lookup).
+        key: Key within the ``baselines`` dict to retrieve (e.g.
+            ``"expert_return"`` or ``"random_return"``).
+
+    Returns:
+        The float value of ``baselines[key]`` from the first matching JSON,
+        or ``None`` if no file or key is found.
+    """
     env_dir = pathlib.Path(results_dir) / env_name.replace("/", "_")
     if not env_dir.is_dir():
         env_dir = pathlib.Path(results_dir) / env_name
@@ -62,10 +74,48 @@ def expert_return_from_results(results_dir, env_name, seed) -> Optional[float]:
             data = json.loads(jf.read_text())
         except (ValueError, OSError):
             continue
-        ret = data.get("baselines", {}).get("expert_return")
+        ret = data.get("baselines", {}).get(key)
         if ret is not None:
             return float(ret)
     return None
+
+
+def expert_return_from_results(results_dir, env_name, seed) -> Optional[float]:
+    """Read baselines.expert_return from any result JSON for this env."""
+    return baseline_from_results(results_dir, env_name, seed, "expert_return")
+
+
+def dqn_gate_warning(
+    dqn_return: float,
+    random_return: Optional[float],
+    expert_return: Optional[float],
+    env_name: str,
+) -> Optional[str]:
+    """Return a warning string if the DQN reference fails the near-optimal gate.
+
+    Uses the normalized return ``(dqn - random) / (expert - random)`` so that
+    the threshold is scale-agnostic and correct for negative-return environments.
+
+    Args:
+        dqn_return: Mean return of the DQN reference policy.
+        random_return: Mean return of a random policy (baseline).
+        expert_return: Mean return of the expert policy (baseline).
+        env_name: Environment id, used in the warning message.
+
+    Returns:
+        ``None`` if baselines are missing or the DQN passes the gate
+        (normalized return ≥ 0.90); otherwise a human-readable warning string.
+    """
+    if random_return is None or expert_return is None:
+        return None
+    norm = recoverability.normalized_return(dqn_return, random_return, expert_return)
+    if norm >= 0.9:
+        return None
+    return (
+        f"DQN reference return ({dqn_return:.0f}) is below the near-optimal gate "
+        f"(normalized {norm:.2f} < 0.90; random={random_return:.0f}, "
+        f"expert={expert_return:.0f}) for {env_name}; mu less reliable."
+    )
 
 
 def render_recoverability_figure(
@@ -265,12 +315,12 @@ def build_and_plot(
             rets = recoverability.reference_returns(dqn, env_name)
             dqn_return = float(rets.mean())
             dqn_return_std = float(rets.std())
-            if ppo_return is not None and dqn_return < 0.9 * ppo_return:
-                print(
-                    f"WARNING: DQN reference return ({dqn_return:.0f}) is well below "
-                    f"the PPO expert return ({ppo_return:.0f}) for {env_name}; the "
-                    f"reference may be under-trained, making mu(s) less reliable."
-                )
+            random_return = baseline_from_results(
+                results_dir, env_name, seed, "random_return"
+            )
+            msg = dqn_gate_warning(dqn_return, random_return, ppo_return, env_name)
+            if msg is not None:
+                print(f"WARNING: {msg}")
 
     render_recoverability_figure(
         mu,

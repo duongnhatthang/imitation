@@ -67,3 +67,20 @@ def test_build_and_plot_skips_blackjack(tmp_path):
     )
     assert result == {"skipped": True}
     assert not out.exists()  # skipped -> no figure written
+
+
+def test_dqn_gate_warning_negative_return_env():
+    # Acrobot-like: DQN better than expert -> normalized ~1.01 -> no warning.
+    assert (
+        plot_recoverability.dqn_gate_warning(-73.0, -500.0, -79.0, "Acrobot-v1") is None
+    )
+
+    # Genuinely under-trained: normalized well below 0.9 -> warning string.
+    msg = plot_recoverability.dqn_gate_warning(-300.0, -500.0, -79.0, "Acrobot-v1")
+    assert msg is not None
+    assert "normalized" in msg
+
+    # Missing random_return baseline -> no warning.
+    assert (
+        plot_recoverability.dqn_gate_warning(-73.0, None, -79.0, "Acrobot-v1") is None
+    )
