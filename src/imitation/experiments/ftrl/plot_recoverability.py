@@ -1,11 +1,15 @@
 """Plot the recoverability-constant distribution mu(s) per environment.
 
-mu is computed from a separately-trained DQN reference expert (NOT the PPO
-imitation expert). The figure annotates this provenance and shows DQN vs PPO
-return so both are visibly near-optimal. The horizon return J is undiscounted
-and far larger than the discounted mu, so it is reported as a text note (with a
-discounting caveat) rather than an on-axis line; the DAgger benefit threshold
-mu(s) << J is thus read qualitatively.
+mu is computed via the per-family dispatch in ``recoverability.recoverability_mu``:
+- Exact tabular computation via env.P for toy-text (discrete obs) envs, using
+  the PPO expert policy.
+- Hub DQN (sb3/dqn-<env>) for Atari environments.
+- Separately-trained DQN reference for continuous classical envs.
+- Blackjack-v1 is skipped (no reliable env.P due to stochastic optimum).
+
+The figure annotates provenance and shows DQN vs PPO return where applicable.
+The horizon return J is undiscounted and far larger than the discounted mu, so
+it is reported as a text note rather than an on-axis line.
 """
 
 import argparse
@@ -19,7 +23,33 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-from imitation.experiments.ftrl import coverage_data, recoverability  # noqa: E402
+from imitation.experiments.ftrl import (  # noqa: E402
+    coverage_data,
+    env_utils,
+    recoverability,
+)
+
+
+def provenance_label(env_name: str) -> str:
+    """Human-readable provenance string for the mu(s) computation backend.
+
+    Args:
+        env_name: Gymnasium environment id.
+
+    Returns:
+        A short string describing how mu(s) was computed for this env family:
+        - ``"skipped (no env.P)"`` for Blackjack-v1.
+        - ``"hub DQN (sb3/dqn-<env>)"`` for Atari environments.
+        - ``"exact via env.P (PPO expert)"`` for toy-text discrete-obs envs.
+        - ``"trained DQN reference"`` for continuous classical envs.
+    """
+    if env_name == "Blackjack-v1":
+        return "skipped (no env.P)"
+    if env_utils.is_atari(env_name):
+        return f"hub DQN (sb3/dqn-{env_name})"
+    if env_utils.ENV_CONFIGS.get(env_name, {}).get("obs_type") == "discrete":
+        return "exact via env.P (PPO expert)"
+    return "trained DQN reference"
 
 
 def expert_return_from_results(results_dir, env_name, seed) -> Optional[float]:
@@ -39,7 +69,15 @@ def expert_return_from_results(results_dir, env_name, seed) -> Optional[float]:
 
 
 def render_recoverability_figure(
-    mu, out_path, env_name, horizon_return, dqn_return, ppo_return, dqn_return_std=None
+    mu,
+    out_path,
+    env_name,
+    horizon_return,
+    dqn_return,
+    ppo_return,
+    dqn_return_std=None,
+    provenance_str: Optional[str] = None,
+    show_dqn_return: bool = True,
 ) -> None:
     """Histogram of mu(s) with a median marker and provenance/threshold text.
 
@@ -47,6 +85,21 @@ def render_recoverability_figure(
     readable. The horizon return J is undiscounted and orders of magnitude larger
     than mu, so it is reported as a text note rather than an on-axis line that
     would crush the histogram.
+
+    Args:
+        mu: Array of recoverability values, shape ``[N]``.
+        out_path: Output path for the PNG figure.
+        env_name: Gymnasium environment id (used in the title).
+        horizon_return: Undiscounted horizon return J; ``None`` if unavailable.
+        dqn_return: DQN reference return; shown only when ``show_dqn_return``
+            is True.
+        ppo_return: PPO expert return; shown when not ``None``.
+        dqn_return_std: Std-dev of DQN returns over evaluation episodes.
+        provenance_str: Provenance label for the annotation. Defaults to the
+            legacy ``"separately-trained DQN reference"`` string.
+        show_dqn_return: Whether to include the DQN return line in the
+            annotation. Set to ``False`` for toy-text envs where mu comes from
+            exact tabular computation, not a DQN.
     """
     out_path = pathlib.Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,21 +133,27 @@ def render_recoverability_figure(
         if horizon_return is not None
         else "horizon return J: unavailable"
     )
-    dqn_str = f"DQN return = {dqn_return:.0f}"
-    if dqn_return_std is not None:
-        dqn_str += f" +/- {dqn_return_std:.0f} (20 eps)"
-    provenance = (
-        "mu from separately-trained DQN reference (not the PPO IL expert)\n"
-        f"{dqn_str}"
-        + (
-            f"   |   PPO expert return = {ppo_return:.0f}"
-            if ppo_return is not None
-            else ""
-        )
-        + f"\n{j_note}"
-        + "\nmu uses discounted DQN Q-values; compare mu << J qualitatively."
-        + "\nInteractive IL benefits when mu(s) << J for most s."
+    prov_line = (
+        provenance_str
+        if provenance_str is not None
+        else "separately-trained DQN reference"
     )
+    annotation_parts = [f"mu from {prov_line}"]
+    if show_dqn_return and dqn_return is not None:
+        dqn_str = f"DQN return = {dqn_return:.0f}"
+        if dqn_return_std is not None:
+            dqn_str += f" +/- {dqn_return_std:.0f} (20 eps)"
+        if ppo_return is not None:
+            dqn_str += f"   |   PPO expert return = {ppo_return:.0f}"
+        annotation_parts.append(dqn_str)
+    elif ppo_return is not None:
+        annotation_parts.append(f"PPO expert return = {ppo_return:.0f}")
+    annotation_parts.append(j_note)
+    annotation_parts.append(
+        "mu uses discounted Q-values; compare mu << J qualitatively."
+    )
+    annotation_parts.append("Interactive IL benefits when mu(s) << J for most s.")
+    provenance = "\n".join(annotation_parts)
     ax.text(
         0.5,
         -0.28,
@@ -118,8 +177,42 @@ def build_and_plot(
     out_path,
     total_timesteps=None,
     horizon_return: Optional[float] = None,
+    expert_cache: Optional[str] = None,
 ) -> dict:
-    """Train/load DQN reference, compute mu over visited states, render figure."""
+    """Compute mu via per-family dispatch, render figure, return summary dict.
+
+    Dispatches mu(s) computation to the appropriate backend via
+    ``recoverability.recoverability_mu``:
+
+    - Blackjack-v1: skipped (returns ``{"skipped": True}``).
+    - Toy-text (discrete obs): exact tabular mu via env.P w.r.t. the PPO
+      expert loaded from ``expert_cache``.
+    - Atari: hub DQN from the HuggingFace model hub.
+    - Continuous classical: trained/cached DQN reference.
+
+    Args:
+        results_dir: Root directory with per-env per-seed JSON result files.
+        env_name: Gymnasium environment id.
+        seed: Experiment seed.
+        cache_dir: Directory for caching DQN models.
+        out_path: Output PNG path.
+        total_timesteps: DQN training budget override (continuous envs only).
+        horizon_return: Reference J value; defaults to PPO expert return from
+            results JSON.
+        expert_cache: Directory of cached PPO expert policies; used only for
+            toy-text (discrete-obs) environments.
+
+    Returns:
+        Dict with keys ``mu_mean``, ``mu_median``, ``ppo_return`` (and
+        ``dqn_return``/``dqn_return_std`` for DQN backends), or
+        ``{"skipped": True}`` for Blackjack-v1.
+    """
+    # Check skip first — before loading any demos.
+    prov = provenance_label(env_name)
+    if prov == "skipped (no env.P)":
+        print(f"Skipping recoverability for {env_name}: {prov}")
+        return {"skipped": True}
+
     states = coverage_data.load_env_states(results_dir, env_name, seed)
     if not states:
         raise FileNotFoundError(
@@ -134,31 +227,72 @@ def build_and_plot(
             f"figure will only include {found}."
         )
     obs = coverage_data.pool(states).obs
-    dqn = recoverability.get_or_train_dqn_reference(
-        env_name, cache_dir, total_timesteps, seed
+
+    # Load PPO expert only for toy-text (discrete-obs) envs.
+    is_discrete = env_utils.ENV_CONFIGS.get(env_name, {}).get("obs_type") == "discrete"
+    expert = None
+    if is_discrete:
+        from imitation.experiments.ftrl import coverage_features
+
+        if expert_cache is None:
+            expert_cache = "experiments/expert_cache"
+        expert = coverage_features.load_expert_policy(env_name, expert_cache)
+
+    mu = recoverability.recoverability_mu(
+        env_name, obs, cache_dir, expert_policy=expert
     )
-    mu = recoverability.recoverability(dqn, obs)
-    rets = recoverability.reference_returns(dqn, env_name)
-    dqn_return = float(rets.mean())
-    dqn_return_std = float(rets.std())
+    # mu should not be None here (Blackjack was caught above), but guard anyway.
+    if mu is None:
+        print(f"Skipping recoverability for {env_name}: {prov}")
+        return {"skipped": True}
+
     ppo_return = expert_return_from_results(results_dir, env_name, seed)
-    if ppo_return is not None and dqn_return < 0.9 * ppo_return:
-        print(
-            f"WARNING: DQN reference return ({dqn_return:.0f}) is well below the "
-            f"PPO expert return ({ppo_return:.0f}) for {env_name}; the reference "
-            f"may be under-trained, making mu(s) less reliable."
-        )
     j_value = horizon_return if horizon_return is not None else ppo_return
+
+    # DQN return/± is only meaningful for DQN backends (Atari / continuous).
+    is_dqn_backend = not is_discrete
+    dqn_return: Optional[float] = None
+    dqn_return_std: Optional[float] = None
+    if is_dqn_backend:
+        if env_utils.is_atari(env_name):
+            # Evaluating an Atari hub DQN in-process is expensive (needs the
+            # Atari env + rom); omit the DQN return line rather than blocking.
+            pass
+        else:
+            dqn = recoverability.get_or_train_dqn_reference(
+                env_name, cache_dir, total_timesteps, seed
+            )
+            rets = recoverability.reference_returns(dqn, env_name)
+            dqn_return = float(rets.mean())
+            dqn_return_std = float(rets.std())
+            if ppo_return is not None and dqn_return < 0.9 * ppo_return:
+                print(
+                    f"WARNING: DQN reference return ({dqn_return:.0f}) is well below "
+                    f"the PPO expert return ({ppo_return:.0f}) for {env_name}; the "
+                    f"reference may be under-trained, making mu(s) less reliable."
+                )
+
     render_recoverability_figure(
-        mu, out_path, env_name, j_value, dqn_return, ppo_return, dqn_return_std
+        mu,
+        out_path,
+        env_name,
+        j_value,
+        dqn_return,
+        ppo_return,
+        dqn_return_std,
+        provenance_str=prov,
+        show_dqn_return=is_dqn_backend,
     )
-    return {
+    result: dict = {
         "mu_mean": float(mu.mean()),
         "mu_median": float(np.median(mu)),
-        "dqn_return": dqn_return,
-        "dqn_return_std": dqn_return_std,
         "ppo_return": ppo_return,
     }
+    if dqn_return is not None:
+        result["dqn_return"] = dqn_return
+    if dqn_return_std is not None:
+        result["dqn_return_std"] = dqn_return_std
+    return result
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -176,6 +310,15 @@ def main(argv: Optional[list] = None) -> None:
         default=None,
         help="Reference line value J; defaults to the PPO expert return from results.",
     )
+    parser.add_argument(
+        "--expert-cache",
+        type=str,
+        default="experiments/expert_cache",
+        help=(
+            "Directory of cached PPO expert policies; used only for toy-text "
+            "(discrete-obs) environments."
+        ),
+    )
     args = parser.parse_args(argv)
     out = pathlib.Path(args.output_dir) / (
         f"{args.env.replace('/', '_')}_recoverability.png"
@@ -188,11 +331,19 @@ def main(argv: Optional[list] = None) -> None:
         out,
         args.dqn_timesteps,
         horizon_return=args.horizon_return,
+        expert_cache=args.expert_cache,
     )
-    print(
-        f"Wrote {out}; mu_median={info['mu_median']:.3f}, "
-        f"DQN_return={info['dqn_return']:.0f}"
-    )
+    if info.get("skipped"):
+        print(f"Skipped {args.env} (no recoverability backend).")
+    else:
+        mu_median = info["mu_median"]
+        dqn_ret = info.get("dqn_return")
+        if dqn_ret is not None:
+            print(
+                f"Wrote {out}; mu_median={mu_median:.3f}, " f"DQN_return={dqn_ret:.0f}"
+            )
+        else:
+            print(f"Wrote {out}; mu_median={mu_median:.3f}")
 
 
 if __name__ == "__main__":
