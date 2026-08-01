@@ -51,10 +51,16 @@ def render_coverage_figure(
         point_size: Fixed marker size; if None, sized per panel by point count.
     """
     algos = sorted(set(pooled.algo.tolist()))
-    ncols = min(3, len(algos))
+    # Square-ish grid (2x2 for the usual 4 algos) so panels are large and titles
+    # don't collide; constrained_layout spaces titles/colorbar and trims whitespace.
+    ncols = int(np.ceil(np.sqrt(len(algos))))
     nrows = int(np.ceil(len(algos) / ncols))
     fig, axes = plt.subplots(
-        nrows, ncols, figsize=(5 * ncols, 5 * nrows), squeeze=False
+        nrows,
+        ncols,
+        figsize=(5 * ncols, 5 * nrows),
+        squeeze=False,
+        constrained_layout=True,
     )
     emb = tsne_result.embedding
     norm = plt.Normalize(vmin=0, vmax=max(n_rounds, 1))
@@ -91,7 +97,8 @@ def render_coverage_figure(
         )
         uniq = metrics_uniq.get(algo, n_uniq) if metrics_uniq else n_uniq
         ax.set_title(
-            f"{algo}  (n={n_pts}, uniq={uniq}, " f"kNN={metrics_hd.get(algo, 0):.2f})"
+            f"{algo}  (n={n_pts}, uniq={uniq}, kNN={metrics_hd.get(algo, 0):.2f})",
+            fontsize=11,
         )
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
@@ -109,7 +116,7 @@ def render_coverage_figure(
     )
     out_path = pathlib.Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
