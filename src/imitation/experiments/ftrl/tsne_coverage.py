@@ -86,6 +86,22 @@ def coverage_metrics_highdim(
     return out
 
 
+def coverage_metrics_unique(
+    features: np.ndarray, algo_labels: np.ndarray, decimals: int = 4
+) -> Dict[str, int]:
+    """Per-algo count of DISTINCT visited states in feature space.
+
+    This is the clearest coverage-breadth signal: interactive methods (ftl/ftrl)
+    visit many more distinct states than the expert-distribution baselines
+    (bc/bc_dagger). Rounding avoids float noise counting near-duplicates.
+    """
+    out: Dict[str, int] = {}
+    for algo in sorted(set(algo_labels.tolist())):
+        pts = np.round(features[algo_labels == algo], decimals)
+        out[algo] = int(len(np.unique(pts, axis=0)))
+    return out
+
+
 def subsample(
     features: np.ndarray,
     algo_labels: np.ndarray,

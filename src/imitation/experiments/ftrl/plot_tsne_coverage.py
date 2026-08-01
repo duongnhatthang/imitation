@@ -22,6 +22,11 @@ def _auto_point_size(n_points: int) -> float:
     return float(np.clip(1800.0 / max(n_points, 1), 6.0, 45.0))
 
 
+def _unique_positions(coords, decimals=2):
+    """Count distinct 2-D positions (to size markers by overlap, not raw count)."""
+    return int(len(np.unique(np.round(coords, decimals), axis=0)))
+
+
 def render_coverage_figure(
     pooled,
     tsne_result,
@@ -31,6 +36,7 @@ def render_coverage_figure(
     metrics_2d,
     metrics_hd,
     point_size=None,
+    metrics_uniq=None,
 ) -> None:
     """One panel per algorithm on the shared embedding, colored by arrival round.
 
@@ -54,15 +60,28 @@ def render_coverage_figure(
     norm = plt.Normalize(vmin=0, vmax=max(n_rounds, 1))
     xlim = (emb[:, 0].min(), emb[:, 0].max())
     ylim = (emb[:, 1].min(), emb[:, 1].max())
+    xrange = max(xlim[1] - xlim[0], 1e-9)
+    yrange = max(ylim[1] - ylim[0], 1e-9)
+    jrng = np.random.default_rng(0)
     scatter = None
     for i, algo in enumerate(algos):
         ax = axes[i // ncols][i % ncols]
         mask = pooled.algo == algo
         n_pts = int(mask.sum())
-        size = point_size if point_size is not None else _auto_point_size(n_pts)
+        xs = emb[mask, 0].astype(float)
+        ys = emb[mask, 1].astype(float)
+        # Size by DISTINCT positions, not raw count: toy-text envs pile 1000
+        # points onto ~6-18 states, so count-based sizing made them invisible.
+        n_uniq = _unique_positions(np.column_stack([xs, ys]))
+        size = point_size if point_size is not None else _auto_point_size(n_uniq)
+        # When many points stack on few positions, jitter so the pile-up and its
+        # arrival-round mix are visible instead of a single opaque dot.
+        if n_pts > 2 * max(n_uniq, 1):
+            xs = xs + jrng.normal(0, 0.008 * xrange, n_pts)
+            ys = ys + jrng.normal(0, 0.008 * yrange, n_pts)
         scatter = ax.scatter(
-            emb[mask, 0],
-            emb[mask, 1],
+            xs,
+            ys,
             c=pooled.rounds[mask],
             cmap="coolwarm",
             norm=norm,
@@ -70,10 +89,9 @@ def render_coverage_figure(
             alpha=0.6,
             edgecolors="none",
         )
-        cov = metrics_2d.get(algo, {})
+        uniq = metrics_uniq.get(algo, n_uniq) if metrics_uniq else n_uniq
         ax.set_title(
-            f"{algo}  (n={n_pts}, cells={cov.get('occupied_cells', 0)}, "
-            f"kNN={metrics_hd.get(algo, 0):.2f})"
+            f"{algo}  (n={n_pts}, uniq={uniq}, " f"kNN={metrics_hd.get(algo, 0):.2f})"
         )
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
@@ -156,6 +174,7 @@ def build_and_plot(
     result = tsne_coverage.fit_shared_tsne(feats, perplexities, seeds)
     metrics_2d = tsne_coverage.coverage_metrics_2d(result.embedding, algo)
     metrics_hd = tsne_coverage.coverage_metrics_highdim(feats, algo)
+    metrics_uniq = tsne_coverage.coverage_metrics_unique(feats, algo)
     n_rounds = int(pooled.rounds.max()) if len(pooled.rounds) else 0
     render_coverage_figure(
         sub,
@@ -166,11 +185,15 @@ def build_and_plot(
         metrics_2d,
         metrics_hd,
         point_size=point_size,
+        metrics_uniq=metrics_uniq,
     )
     out_path = pathlib.Path(out_path)
+    # Cache the pre-t-SNE features (plus algo/rounds) so the interactive tuner can
+    # re-fit t-SNE at other perplexities/seeds without the raw scratch demos.
     np.savez(
         out_path.with_suffix(".npz"),
         embedding=result.embedding,
+        features=feats,
         algo=algo.astype(str),
         rounds=rounds,
         perplexity=result.perplexity,
@@ -179,6 +202,7 @@ def build_and_plot(
     return {
         "coverage_2d": metrics_2d,
         "coverage_highdim": metrics_hd,
+        "coverage_unique": metrics_uniq,
         "trustworthiness": result.trustworthiness,
     }
 

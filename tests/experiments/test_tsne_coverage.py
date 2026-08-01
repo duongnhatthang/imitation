@@ -44,3 +44,11 @@ def test_subsample_respects_cap():
     rounds = np.zeros(10000, dtype=int)
     f, l, r, idx = tsne_coverage.subsample(feats, labels, rounds, cap=1000, seed=0)
     assert len(f) <= 1000 and len(f) == len(l) == len(r) == len(idx)
+
+
+def test_coverage_metrics_unique_counts_distinct_states():
+    feats = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+    labels = np.array(["dense", "dense", "dense", "spread", "spread"], dtype=object)
+    m = tsne_coverage.coverage_metrics_unique(feats, labels)
+    assert m["dense"] == 1  # 3 identical rows -> 1 distinct state
+    assert m["spread"] == 2  # 2 distinct rows
