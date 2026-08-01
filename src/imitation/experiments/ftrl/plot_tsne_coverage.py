@@ -120,6 +120,79 @@ def render_coverage_figure(
     plt.close(fig)
 
 
+def render_coverage_diff(
+    embedding, algo_labels, out_path, env_name, n_bins=40, both_gray=True
+):
+    """Region map on the shared embedding: where ftl/ftrl explore vs bc (offline).
+
+    Grids the 2-D embedding and paints each cell by which family occupies it:
+    interactive-only (ftl/ftrl but not bc), bc-only, both (light gray), or empty
+    (white). Highlights what interaction discovers beyond the offline dataset.
+    """
+    import matplotlib.patches as mpatches
+
+    x = embedding[:, 0].astype(float)
+    y = embedding[:, 1].astype(float)
+    xe = np.linspace(x.min(), x.max(), n_bins + 1)
+    ye = np.linspace(y.min(), y.max(), n_bins + 1)
+
+    def occupied(mask):
+        hist, _, _ = np.histogram2d(x[mask], y[mask], bins=[xe, ye])
+        return hist > 0
+
+    bc = occupied(algo_labels == "bc")
+    inter_mask = np.isin(algo_labels, ["ftl", "ftrl"])
+    inter = occupied(inter_mask)
+    both = bc & inter
+    c_bc = (0.55, 0.68, 0.90)  # light blue
+    c_int = (0.98, 0.70, 0.40)  # light orange
+    c_both = (0.85, 0.85, 0.85)  # light gray
+    img = np.ones((n_bins, n_bins, 3))
+    img[bc & ~inter] = c_bc
+    img[inter & ~bc] = c_int
+    if both_gray:
+        img[both] = c_both
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), constrained_layout=True)
+    ax.imshow(
+        np.transpose(img, (1, 0, 2)),
+        origin="lower",
+        extent=[x.min(), x.max(), y.min(), y.max()],
+        aspect="auto",
+        interpolation="nearest",
+    )
+    ax.scatter(
+        x[algo_labels == "bc"],
+        y[algo_labels == "bc"],
+        s=3,
+        c="#26418f",
+        alpha=0.25,
+        edgecolors="none",
+    )
+    ax.scatter(
+        x[inter_mask],
+        y[inter_mask],
+        s=3,
+        c="#b25000",
+        alpha=0.15,
+        edgecolors="none",
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(f"Coverage difference: {env_name}  (grid {n_bins}x{n_bins})")
+    handles = [
+        mpatches.Patch(color=c_int, label="ftl/ftrl only (interaction discovers)"),
+        mpatches.Patch(color=c_bc, label="bc only (offline, not revisited)"),
+        mpatches.Patch(color=c_both, label="both"),
+        mpatches.Patch(facecolor="white", edgecolor="0.7", label="neither"),
+    ]
+    ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
+    out_path = pathlib.Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def build_and_plot(
     results_dir,
     env_name,
@@ -206,6 +279,8 @@ def build_and_plot(
         perplexity=result.perplexity,
         trustworthiness=result.trustworthiness,
     )
+    diff_path = out_path.parent / f"{out_path.stem}_coverage_diff.png"
+    render_coverage_diff(result.embedding, algo, diff_path, env_name)
     return {
         "coverage_2d": metrics_2d,
         "coverage_highdim": metrics_hd,
