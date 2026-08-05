@@ -95,6 +95,21 @@ export HF_DATASETS_IN_MEMORY_MAX_SIZE="${HF_DATASETS_IN_MEMORY_MAX_SIZE:-2147483
 cleanup_tmp() { rm -rf "$TMPDIR" "$HF_DATASETS_CACHE"; }
 trap cleanup_tmp EXIT
 
+# HF `datasets` leaves per-round temp dirs behind in $TMPDIR (one brief copy
+# per demo load/save, then orphaned) -- they accumulate ~linearly with rounds.
+# Reap orphans older than TMP_REAP_MIN minutes: the in-flight dir is always
+# newer, and Linux frees space on close even if one were still mmap'd, so this
+# is safe. This is what actually keeps $TMPDIR bounded across a deep run.
+TMP_REAP_MIN="${TMP_REAP_MIN:-3}"
+tmp_reaper() {
+    local target_pid="$1"
+    while kill -0 "$target_pid" 2>/dev/null; do
+        find "$TMPDIR" -mindepth 1 -maxdepth 1 -mmin +"$TMP_REAP_MIN" \
+            -exec rm -rf {} + 2>/dev/null || true
+        sleep 60
+    done
+}
+
 DISK_FLOOR_GB="${DISK_FLOOR_GB:-30}"
 disk_watchdog() {
     local target_pid="$1" avail_gb
@@ -147,9 +162,11 @@ python -m imitation.experiments.ftrl.run_experiment \
 RUN_PID=$!
 disk_watchdog "$RUN_PID" &
 WATCH_PID=$!
+tmp_reaper "$RUN_PID" &
+REAP_PID=$!
 wait "$RUN_PID" && RUN_RC=0 || RUN_RC=$?
-kill "$WATCH_PID" 2>/dev/null || true
-wait "$WATCH_PID" 2>/dev/null || true
+kill "$WATCH_PID" "$REAP_PID" 2>/dev/null || true
+wait "$WATCH_PID" "$REAP_PID" 2>/dev/null || true
 if [ "$RUN_RC" -ne 0 ]; then
     echo "[atari_curves] sweep exited non-zero (rc=$RUN_RC) -- see disk guard / errors above." \
         | tee -a "$LOG_FILE"
