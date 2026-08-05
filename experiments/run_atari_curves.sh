@@ -82,12 +82,16 @@ mkdir -p "$RESULTS_DIR" "$PLOTS_DIR"
 # 3. A background watchdog that aborts the sweep if free space on the results
 #    volume drops below a floor -- a fail-safe so we can never fill a disk
 #    other people share, regardless of what the code above misses.
-export TMPDIR="$RESULTS_DIR/_tmp"
+# Create the dirs first, then export ABSOLUTE paths (workers may change cwd, so
+# a relative TMPDIR could scatter temp files onto the wrong volume).
+mkdir -p "$RESULTS_DIR/_tmp" "$RESULTS_DIR/_hfcache"
+TMPDIR="$(cd "$RESULTS_DIR/_tmp" && pwd)"
+export TMPDIR
 export TMP="$TMPDIR" TEMP="$TMPDIR"
-export HF_DATASETS_CACHE="$RESULTS_DIR/_hfcache"
+HF_DATASETS_CACHE="$(cd "$RESULTS_DIR/_hfcache" && pwd)"
+export HF_DATASETS_CACHE
 # Keep demo datasets <= 2 GiB in RAM instead of mmap-ing a temp copy.
 export HF_DATASETS_IN_MEMORY_MAX_SIZE="${HF_DATASETS_IN_MEMORY_MAX_SIZE:-2147483648}"
-mkdir -p "$TMPDIR" "$HF_DATASETS_CACHE"
 cleanup_tmp() { rm -rf "$TMPDIR" "$HF_DATASETS_CACHE"; }
 trap cleanup_tmp EXIT
 
