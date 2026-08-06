@@ -25,6 +25,40 @@ To analyze these results, run `python -m imitation.scripts.analyze with run_name
 
 Run `experiments/transfer_learn_benchmark.sh`. To choose AIRL or GAIL, add the `--airl` and `--gail` flags (default is GAIL). Transfer rewards are loaded from `data/reward_models`.
 
+### Coverage / recoverability / runtime (post-hoc analysis)
+
+After a classical sweep (e.g. `run_learning_curves.sh`), visualize state coverage
+and the DAgger recoverability constant, and summarize wall-clock:
+
+```
+./experiments/run_coverage_analysis.sh          # CartPole Phase 1
+```
+
+- **t-SNE coverage** (`plot_tsne_coverage`): one shared embedding per env, one panel
+  per algorithm, colored by data-arrival round. Override the projection with
+  `--perplexity`/`--tsne-seed`; embeddings are cached next to the PNG.
+- **Recoverability** (`plot_recoverability`): distribution of
+  mu(s)=max_a Q-min_a Q from a separately-trained DQN reference expert (the figure
+  states this provenance and shows DQN vs PPO return). Interactive IL benefits when
+  mu(s) << J.
+- **Runtime** (`aggregate_runtime`): `runtime.csv` + grouped bar chart from the
+  per-run `elapsed_seconds` already stored in result JSONs.
+
+#### Atari + all-classical (Phase 2)
+
+Recoverability dispatches by env family: exact `env.P` for toy-text (FrozenLake,
+CliffWalking, Taxi), pretrained `sb3/dqn-<Game>` for Atari, per-env tuned DQN for
+continuous classical (CartPole/Acrobot/MountainCar/LunarLander). Blackjack skips μ.
+t-SNE uses the expert CNN features for Atari, StandardScaler otherwise.
+
+Generate viz for an existing sweep:
+```
+./experiments/gen_coverage_viz.sh experiments/learning_curves/classical \
+    CartPole-v1 Acrobot-v1 MountainCar-v0 LunarLander-v2 FrozenLake-v1 CliffWalking-v0 Taxi-v3 Blackjack-v1
+./experiments/gen_coverage_viz.sh experiments/learning_curves/atari \
+    PongNoFrameskip-v4 BreakoutNoFrameskip-v4 QbertNoFrameskip-v4 SeaquestNoFrameskip-v4
+```
+
 ## Hyperparameter tuning
 
 Add a named config containing the hyperparameter search space and other settings to `src/imitation/scripts/config/parallel.py`. (`def example_cartpole_rl():` is an example).

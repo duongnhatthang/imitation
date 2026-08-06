@@ -66,6 +66,68 @@ PLOTS_DIR="$EXP_LC_ATARI/plots"
 LOG_FILE="$EXP_LC_ATARI/run.log"
 mkdir -p "$RESULTS_DIR" "$PLOTS_DIR"
 
+# --- Disk safety (shared server) -------------------------------------------
+# HuggingFace `datasets` stages load_from_disk / save_to_disk copies through
+# $TMPDIR (default /tmp, on the shared ROOT filesystem). DAgger (ftl/ftrl)
+# reloads the *accumulated* demo set every round, so over a deep run the many
+# concurrent workers pile temp copies onto / until it fills node-wide -- this
+# is exactly what sank the first atari_r200 sweep (ENOSPC on /). Three
+# independent guards, cheapest first:
+#
+# 1. Redirect all temp + HF cache to a RUN-LOCAL dir on the same (big) volume
+#    as the results, and remove it on exit -- keeps churn off shared / and
+#    leaves nothing behind.
+# 2. Keep small demo datasets in RAM (IN_MEMORY_MAX_SIZE) so per-round reloads
+#    don't leave memory-mapped temp copies at all.
+# 3. A background watchdog that aborts the sweep if free space on the results
+#    volume drops below a floor -- a fail-safe so we can never fill a disk
+#    other people share, regardless of what the code above misses.
+# Create the dirs first, then export ABSOLUTE paths (workers may change cwd, so
+# a relative TMPDIR could scatter temp files onto the wrong volume).
+mkdir -p "$RESULTS_DIR/_tmp" "$RESULTS_DIR/_hfcache"
+TMPDIR="$(cd "$RESULTS_DIR/_tmp" && pwd)"
+export TMPDIR
+export TMP="$TMPDIR" TEMP="$TMPDIR"
+HF_DATASETS_CACHE="$(cd "$RESULTS_DIR/_hfcache" && pwd)"
+export HF_DATASETS_CACHE
+# Keep demo datasets <= 2 GiB in RAM instead of mmap-ing a temp copy.
+export HF_DATASETS_IN_MEMORY_MAX_SIZE="${HF_DATASETS_IN_MEMORY_MAX_SIZE:-2147483648}"
+cleanup_tmp() { rm -rf "$TMPDIR" "$HF_DATASETS_CACHE"; }
+trap cleanup_tmp EXIT
+
+# HF `datasets` leaves per-round temp dirs behind in $TMPDIR (one brief copy
+# per demo load/save, then orphaned) -- they accumulate ~linearly with rounds.
+# Reap orphans older than TMP_REAP_MIN minutes: the in-flight dir is always
+# newer, and Linux frees space on close even if one were still mmap'd, so this
+# is safe. This is what actually keeps $TMPDIR bounded across a deep run.
+TMP_REAP_MIN="${TMP_REAP_MIN:-3}"
+tmp_reaper() {
+    local target_pid="$1"
+    while kill -0 "$target_pid" 2>/dev/null; do
+        find "$TMPDIR" -mindepth 1 -maxdepth 1 -mmin +"$TMP_REAP_MIN" \
+            -exec rm -rf {} + 2>/dev/null || true
+        sleep 60
+    done
+}
+
+DISK_FLOOR_GB="${DISK_FLOOR_GB:-30}"
+disk_watchdog() {
+    local target_pid="$1" avail_gb
+    while kill -0 "$target_pid" 2>/dev/null; do
+        avail_gb=$(df -B1G --output=avail "$RESULTS_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
+        if [ -n "$avail_gb" ] && [ "$avail_gb" -lt "$DISK_FLOOR_GB" ]; then
+            echo "[atari_curves] DISK GUARD: only ${avail_gb}G free on the results volume" \
+                 "(< ${DISK_FLOOR_GB}G floor) -- aborting sweep to protect the shared disk." \
+                 | tee -a "$LOG_FILE"
+            pkill -TERM -f run_experiment 2>/dev/null || true
+            sleep 5
+            pkill -KILL -f run_experiment 2>/dev/null || true
+            return 1
+        fi
+        sleep 30
+    done
+}
+
 # CPU worker count: total - 2, floor 1.
 CPU_TOTAL="$(getconf _NPROCESSORS_ONLN)"
 WORKERS=$(( CPU_TOTAL - 2 ))
@@ -74,10 +136,18 @@ echo "[atari_curves] $WORKERS workers, $N_GPUS GPUs, n_rounds=$N_ROUNDS" | tee -
 echo "[atari_curves] start: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE"
 echo "[atari_curves] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
+# Algo set is overridable (ALGOS="ftl ftrl") so a targeted resume can re-run
+# only the interactive methods without re-touching completed bc/bc_dagger cells.
+# shellcheck disable=SC2206  # word-splitting is intentional for the list
+ALGO_SEL=(${ALGOS:-ftl ftrl bc bc_dagger})
+
+# Run under the disk watchdog: launch the sweep in the background, capture its
+# PID (process substitution keeps python as the job, so $! is python's PID),
+# and let the watchdog abort it if the shared disk gets dangerously low.
 python -m imitation.experiments.ftrl.run_experiment \
     "${ENV_SEL[@]}" \
     --policy-mode linear \
-    --algos ftl ftrl bc bc_dagger \
+    --algos "${ALGO_SEL[@]}" \
     --seeds 5 \
     --samples-per-round 1 \
     --n-rounds "$N_ROUNDS" \
@@ -88,7 +158,20 @@ python -m imitation.experiments.ftrl.run_experiment \
     --n-workers "$WORKERS" \
     --n-gpus "$N_GPUS" \
     "$@" \
-    2>&1 | tee -a "$LOG_FILE"
+    > >(tee -a "$LOG_FILE") 2>&1 &
+RUN_PID=$!
+disk_watchdog "$RUN_PID" &
+WATCH_PID=$!
+tmp_reaper "$RUN_PID" &
+REAP_PID=$!
+wait "$RUN_PID" && RUN_RC=0 || RUN_RC=$?
+kill "$WATCH_PID" "$REAP_PID" 2>/dev/null || true
+wait "$WATCH_PID" "$REAP_PID" 2>/dev/null || true
+if [ "$RUN_RC" -ne 0 ]; then
+    echo "[atari_curves] sweep exited non-zero (rc=$RUN_RC) -- see disk guard / errors above." \
+        | tee -a "$LOG_FILE"
+    exit "$RUN_RC"
+fi
 
 echo "[atari_curves] sweep done: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE"
 echo "[atari_curves] plotting ..." | tee -a "$LOG_FILE"

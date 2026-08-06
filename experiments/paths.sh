@@ -13,6 +13,9 @@
 
 EXP_LC_CLASSICAL="${EXP_LC_CLASSICAL:-experiments/learning_curves/classical}"
 EXP_LC_ATARI="${EXP_LC_ATARI:-experiments/learning_curves/atari}"
+# Coverage / recoverability / runtime full run. Kept under learning_curves/ so the
+# existing sync_results.sh pull (JSON + PNG + CSV) brings its figures back unedited.
+EXP_LC_COVERAGE="${EXP_LC_COVERAGE:-experiments/learning_curves/coverage}"
 EXP_LR_OBS_CLASSICAL="${EXP_LR_OBS_CLASSICAL:-experiments/lr_obs_heatmap/classical}"
 EXP_LR_OBS_ATARI="${EXP_LR_OBS_ATARI:-experiments/lr_obs_heatmap/atari}"
 EXP_SMOKE_DIR="${EXP_SMOKE_DIR:-experiments/smoke}"
