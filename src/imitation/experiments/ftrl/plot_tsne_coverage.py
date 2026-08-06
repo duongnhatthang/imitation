@@ -27,6 +27,27 @@ def _unique_positions(coords, decimals=2):
     return int(len(np.unique(np.round(coords, decimals), axis=0)))
 
 
+def _sized_jittered_scatter(xs, ys, xrange, yrange, point_size, rng):
+    """Marker size (by distinct positions) + jitter for piled-up points.
+
+    Toy-text envs pile many points onto a handful of distinct t-SNE positions,
+    so sizing by *distinct* positions (not raw count) keeps sparse groups
+    legible, and jittering a pile-up fans it out instead of collapsing to a
+    single opaque dot. Shared by the per-algo panels and the coverage-diff
+    overlay so both figures render the same points identically. Returns
+    ``(xs, ys, size, n_uniq)`` with xs/ys jittered copies.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    n_pts = len(xs)
+    n_uniq = _unique_positions(np.column_stack([xs, ys]))
+    size = point_size if point_size is not None else _auto_point_size(n_uniq)
+    if n_pts > 2 * max(n_uniq, 1):
+        xs = xs + rng.normal(0, 0.008 * xrange, n_pts)
+        ys = ys + rng.normal(0, 0.008 * yrange, n_pts)
+    return xs, ys, size, n_uniq
+
+
 def render_coverage_figure(
     pooled,
     tsne_result,
@@ -74,17 +95,11 @@ def render_coverage_figure(
         ax = axes[i // ncols][i % ncols]
         mask = pooled.algo == algo
         n_pts = int(mask.sum())
-        xs = emb[mask, 0].astype(float)
-        ys = emb[mask, 1].astype(float)
-        # Size by DISTINCT positions, not raw count: toy-text envs pile 1000
-        # points onto ~6-18 states, so count-based sizing made them invisible.
-        n_uniq = _unique_positions(np.column_stack([xs, ys]))
-        size = point_size if point_size is not None else _auto_point_size(n_uniq)
-        # When many points stack on few positions, jitter so the pile-up and its
-        # arrival-round mix are visible instead of a single opaque dot.
-        if n_pts > 2 * max(n_uniq, 1):
-            xs = xs + jrng.normal(0, 0.008 * xrange, n_pts)
-            ys = ys + jrng.normal(0, 0.008 * yrange, n_pts)
+        # Size by DISTINCT positions + jitter piled-up points (shared with the
+        # coverage-diff overlay so the two figures render points identically).
+        xs, ys, size, n_uniq = _sized_jittered_scatter(
+            emb[mask, 0], emb[mask, 1], xrange, yrange, point_size, jrng
+        )
         scatter = ax.scatter(
             xs,
             ys,
@@ -133,6 +148,8 @@ def render_coverage_diff(
 
     x = embedding[:, 0].astype(float)
     y = embedding[:, 1].astype(float)
+    xrange = max(x.max() - x.min(), 1e-9)
+    yrange = max(y.max() - y.min(), 1e-9)
     xe = np.linspace(x.min(), x.max(), n_bins + 1)
     ye = np.linspace(y.min(), y.max(), n_bins + 1)
 
@@ -161,22 +178,20 @@ def render_coverage_diff(
         aspect="auto",
         interpolation="nearest",
     )
-    ax.scatter(
-        x[algo_labels == "bc"],
-        y[algo_labels == "bc"],
-        s=3,
-        c="#26418f",
-        alpha=0.25,
-        edgecolors="none",
+    # Overlay the actual points using the SAME size + jitter as the per-algo
+    # t-SNE panels (via the shared helper) so the two figures are visually
+    # consistent for a reader comparing them. Alpha is kept lower than the
+    # panels (0.6) so the region colors still read through the markers.
+    jrng = np.random.default_rng(0)
+    bc_mask = algo_labels == "bc"
+    bx, by, bsize, _ = _sized_jittered_scatter(
+        x[bc_mask], y[bc_mask], xrange, yrange, None, jrng
     )
-    ax.scatter(
-        x[inter_mask],
-        y[inter_mask],
-        s=3,
-        c="#b25000",
-        alpha=0.15,
-        edgecolors="none",
+    ax.scatter(bx, by, s=bsize, c="#26418f", alpha=0.35, edgecolors="none")
+    ix, iy, isize, _ = _sized_jittered_scatter(
+        x[inter_mask], y[inter_mask], xrange, yrange, None, jrng
     )
+    ax.scatter(ix, iy, s=isize, c="#b25000", alpha=0.35, edgecolors="none")
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_title(f"Coverage difference: {env_name}  (grid {n_bins}x{n_bins})")
