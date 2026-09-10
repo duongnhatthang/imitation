@@ -388,6 +388,7 @@ def generate_trajectories(
     rng: np.random.Generator,
     *,
     deterministic_policy: bool = False,
+    shuffle: bool = True,
 ) -> Sequence[types.TrajectoryWithRew]:
     """Generate trajectory dictionaries from a policy and an environment.
 
@@ -405,6 +406,9 @@ def generate_trajectories(
             action. Note the trajectories might still be non-deterministic if the
             environment has non-determinism!
         rng: used for shuffling trajectories.
+        shuffle: Shuffle completed trajectories before returning them (default True).
+            Set False to preserve completion order. With one environment this is
+            chronological collection order, useful for temporal prefix datasets.
 
     Returns:
         Sequence of trajectories, satisfying `sample_until`. Additional trajectories
@@ -480,7 +484,8 @@ def generate_trajectories(
     # `trajectories` sooner. Shuffle to avoid bias in order. This is important
     # when callees end up truncating the number of trajectories or transitions.
     # It is also cheap, since we're just shuffling pointers.
-    rng.shuffle(trajectories)  # type: ignore[arg-type]
+    if shuffle:
+        rng.shuffle(trajectories)  # type: ignore[arg-type]
 
     # Sanity checks.
     for trajectory in trajectories:

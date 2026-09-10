@@ -76,6 +76,24 @@ def _sample_fixed_length_trajectories(
     return trajectories
 
 
+def test_generate_trajectories_optional_completion_order():
+    """Ordered collection is opt-in; existing callers still shuffle episodes."""
+
+    def collect(**kwargs):
+        trajs = _sample_fixed_length_trajectories(
+            [3, 5],
+            min_episodes=3,
+            rng=np.random.default_rng(3),
+            **kwargs,
+        )
+        return [len(traj) for traj in trajs]
+
+    ordered = collect(shuffle=False)
+    assert ordered == [3, 5, 3, 5]
+    assert collect() == collect(shuffle=True)
+    assert collect() != ordered
+
+
 @pytest.mark.parametrize(
     "policy_type",
     ["policy", "callable", "random"],

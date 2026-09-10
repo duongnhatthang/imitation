@@ -137,9 +137,9 @@ echo "[atari_curves] start: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE"
 echo "[atari_curves] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 # Algo set is overridable (ALGOS="ftl ftrl") so a targeted resume can re-run
-# only the interactive methods without re-touching completed bc/bc_dagger cells.
+# only the interactive methods without re-touching completed bc/bc_iid cells.
 # shellcheck disable=SC2206  # word-splitting is intentional for the list
-ALGO_SEL=(${ALGOS:-ftl ftrl bc bc_dagger})
+ALGO_SEL=(${ALGOS:-ftl ftrl bc bc_iid})
 
 # Run under the disk watchdog: launch the sweep in the background, capture its
 # PID (process substitution keeps python as the job, so $! is python's PID),

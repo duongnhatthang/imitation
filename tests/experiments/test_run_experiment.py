@@ -28,7 +28,7 @@ def test_uniform_expert_order_is_random_and_repeatable():
 
 
 @pytest.mark.parametrize("early_stop", [False, True])
-def test_shared_bc_data_and_evaluation_budget(tmp_path, monkeypatch, early_stop):
+def test_baseline_data_and_evaluation_budget(tmp_path, monkeypatch, early_stop):
     """Exercise real collection, training, persistence, and checkpoint loading."""
     from stable_baselines3 import PPO
     from imitation.experiments.ftrl.policy_utils import load_policy_checkpoint
@@ -66,7 +66,7 @@ def test_shared_bc_data_and_evaluation_budget(tmp_path, monkeypatch, early_stop)
     monkeypatch.setattr(run_experiment, "_inner_train", train)
     monkeypatch.setattr(run_experiment, "_compute_round_eval", evaluate)
     results = {}
-    for algo in ("bc_dagger", "bc", "ftl", "ftrl"):
+    for algo in ("bc_iid", "bc", "ftl", "ftrl"):
         trained[0] = 0
         config = _make_config(
             algo,
@@ -83,22 +83,22 @@ def test_shared_bc_data_and_evaluation_budget(tmp_path, monkeypatch, early_stop)
             for row in results[algo]["per_round"]:
                 assert row["evaluated_round"] == row["round"]
         final = results[algo]["per_round"][-1]
-        if algo in ("ftl", "ftrl"):
+        if algo in ("ftl", "ftrl", "bc_iid"):
             assert final["trajectories_collected_this_round"] == 3
             assert final["n_observations"] == 3
             assert final["collection_steps"] >= 9
         assert final["episode_returns"] == [10.0, 12.0]
         loaded = load_policy_checkpoint(final["checkpoint"])
         assert loaded is not None
-    assert results["bc"]["expert_dataset"] == results["bc_dagger"]["expert_dataset"]
+    assert results["bc"]["expert_dataset"]["strategy"] == "prefix"
+    assert "expert_dataset" not in results["bc_iid"]
     bc_states = coverage_data.load_algo_states(
         config.output_dir, config.env_name, "bc", 0
     )
     growing_states = coverage_data.load_algo_states(
-        config.output_dir, config.env_name, "bc_dagger", 0
+        config.output_dir, config.env_name, "bc_iid", 0
     )
-    np.testing.assert_array_equal(bc_states.obs, growing_states.obs)
-    assert len(bc_states.obs) == 3
+    assert len(bc_states.obs) == len(growing_states.obs) == 3
     expert.get_env().close()
 
 
@@ -234,10 +234,10 @@ class TestResolveEnvs:
             resolve_envs(env_group="classical", envs=["CartPole-v1"])
 
 
-def test_run_bc_dagger_cartpole(tmp_path):
-    """bc_dagger smoke test on CartPole."""
+def test_run_bc_iid_cartpole(tmp_path):
+    """bc_iid smoke test on CartPole."""
     config = _make_config(
-        "bc_dagger",
+        "bc_iid",
         tmp_path,
         env_name="CartPole-v1",
         policy_mode="end_to_end",
@@ -246,11 +246,11 @@ def test_run_bc_dagger_cartpole(tmp_path):
         eval_interval=1,
     )
     result = run_single(config)
-    assert result["algo"] == "bc_dagger"
-    assert len(result["per_round"]) == 3
+    assert result["algo"] == "bc_iid"
+    assert len(result["per_round"]) == 4
     # Data budget invariant: round k has exactly k * samples_per_round obs
     for i, r in enumerate(result["per_round"]):
-        assert r["n_observations"] == (i + 1) * 200
+        assert r["n_observations"] == i * 200
     # rollout_cross_entropy populated on every eval-point round
     # (with eval_interval=1, every round is an eval point)
     for r in result["per_round"]:

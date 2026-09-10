@@ -1,4 +1,4 @@
-"""Plotting for FTL vs FTRL vs BC (growing dataset) vs BC experiment results.
+"""Plotting for FTL vs FTRL vs BC-iid vs BC experiment results.
 
 Generates per-environment figures with 4 subplots (linear x-axis by default):
   1. Rollout cross-entropy on the aggregated D_eval^t buffer (log y)
@@ -35,7 +35,7 @@ matplotlib.use("Agg")
 ALGO_COLORS: Dict[str, str] = {
     "ftl": "#1f77b4",  # blue
     "ftrl": "#d62728",  # red
-    "bc_dagger": "#2ca02c",  # green
+    "bc_iid": "#2ca02c",  # green
     "bc": "#17a663",  # dark green (dashed reference)
     "expert": "#555555",  # gray (dashed reference)
 }
@@ -43,7 +43,7 @@ ALGO_COLORS: Dict[str, str] = {
 ALGO_LABELS: Dict[str, str] = {
     "ftl": "FTL+DAgger",
     "ftrl": "FTRL+DAgger",
-    "bc_dagger": "BC (growing dataset)",
+    "bc_iid": "BC-iid",
     "bc": "BC (fixed)",
     "expert": "Expert",
 }
@@ -51,12 +51,12 @@ ALGO_LABELS: Dict[str, str] = {
 ALGO_LINESTYLES: Dict[str, str] = {
     "ftl": "-",
     "ftrl": "-",
-    "bc_dagger": "-",
+    "bc_iid": "-",
     "bc": "--",
     "expert": "--",
 }
 
-LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger", "bc"}
+LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_iid", "bc"}
 
 
 def _draw_bc_hlines(
@@ -597,7 +597,7 @@ def plot_env(
         "Disagreement Rate",
         log_scale=True,
         y_clip_floor=1e-3,
-        allowed_algos={"ftl", "ftrl", "bc_dagger", "bc"},
+        allowed_algos={"ftl", "ftrl", "bc_iid", "bc"},
         band=band,
     )
 
@@ -686,7 +686,7 @@ def plot_all(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot FTL vs FTRL vs BC (growing dataset) vs BC experiment results",
+        description="Plot FTL vs FTRL vs BC-iid vs BC experiment results",
     )
     parser.add_argument(
         "--results-dir",

@@ -1,4 +1,4 @@
-"""One immutable, ordered expert dataset shared by both BC baselines."""
+"""Immutable, ordered expert datasets for fixed BC."""
 
 import fcntl
 import hashlib
@@ -24,8 +24,8 @@ def policy_digest(policy):
 def load_or_collect(root, metadata, collect):
     """Atomically create or load ordered transitions, including provenance.
 
-    A filesystem lock permits BC and growing BC workers to start in either
-    order without collecting different datasets. The callback is called once
+    A filesystem lock permits concurrent workers to reuse the same fixed BC
+    dataset without duplicate collection. The callback is called once
     per metadata key. Only numeric arrays are stored, never pickled objects.
     """
     root = pathlib.Path(root)

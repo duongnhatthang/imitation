@@ -10,6 +10,44 @@ brew install coreutils gnu-getopt parallel
 
 ## Scripts
 
+### FTL, FTRL, BC-iid, and fixed BC
+
+The learning-curve and coverage sweeps run `ftl`, `ftrl`, `bc_iid`, and `bc`.
+BC-iid replaces the former `bc_dagger` growing-dataset baseline.
+
+BC-iid collects fresh complete trajectories using the same expert policy as BC,
+with deterministic expert actions throughout every round. It uniformly samples
+`--samples-per-round` distinct transitions from the pooled round trajectories
+(default 1), accumulates them, and trains with FTL's zero-L2 objective, optimizer,
+warm-start setting, and early-stopping rules. Evaluation uses the current learned
+policy: once before training, then after the first, scheduled, and final rounds.
+
+`--trajectories-per-round` (alias `--traj-per-round`) sets the minimum number of
+complete trajectories per round, default 1. Extra trajectories are collected
+when needed to supply the retained sample count. The learning-curve x-axis counts
+retained training observations, not all environment steps or expert queries.
+FTL/FTRL retain their configured expert-to-learner mixing schedule.
+
+Fixed BC defaults to `prefix`: it keeps the first transitions in temporal order
+from its expert dataset. FTL/FTRL and BC-iid default to `uniform`.
+`--subsample-strategy uniform` explicitly selects uniform sampling for BC too;
+`--subsample-strategy prefix` is available for runs that exclude BC-iid.
+BC-iid always requires uniform sampling. Training minibatches may still shuffle;
+`prefix` describes data selection, not optimizer minibatch order.
+
+Example BC-iid run with one retained sample per round:
+
+```bash
+python -m imitation.experiments.ftrl.run_experiment \
+    --envs CartPole-v1 --algos bc_iid --seeds 1 \
+    --samples-per-round 1 --traj-per-round 1 --n-rounds 100 \
+    --output-dir experiments/learning_curves/bc_iid_v1
+```
+
+Use a fresh output directory when comparing the new baselines. Existing
+`bc_dagger` result files represent a different method and are not renamed or
+reused as BC-iid results.
+
 ### Phase 1: Generate expert demonstrations from models.
 
 Run `experiments/rollouts_from_policies.sh`. (Rollouts saved in `output/train_experts/`).

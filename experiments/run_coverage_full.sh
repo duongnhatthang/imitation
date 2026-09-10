@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full coverage run: an FTRL sweep (which now persists per-round demos for ALL
-# four algos -- ftl, ftrl, bc, bc_dagger) followed by the three post-hoc
+# four algos -- ftl, ftrl, bc, bc_iid) followed by the three post-hoc
 # visualizations (t-SNE state coverage, recoverability mu(s), runtime) plus the
 # standard learning-curve plots. One command produces the whole deliverable.
 #
@@ -63,7 +63,7 @@ echo "[coverage_full] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.run_experiment \
     --envs "${ENV_ARR[@]}" \
-    --algos ftl ftrl bc bc_dagger \
+    --algos ftl ftrl bc bc_iid \
     --seeds "$SEEDS" \
     --samples-per-round 1 \
     --n-rounds "$N_ROUNDS" \

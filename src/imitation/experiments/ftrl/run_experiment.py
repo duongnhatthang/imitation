@@ -34,7 +34,7 @@ from imitation.util import logger as imit_logger
 
 logger = logging.getLogger(__name__)
 
-ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_dagger"]
+ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_iid"]
 
 
 def _config_metadata(config):
@@ -42,7 +42,7 @@ def _config_metadata(config):
     settings = dataclasses.asdict(config)
     for key in ("output_dir", "expert_cache_dir"):
         settings[key] = str(settings[key])
-    settings["protocol_version"] = 2
+    settings["protocol_version"] = 3
     digest = hashlib.sha256()
     for name in (
         "run_experiment.py",
@@ -146,11 +146,24 @@ class ExperimentConfig:
     # `_split_transitions_for_val`).
     inner_early_stop_min_val_size: int = 32
     inner_early_stop_min_epochs: int = 3
-    subsample_strategy: str = "uniform"  # "uniform" or "prefix"
+    # None selects the algorithm default: temporal BC, uniform interactive data.
+    subsample_strategy: Optional[str] = None
     trajectories_per_round: int = (
         1  # minimum complete rollouts, independent of training batches
     )
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
+
+    def __post_init__(self) -> None:
+        if self.subsample_strategy is None:
+            self.subsample_strategy = "prefix" if self.algo == "bc" else "uniform"
+        if self.subsample_strategy not in ("uniform", "prefix"):
+            raise ValueError("subsample_strategy must be 'uniform' or 'prefix'")
+        if self.algo == "bc_iid" and self.subsample_strategy != "uniform":
+            raise ValueError("BC-iid requires uniform sampling")
+        if self.trajectories_per_round < 1 or self.samples_per_round < 1:
+            raise ValueError(
+                "trajectories_per_round and samples_per_round must be positive"
+            )
 
 
 def _compute_round_eval(
@@ -264,7 +277,7 @@ def _inner_train(
     For ``inner_early_stop=False`` (this task) runs the underlying BC training
     once with ``n_epochs=config.bc_n_epochs``. For DAgger callers this routes
     through ``extend_and_update`` so the round counter advances and demos
-    aggregate; for BC / BC-DAgger callers it calls ``bc_trainer.train`` directly.
+    aggregate; fixed BC calls ``bc_trainer.train`` directly.
 
     The val-split early-stop branch lands in Task 7.
 
@@ -366,6 +379,10 @@ def _inner_train(
         val_acts = np.stack([t["acts"] for t in val_subset])
 
     # 5. Re-bind BC trainer to train-only.
+    original_batch_size = bc_trainer.batch_size
+    original_minibatch_size = bc_trainer.minibatch_size
+    if len(train_subset) < original_minibatch_size:
+        bc_trainer.batch_size = bc_trainer.minibatch_size = len(train_subset)
     bc_trainer.set_demonstrations(train_subset)
 
     # 6. Loop epochs with val-NLL early stop.
@@ -404,10 +421,9 @@ def _inner_train(
     if best_state is not None:
         bc_trainer.policy.load_state_dict(best_state)
 
-    # 8. Defensive: restore the full data loader so any downstream code that
-    #    consults it (currently none in this branch — both DAgger's next
-    #    extend_and_update and bc_dagger's fresh bc_trainer rebuild it from
-    #    scratch — but kept for forward compatibility).
+    # 8. Restore the full data loader for subsequent training and diagnostics.
+    bc_trainer.batch_size = original_batch_size
+    bc_trainer.minibatch_size = original_minibatch_size
     bc_trainer.set_demonstrations(full_transitions)
 
     # 9. For DAgger callers, append per-round metrics now that training is
@@ -555,7 +571,7 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         "per_round": [],
     }
 
-    if config.algo in ("ftl", "ftrl"):
+    if config.algo in ("ftl", "ftrl", "bc_iid"):
         result["per_round"] = _run_dagger_variant(
             config,
             venv,
@@ -565,10 +581,6 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         )
     elif config.algo == "bc":
         result["per_round"] = _run_bc(config, venv, expert_policy, rng, baselines)
-    elif config.algo == "bc_dagger":
-        result["per_round"] = _run_bc_dagger(
-            config, venv, expert_policy, rng, baselines
-        )
     else:
         raise ValueError(f"Unknown algo: {config.algo}")
 
@@ -593,7 +605,8 @@ def _truncate_trajectory(traj: types.Trajectory, n: int) -> types.Trajectory:
     """Return the first ``n`` transitions of ``traj`` as a new Trajectory.
 
     Mid-episode cut => terminal=False. Used to make each DAgger round contribute
-    exactly samples_per_round expert labels, matching BC / BC (growing dataset) bookkeeping.
+    exactly samples_per_round expert labels, matching the other baselines'
+    observation budgets.
     """
     assert 0 < n < len(traj), (n, len(traj))
     new_infos = None if traj.infos is None else traj.infos[:n]
@@ -622,7 +635,7 @@ def _truncate_round_demos(
 
     Keeps whole saved trajectories while their cumulative length <= n_target,
     then cuts the next trajectory mid-episode to fill the remainder. Matches
-    BC / BC (growing dataset) which slice upfront-collected transitions to an exact N.
+    fixed BC, which slices upfront-collected transitions to an exact N.
     """
     # Demos are saved as HuggingFace dataset directories (suffix is still .npz).
     demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
@@ -756,8 +769,12 @@ def _run_dagger_variant(
     rng: np.random.Generator,
     baselines: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    """Run FTL or FTRL (DAgger variants)."""
-    from imitation.algorithms.dagger import LinearBetaSchedule
+    """Run FTL, FTRL, or BC-iid with shared training and evaluation mechanics.
+
+    BC-iid keeps expert control at every round. FTL/FTRL retain their configured
+    expert-to-learner mixing schedule. All accumulate the retained round samples.
+    """
+    from imitation.algorithms.dagger import ExponentialBetaSchedule, LinearBetaSchedule
 
     # Create policy
     if config.policy_mode == "linear":
@@ -771,7 +788,7 @@ def _run_dagger_variant(
         use_trainable_params_loss = False
 
     # L2 schedule
-    if config.algo == "ftl":
+    if config.algo in ("ftl", "bc_iid"):
         l2_schedule = ftrl.ConstantL2Schedule(0.0)
     elif config.l2_decay:
         l2_schedule = ftrl.DecayingL2Schedule(config.l2_lambda)
@@ -823,7 +840,11 @@ def _run_dagger_variant(
         warm_start=config.warm_start,
         track_per_round_loss=True,
         use_trainable_params_loss=use_trainable_params_loss,
-        beta_schedule=LinearBetaSchedule(config.beta_rampdown),
+        beta_schedule=(
+            ExponentialBetaSchedule(1.0)
+            if config.algo == "bc_iid"
+            else LinearBetaSchedule(config.beta_rampdown)
+        ),
         custom_logger=custom_logger,
     )
 
@@ -993,12 +1014,12 @@ def _save_policy(config, policy, round_num):
 
 
 def _shared_expert_data(config, venv, expert_policy):
-    """Use a common BC dataset regardless of which baseline worker runs first."""
+    """Cache fixed BC data with its sampling strategy and expert provenance."""
     from imitation.experiments.ftrl import expert_dataset
 
     budget = config.n_rounds * config.samples_per_round
     metadata = dict(
-        version=3,
+        version=4,
         env=config.env_name,
         seed=config.seed,
         budget=budget,
@@ -1028,6 +1049,7 @@ def _shared_expert_data(config, venv, expert_policy):
                 ),
                 deterministic_policy=True,
                 rng=data_rng,
+                shuffle=config.subsample_strategy != "prefix",
             )
         finally:
             data_env.close()
@@ -1121,169 +1143,6 @@ def _run_bc(
             **eval_data,
         }
     ]
-
-
-def _run_bc_dagger(
-    config: ExperimentConfig,
-    venv,
-    expert_policy,
-    rng: np.random.Generator,
-    baselines: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    """BC (growing dataset) baseline.
-
-    Per-round ERM on a growing PREFIX of the expert dataset, sized to
-    match DAgger's aggregated observation budget. Eval uses the same
-    aggregated D_eval^t buffer construction as FTL/FTRL+DAgger (spec §3.4).
-
-    A round-0 eval (fresh policy, before any training) is also emitted,
-    and the outer round loop early-stops when disagreement_rate plateaus.
-    """
-    total_timesteps = config.n_rounds * config.samples_per_round
-
-    all_transitions = _shared_expert_data(config, venv, expert_policy)
-
-    bcd_scratch = (
-        config.output_dir / "scratch" / f"bc_dagger_{config.env_name}_seed{config.seed}"
-    )
-    if bcd_scratch.exists():
-        shutil.rmtree(bcd_scratch)
-    warm_start = env_utils.is_atari(config.env_name)
-
-    # Build the initial fresh policy for round 0.
-    if config.policy_mode == "linear":
-        policy = policy_utils.create_linear_policy(expert_policy)
-    else:
-        policy = policy_utils.create_end_to_end_policy(
-            venv.observation_space, venv.action_space
-        )
-
-    disagreement_history: List[float] = []
-    per_round: List[Dict[str, Any]] = []
-
-    # Round 0: evaluate fresh policy.
-    round0_eval = _compute_round_eval(
-        policy,
-        expert_policy,
-        venv,
-        baselines,
-    )
-    round0_eval["checkpoint"] = _save_policy(config, policy, 0)
-    disagreement_history.append(round0_eval["disagreement_rate"])
-    per_round.append(
-        {
-            "round": 0,
-            "n_observations": 0,
-            "train_cross_entropy": None,
-            "l2_norm": None,
-            "total_loss": None,
-            **round0_eval,
-        }
-    )
-
-    stopped_early = False
-    for round_num in range(1, config.n_rounds + 1):
-        # --- Train on the growing prefix of shared expert data ---
-        k = round_num * config.samples_per_round
-        prefix = all_transitions[:k]
-        _save_transitions_as_demos(
-            all_transitions[k - config.samples_per_round : k],
-            bcd_scratch,
-            round_num,
-            np.random.default_rng(config.seed + round_num),
-        )
-
-        if not warm_start:
-            if config.policy_mode == "linear":
-                policy = policy_utils.create_linear_policy(expert_policy)
-            else:
-                policy = policy_utils.create_end_to_end_policy(
-                    venv.observation_space, venv.action_space
-                )
-
-        custom_logger = imit_logger.configure(
-            str(
-                config.output_dir
-                / "tb"
-                / f"bc_dagger_{config.env_name}_{config.seed}_r{round_num}"
-            ),
-            format_strs=[],
-        )
-        bc_trainer = bc.BC(
-            observation_space=venv.observation_space,
-            action_space=venv.action_space,
-            rng=rng,
-            policy=policy,
-            demonstrations=prefix,
-            batch_size=min(config.bc_batch_size, len(prefix)),
-            optimizer_kwargs={"lr": config.learning_rate},
-            custom_logger=custom_logger,
-        )
-        inner_log = _inner_train(
-            bc_trainer, config, round_num=round_num, is_dagger=False
-        )
-        policy = bc_trainer.policy
-
-        # --- Evaluate after training ---
-        is_first = round_num == 1
-        is_interval = round_num % config.eval_interval == 0
-        is_final = round_num == config.n_rounds
-        should_eval = is_first or is_interval or is_final
-
-        eval_data: Optional[Dict[str, Any]] = None
-        if should_eval:
-            eval_data = _compute_round_eval(
-                policy,
-                expert_policy,
-                venv,
-                baselines,
-            )
-            disagreement_history.append(eval_data["disagreement_rate"])
-
-            if config.outer_early_stop and _should_outer_early_stop(
-                disagreement_history,
-                config.outer_early_stop_patience,
-                config.outer_early_stop_min_delta,
-                disagreement_ceiling=config.outer_early_stop_disagreement_ceiling,
-            ):
-                stopped_early = True
-                logger.info(
-                    f"bc_dagger/{config.env_name}/seed{config.seed}: "
-                    f"early stop at round {round_num} "
-                    f"(disagreement plateau over "
-                    f"{config.outer_early_stop_patience} eval points)"
-                )
-
-        l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
-        l2_norm = sum(l2_norms) / 2
-
-        round_data: Dict[str, Any] = {
-            "round": round_num,
-            "n_observations": k,
-            "train_cross_entropy": None,
-            "l2_norm": round(l2_norm, 6),
-            "total_loss": None,
-            "rollout_cross_entropy": None,
-            "expert_rollout_cross_entropy": None,
-            "normalized_return": None,
-            "disagreement_rate": None,
-            "d_eval_size": None,
-            **inner_log,
-        }
-
-        if eval_data is not None:
-            round_data.update(eval_data)
-            round_data["checkpoint"] = _save_policy(
-                config, bc_trainer.policy, round_num
-            )
-
-        per_round.append(round_data)
-        if stopped_early:
-            break
-
-        _free_memory()
-
-    return per_round
 
 
 def _result_path(config: ExperimentConfig) -> pathlib.Path:
@@ -1382,6 +1241,7 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         output_dir=pathlib.Path(args.output_dir),
                         expert_cache_dir=pathlib.Path(args.expert_cache_dir),
                         learning_rate=args.learning_rate,
+                        subsample_strategy=getattr(args, "subsample_strategy", None),
                         outer_early_stop=args.outer_early_stop,
                         outer_early_stop_patience=args.outer_early_stop_patience,
                         outer_early_stop_min_delta=args.outer_early_stop_min_delta,
@@ -1427,7 +1287,7 @@ def main():
         "--samples-per-round",
         type=int,
         default=1,
-        help="Min timesteps per DAgger round (default: 1)",
+        help="Retained samples per round, pooled across complete trajectories (default: 1)",
     )
     # Python 3.8 doesn't have argparse.BooleanOptionalAction, so we pair
     # store_true / store_false on a shared dest.
@@ -1605,13 +1465,27 @@ def main():
     )
     parser.add_argument(
         "--trajectories-per-round",
+        "--traj-per-round",
         type=int,
         default=1,
         help="Minimum complete trajectories in each interactive round (default 1)",
     )
+    parser.add_argument(
+        "--subsample-strategy",
+        choices=["uniform", "prefix"],
+        default=None,
+        help=(
+            "Sampling override: BC defaults to prefix; FTL/FTRL and BC-iid default "
+            "to uniform. BC-iid requires uniform."
+        ),
+    )
     args = parser.parse_args()
     if args.trajectories_per_round < 1:
         parser.error("--trajectories-per-round must be positive")
+    if args.samples_per_round < 1:
+        parser.error("--samples-per-round must be positive")
+    if "bc_iid" in args.algos and args.subsample_strategy == "prefix":
+        parser.error("BC-iid requires uniform sampling")
     args.envs = resolve_envs(env_group=args.env_group, envs=args.envs)
 
     logging.basicConfig(

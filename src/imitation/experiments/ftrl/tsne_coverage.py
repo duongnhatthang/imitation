@@ -93,7 +93,7 @@ def coverage_metrics_unique(
 
     This is the clearest coverage-breadth signal: interactive methods (ftl/ftrl)
     visit many more distinct states than the expert-distribution baselines
-    (bc/bc_dagger). Rounding avoids float noise counting near-duplicates.
+    (BC and BC-iid). Rounding avoids float noise counting near-duplicates.
     """
     out: Dict[str, int] = {}
     for algo in sorted(set(algo_labels.tolist())):
@@ -121,9 +121,7 @@ def subsample(
     keep = []
     for index, algo in enumerate(labels):
         members = np.flatnonzero(algo_labels == algo)
-        # BC variants share ordered source data, so also share display indices.
-        stream = 0 if algo in ("bc", "bc_dagger") else index + 1
-        rng = np.random.default_rng(np.random.SeedSequence([seed, stream]))
+        rng = np.random.default_rng(np.random.SeedSequence([seed, index]))
         keep.extend(rng.choice(members, size=per_algo, replace=False))
     idx = np.sort(np.asarray(keep, dtype=int))
     return features[idx], algo_labels[idx], rounds[idx], idx

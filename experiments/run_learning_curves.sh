@@ -39,7 +39,7 @@ echo "[learning_curves] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.run_experiment \
     --env-group classical \
-    --algos ftl ftrl bc bc_dagger \
+    --algos ftl ftrl bc bc_iid \
     --seeds 5 \
     --samples-per-round 1 \
     --n-rounds 1000 \

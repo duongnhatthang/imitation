@@ -47,7 +47,7 @@ def test_subsample_respects_cap():
 
 
 def test_subsample_balances_algorithms_with_many_rounds():
-    labels = np.repeat(["ftl", "ftrl", "bc", "bc_dagger"], 1000)
+    labels = np.repeat(["ftl", "ftrl", "bc", "bc_iid"], 1000)
     rounds = np.concatenate(
         [np.arange(1000), np.arange(1000), np.zeros(1000), np.arange(1000)]
     )
@@ -57,7 +57,7 @@ def test_subsample_balances_algorithms_with_many_rounds():
         "ftl": 200,
         "ftrl": 200,
         "bc": 200,
-        "bc_dagger": 200,
+        "bc_iid": 200,
     }
 
 
