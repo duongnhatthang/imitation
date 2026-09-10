@@ -109,19 +109,21 @@ def subsample(
     cap: int = 8000,
     seed: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Stratified subsample by algo x round so the arrival gradient survives."""
-    n = len(features)
-    if n <= cap:
-        idx = np.arange(n)
-        return features, algo_labels, rounds, idx
-    rng = np.random.default_rng(seed)
-    keep_frac = cap / n
+    """Use equal display counts per algorithm without ordered truncation bias.
+
+    Uniform selection within each algorithm preserves empirical round weights
+    in expectation. Counts are capped by the smallest available dataset.
+    """
+    labels, counts = np.unique(algo_labels, return_counts=True)
+    if len(labels) == 0 or cap < len(labels):
+        raise ValueError("cap must allow at least one point per algorithm")
+    per_algo = min(int(counts.min()), cap // len(labels))
     keep = []
-    strata = {}
-    for i in range(n):
-        strata.setdefault((algo_labels[i], int(rounds[i])), []).append(i)
-    for members in strata.values():
-        m = max(1, int(round(len(members) * keep_frac)))
-        keep.extend(rng.choice(members, size=min(m, len(members)), replace=False))
-    idx = np.array(sorted(keep))[:cap]
+    for index, algo in enumerate(labels):
+        members = np.flatnonzero(algo_labels == algo)
+        # BC variants share ordered source data, so also share display indices.
+        stream = 0 if algo in ("bc", "bc_dagger") else index + 1
+        rng = np.random.default_rng(np.random.SeedSequence([seed, stream]))
+        keep.extend(rng.choice(members, size=per_algo, replace=False))
+    idx = np.sort(np.asarray(keep, dtype=int))
     return features[idx], algo_labels[idx], rounds[idx], idx

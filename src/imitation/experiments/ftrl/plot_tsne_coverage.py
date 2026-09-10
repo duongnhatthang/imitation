@@ -1,6 +1,7 @@
 """Render per-environment t-SNE coverage grids colored by data-arrival round."""
 
 import argparse
+import json
 import pathlib
 from typing import Optional, Sequence
 
@@ -293,10 +294,21 @@ def build_and_plot(
         rounds=rounds,
         perplexity=result.perplexity,
         trustworthiness=result.trustworthiness,
+        dataset_seed=seed,
+        embedding_seed=result.seed,
+        search_seeds=np.asarray(seeds),
+        search_perplexities=np.asarray(perplexities),
     )
     diff_path = out_path.parent / f"{out_path.stem}_coverage_diff.png"
     render_coverage_diff(result.embedding, algo, diff_path, env_name)
     return {
+        "dataset_seed": seed,
+        "embedding_seed": result.seed,
+        "perplexity": result.perplexity,
+        "training_counts": {state.algo: len(state.obs) for state in states},
+        "display_counts": {
+            str(label): int(np.sum(algo == label)) for label in np.unique(algo)
+        },
         "coverage_2d": metrics_2d,
         "coverage_highdim": metrics_hd,
         "coverage_unique": metrics_uniq,
@@ -330,7 +342,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         help="Directory containing cached PPO expert policies for Atari CNN features.",
     )
     args = parser.parse_args(argv)
-    out = pathlib.Path(args.output_dir) / f"{args.env.replace('/', '_')}.png"
+    out = (
+        pathlib.Path(args.output_dir)
+        / f"{args.env.replace('/', '_')}_seed{args.seed}.png"
+    )
     metrics = build_and_plot(
         args.results_dir,
         args.env,
@@ -343,6 +358,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         expert_cache=args.expert_cache,
     )
     print(f"Wrote {out}; trustworthiness={metrics['trustworthiness']:.3f}")
+    out.with_suffix(".json").write_text(json.dumps(metrics, indent=2))
 
 
 if __name__ == "__main__":

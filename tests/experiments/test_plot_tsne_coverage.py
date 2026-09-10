@@ -50,3 +50,31 @@ def test_build_and_plot_scaler_path_unchanged(tmp_path):
         tmp_path, "CartPole-v1", 0, out, perplexities=(15,), seeds=(0,)
     )
     assert out.exists() and "ftrl" in metrics["coverage_2d"]
+
+
+def test_cli_separates_dataset_seeds(tmp_path):
+    for seed, count in ((0, 40), (1, 60)):
+        for algo in ("bc", "ftrl"):
+            _demo(tmp_path, algo, seed, 0, count)
+        plot_tsne_coverage.main(
+            [
+                "--results-dir",
+                str(tmp_path),
+                "--env",
+                "CartPole-v1",
+                "--seed",
+                str(seed),
+                "--output-dir",
+                str(tmp_path / "plots"),
+                "--perplexity",
+                "15",
+                "--tsne-seed",
+                "0",
+                "1",
+            ]
+        )
+        path = tmp_path / "plots" / f"CartPole-v1_seed{seed}.npz"
+        with np.load(path) as saved:
+            assert saved["dataset_seed"] == seed
+            assert len(saved["features"]) == 2 * count
+            assert saved["embedding_seed"] in (0, 1)

@@ -100,16 +100,16 @@ LOSS_SUBTITLE_LINES = [
         r"$a^*(s)=\arg\max_a \pi^*(a|s).$"
     ),
     (
-        r"$D_{\mathrm{eval}}^t$: 10-episode rollout of the current "
+        r"$D_{\mathrm{eval}}^t$: 100-episode rollout of the current "
         r"learner $\pi^t$ (labeled with expert argmax). Not aggregated."
     ),
     (
-        r"Cum. regret: $\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
-        r"where $\ell_t(\pi^*)$ is the expert's CE on the same $D_{\mathrm{eval}}^t$."
+        r"Cumulative excess CE: $\sum_{t\ \mathrm{logged}} [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
+        r"on the same $D_{\mathrm{eval}}^t$ at each logged evaluation."
     ),
     (
-        "x-axis = cumulative expert queries (= transitions labeled by "
-        r"$\pi^*$). All algorithms evaluated at equal expert-label budget."
+        "x-axis = retained training observations. Fixed BC uses the full dataset budget; "
+        "collection and evaluation queries are additional."
     ),
 ]
 
@@ -606,7 +606,7 @@ def plot_env(
         ax4,
         env_df,
         "cum_regret",
-        r"Cumulative Regret (vs Expert $\pi^*$)",
+        r"Cumulative Evaluated Excess CE (vs Expert $\pi^*$)",
         allowed_algos=LOSS_SUBPLOT_ALGOS,
         band=band,
     )
