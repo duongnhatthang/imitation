@@ -10,10 +10,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+source experiments/paths.sh
+
 ENV="CartPole-v1"
-RESULTS_DIR="${COVERAGE_RESULTS_DIR:-experiments/coverage/classical}"
-PLOTS_DIR="$RESULTS_DIR/plots/coverage"
-CACHE_DIR="${COVERAGE_CACHE_DIR:-experiments/coverage/dqn_cache}"
+RESULTS_DIR="${COVERAGE_RESULTS_DIR:-$EXP_LC_COVERAGE}"
+PLOTS_DIR="$EXP_PLOTS_COVERAGE/coverage"
+CACHE_DIR="${COVERAGE_CACHE_DIR:-$RESULTS_DIR/dqn_cache}"
 mkdir -p "$PLOTS_DIR" "$CACHE_DIR"
 
 # Require every algo's demos (not just ftrl): bc/bc_iid persist demos too, and a

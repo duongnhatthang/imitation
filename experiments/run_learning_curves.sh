@@ -14,8 +14,7 @@
 # Extra args ($@) forward to run_experiment, so you can pass --force-rerun,
 # --seeds 3, --envs CartPole-v1, etc. without editing the script.
 #
-# Stop-and-review gate: after this completes, review the PNGs in
-# $EXP_LC_CLASSICAL/plots/ before any further env scaling.
+# Learning curves are saved under $EXP_PLOTS_CLASSICAL/learning_curves/.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,13 +24,13 @@ cd "$REPO_ROOT"
 source experiments/paths.sh
 
 RESULTS_DIR="$EXP_LC_CLASSICAL"
-PLOTS_DIR="$EXP_LC_CLASSICAL/plots"
-LOG_FILE="$EXP_LC_CLASSICAL/run.log"
-mkdir -p "$RESULTS_DIR" "$PLOTS_DIR"
+PLOTS_DIR="$EXP_PLOTS_CLASSICAL/learning_curves"
+LOG_FILE="$EXP_LOG_DIR/classical.log"
+mkdir -p "$RESULTS_DIR" "$PLOTS_DIR" "$EXP_LOG_DIR"
 
 # CPU worker count: total - 2, floor 1.
 CPU_TOTAL="$(getconf _NPROCESSORS_ONLN)"
-WORKERS=$(( CPU_TOTAL - 2 ))
+WORKERS="${N_WORKERS:-$(( CPU_TOTAL - 2 ))}"
 if [ "$WORKERS" -lt 1 ]; then WORKERS=1; fi
 echo "[learning_curves] launching with $WORKERS parallel workers on $CPU_TOTAL-core host" | tee -a "$LOG_FILE"
 echo "[learning_curves] start time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE"
@@ -46,6 +45,7 @@ python -m imitation.experiments.ftrl.run_experiment \
     --bc-n-epochs 20 \
     --eval-interval 10 \
     --output-dir "$RESULTS_DIR" \
+    --expert-cache-dir "$EXP_EXPERT_CACHE" \
     --inner-early-stop \
     --no-outer-early-stop \
     --n-workers "$WORKERS" \
@@ -58,10 +58,10 @@ echo "[learning_curves] generating plots ..." | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir "$RESULTS_DIR" \
-    --output-dir "$PLOTS_DIR" \
+    --output-dir "$PLOTS_DIR" --flat-output \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[learning_curves] complete. JSONs:"
-find "$RESULTS_DIR" -name "*.json" -not -path "*/scratch/*" -not -path "*/tb/*" | wc -l | tee -a "$LOG_FILE"
+find "$RESULTS_DIR" -mindepth 2 -maxdepth 2 -name "*.json" | wc -l | tee -a "$LOG_FILE"
 echo "[learning_curves] PNGs in $PLOTS_DIR/:"
 ls "$PLOTS_DIR/" 2>&1 | tee -a "$LOG_FILE"

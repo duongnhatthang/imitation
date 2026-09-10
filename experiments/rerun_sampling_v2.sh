@@ -1,32 +1,19 @@
 #!/usr/bin/env bash
-# Run corrected learning curves, then coverage from those same training datasets.
-# Usage: bash experiments/rerun_sampling_v2.sh classical|atari|all
-# Run long experiments inside an existing tmux session.
+# Compatibility entry point. New runs use the named-run layout in paths.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export EXP_LC_CLASSICAL="${EXP_LC_CLASSICAL:-experiments/learning_curves/sampling_v2/classical}"
-export EXP_LC_ATARI="${EXP_LC_ATARI:-experiments/learning_curves/sampling_v2/atari}"
-export COVERAGE_SEEDS="0 1 2 3 4"
-export TSNE_SEEDS="${TSNE_SEEDS:-0 1 2}"
-
-run_group() {
-  local group="$1" results envs
-  if [ "$group" = classical ]; then
-    bash experiments/run_learning_curves.sh --trajectories-per-round 1
-    results="$EXP_LC_CLASSICAL"
+source experiments/paths.sh
+case "${1:-all}" in
+  all) exec bash experiments/run_bc_iid_experiments.sh ;;
+  classical)
+    bash experiments/run_learning_curves.sh --traj-per-round "${TRAJECTORIES_PER_ROUND:-1}"
     envs=$(python -c 'from imitation.experiments.ftrl.env_utils import ENV_GROUPS; print(" ".join(ENV_GROUPS["classical"]))')
-  else
-    bash experiments/run_atari_curves.sh --trajectories-per-round 1
-    results="$EXP_LC_ATARI"
+    PLOT_ROOT="$EXP_PLOTS_CLASSICAL" bash experiments/gen_coverage_viz.sh "$EXP_LC_CLASSICAL" $envs
+    ;;
+  atari)
+    N_ROUNDS="${N_ROUNDS:-200}" bash experiments/run_atari_curves.sh --traj-per-round "${TRAJECTORIES_PER_ROUND:-1}"
     envs="${ENVS:-$(python -c 'from imitation.experiments.ftrl.env_utils import ENV_GROUPS; print(" ".join(ENV_GROUPS["atari-zoo"]))')}"
-  fi
-  # Environment identifiers deliberately expand to separate arguments.
-  bash experiments/gen_coverage_viz.sh "$results" $envs
-}
-
-case "${1:-classical}" in
-  classical) run_group classical ;;
-  atari) run_group atari ;;
-  all) run_group classical; run_group atari ;;
-  *) echo "Usage: $0 classical|atari|all" >&2; exit 2 ;;
+    PLOT_ROOT="$EXP_PLOTS_ATARI" bash experiments/gen_coverage_viz.sh "$EXP_LC_ATARI" $envs
+    ;;
+  *) echo 'Usage: rerun_sampling_v2.sh classical|atari|all' >&2; exit 2 ;;
 esac

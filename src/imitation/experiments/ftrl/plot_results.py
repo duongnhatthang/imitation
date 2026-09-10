@@ -638,6 +638,7 @@ def plot_all(
     show_expert_on_loss: bool = True,
     calibration_data: Optional[Dict[str, Any]] = None,
     band: str = "ci",
+    flat_output: bool = False,
 ) -> List[pathlib.Path]:
     """Generate plots for all environments.
 
@@ -649,6 +650,8 @@ def plot_all(
         calibration_data: Optional dict from lr_calibration.json, keyed by env.
         band: Uncertainty band type forwarded to ``plot_env`` — ``"ci"`` or
             ``"sem"``.
+
+        flat_output: Save directly in output_dir, without another environment-family folder.
 
     Returns:
         List of saved plot file paths.
@@ -667,9 +670,10 @@ def plot_all(
     saved_paths = []
     for env_name in sorted(df["env"].unique()):
         safe_name = env_name.replace("/", "_")
-        out_path = (
-            pathlib.Path(output_dir) / _env_category(env_name) / f"{safe_name}.png"
-        )
+        parent = pathlib.Path(output_dir)
+        if not flat_output:
+            parent /= _env_category(env_name)
+        out_path = parent / f"{safe_name}.png"
         cal = (calibration_data or {}).get(env_name)
         plot_env(
             df,
@@ -732,6 +736,11 @@ def main():
         help="Uncertainty band: 'ci' (IQM + 95%% bootstrap CI, default) or "
         "'sem' (mean ± 1 SEM)",
     )
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help="Save directly in output-dir without a family subfolder",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -751,6 +760,7 @@ def main():
         show_expert_on_loss=args.show_expert_on_loss,
         calibration_data=calibration_data,
         band=args.band,
+        flat_output=args.flat_output,
     )
     if paths:
         logger.info(f"Generated {len(paths)} plots in {args.output_dir}")

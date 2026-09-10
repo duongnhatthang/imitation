@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Validate and run one named experiment campaign, classical before Atari.
+# Activate the desired Python environment and run this inside tmux.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+source experiments/paths.sh
+export CLASSICAL_ROUNDS="${CLASSICAL_ROUNDS:-1000}"
+export ATARI_ROUNDS="${ATARI_ROUNDS:-200}"
+export SEEDS="${SEEDS:-5}"
+export SAMPLES_PER_ROUND="${SAMPLES_PER_ROUND:-1}"
+export TRAJECTORIES_PER_ROUND="${TRAJECTORIES_PER_ROUND:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p "$EXP_LOG_DIR"
+STAGE=starting
+status() {
+    STAGE="$1"
+    printf '%s\n' "$STAGE" > "$EXP_RUN_ROOT/status.tmp"
+    mv "$EXP_RUN_ROOT/status.tmp" "$EXP_RUN_ROOT/status.txt"
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $STAGE"
+}
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then status "failed: $STAGE (exit $rc)"; fi' EXIT
+python - <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+root = Path(os.environ['EXP_RUN_ROOT'])
+manifest = {
+    'run_id': os.environ['EXP_RUN_ID'],
+    'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'source_revision': os.environ.get('SOURCE_REVISION', 'unknown'),
+    'algorithms': ['ftl', 'ftrl', 'bc', 'bc_iid'],
+    'classical_rounds': int(os.environ['CLASSICAL_ROUNDS']),
+    'atari_rounds': int(os.environ['ATARI_ROUNDS']),
+    'seeds': int(os.environ['SEEDS']),
+    'samples_per_round': int(os.environ['SAMPLES_PER_ROUND']),
+    'minimum_trajectories_per_round': int(os.environ['TRAJECTORIES_PER_ROUND']),
+    'policy_mode': 'linear',
+    'bc_sampling': 'prefix',
+    'bc_iid_sampling': 'uniform',
+    'outer_early_stop': False,
+}
+(root / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+PY
+status validation
+python -m pytest -q tests/experiments/test_bc_iid.py \
+    tests/experiments/test_expert_dataset.py \
+    tests/experiments/test_run_experiment.py \
+    -k 'bc_iid_uses_only or fixed_bc_defaults or bc_prefix_preserves or baseline_data_and_evaluation_budget or shared_data_is_collected' \
+    > "$EXP_LOG_DIR/validation.log" 2>&1
+status smoke
+python -m imitation.experiments.ftrl.run_experiment \
+    --envs CartPole-v1 --algos ftl ftrl bc bc_iid --seeds 1 \
+    --samples-per-round 1 --traj-per-round 1 --n-rounds 3 \
+    --bc-n-epochs 1 --eval-interval 1 --policy-mode linear \
+    --no-inner-early-stop --no-outer-early-stop --n-workers 2 --n-gpus 0 \
+    --expert-cache-dir "$EXP_EXPERT_CACHE" --output-dir "$EXP_SMOKE_DIR" \
+    > "$EXP_LOG_DIR/smoke.log" 2>&1
+status classical_training
+N_WORKERS="${CLASSICAL_WORKERS:-${N_WORKERS:-8}}" bash experiments/run_learning_curves.sh \
+    --seeds "$SEEDS" --n-rounds "$CLASSICAL_ROUNDS" \
+    --samples-per-round "$SAMPLES_PER_ROUND" --traj-per-round "$TRAJECTORIES_PER_ROUND"
+status classical_plots
+CLASSICAL_ENVS=$(python -c 'from imitation.experiments.ftrl.env_utils import ENV_GROUPS; print(" ".join(ENV_GROUPS["classical"]))')
+PLOT_ROOT="$EXP_PLOTS_CLASSICAL" bash experiments/gen_coverage_viz.sh "$EXP_LC_CLASSICAL" $CLASSICAL_ENVS \
+    > "$EXP_LOG_DIR/classical-coverage.log" 2>&1
+status atari_training
+N_WORKERS="${ATARI_WORKERS:-${N_WORKERS:-4}}" N_ROUNDS="$ATARI_ROUNDS" bash experiments/run_atari_curves.sh \
+    --seeds "$SEEDS" --samples-per-round "$SAMPLES_PER_ROUND" --traj-per-round "$TRAJECTORIES_PER_ROUND"
+status atari_plots
+ATARI_ENVS=$(python -c 'from imitation.experiments.ftrl.env_utils import ENV_GROUPS; print(" ".join(ENV_GROUPS["atari-zoo"]))')
+PLOT_ROOT="$EXP_PLOTS_ATARI" bash experiments/gen_coverage_viz.sh "$EXP_LC_ATARI" $ATARI_ENVS \
+    > "$EXP_LOG_DIR/atari-coverage.log" 2>&1
+status complete

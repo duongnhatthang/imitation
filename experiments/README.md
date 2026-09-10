@@ -8,6 +8,47 @@ macOS to install some GNU-compatible binaries before all experiments scripts wil
 brew install coreutils gnu-getopt parallel
 ```
 
+## Run storage and local plots
+
+Use `bash experiments/run_bc_iid_experiments.sh` from an activated Python
+runtime inside tmux. It validates the implementation, runs a short smoke test,
+then completes classical training and plots before starting Atari. Defaults:
+five seeds, 1,000 classical rounds, 200 Atari rounds, one retained sample per
+round, and a minimum of one trajectory per round.
+
+Every invocation gets one UTC timestamp as its run ID. Set `EXP_RUN_ID` to a
+recognizable name or an existing ID to resume that run. All child launchers
+inherit it. `EXP_RUNS_DIR` can relocate the entire run collection.
+
+```text
+experiments/runs/<run-id>/
+  manifest.json
+  status.txt
+  data/
+    classical/     # metrics, checkpoints, datasets, scratch, TensorBoard
+    atari/
+    smoke/
+  plots/
+    classical/{learning_curves,coverage,runtime}/
+    atari/{learning_curves,coverage,runtime}/
+  logs/
+```
+
+The local plot mirror is `experiments/plots/<run-id>/classical/` and `atari/`.
+The private sync script's `pull [run-id]` command transfers image and PDF plots
+only. It excludes raw metrics, NPZ caches, trajectories, checkpoints, and logs.
+Its `push` command transfers Git-tracked code instead of recursively sending
+local result trees. Historical plots use run folders named `legacy-*`.
+Raw archives stay on the execution machine.
+
+Budget overrides: `CLASSICAL_ROUNDS`, `ATARI_ROUNDS`, `SEEDS`,
+`SAMPLES_PER_ROUND`, and `TRAJECTORIES_PER_ROUND`. Worker overrides:
+`CLASSICAL_WORKERS` and `ATARI_WORKERS`. Coverage follows the training seed
+count by default; set `COVERAGE_SEEDS` to change that list.
+`SOURCE_REVISION` records the exact source commit when the execution checkout
+is populated by file sync. Detailed per-result metadata also includes a source
+hash and all experiment settings.
+
 ## Scripts
 
 ### FTL, FTRL, BC-iid, and fixed BC
@@ -41,7 +82,7 @@ Example BC-iid run with one retained sample per round:
 python -m imitation.experiments.ftrl.run_experiment \
     --envs CartPole-v1 --algos bc_iid --seeds 1 \
     --samples-per-round 1 --traj-per-round 1 --n-rounds 100 \
-    --output-dir experiments/learning_curves/bc_iid_v1
+    --output-dir experiments/runs/bc_iid_v1/data/classical
 ```
 
 Use a fresh output directory when comparing the new baselines. Existing
@@ -91,9 +132,9 @@ t-SNE uses the expert CNN features for Atari, StandardScaler otherwise.
 
 Generate viz for an existing sweep:
 ```
-./experiments/gen_coverage_viz.sh experiments/learning_curves/classical \
+./experiments/gen_coverage_viz.sh experiments/runs/YOUR_RUN_ID/data/classical \
     CartPole-v1 Acrobot-v1 MountainCar-v0 LunarLander-v2 FrozenLake-v1 CliffWalking-v0 Taxi-v3 Blackjack-v1
-./experiments/gen_coverage_viz.sh experiments/learning_curves/atari \
+./experiments/gen_coverage_viz.sh experiments/runs/YOUR_RUN_ID/data/atari \
     PongNoFrameskip-v4 BreakoutNoFrameskip-v4 QbertNoFrameskip-v4 SeaquestNoFrameskip-v4
 ```
 

@@ -62,9 +62,9 @@ else
     ENV_SEL=(--env-group atari-zoo)
 fi
 RESULTS_DIR="$EXP_LC_ATARI"
-PLOTS_DIR="$EXP_LC_ATARI/plots"
-LOG_FILE="$EXP_LC_ATARI/run.log"
-mkdir -p "$RESULTS_DIR" "$PLOTS_DIR"
+PLOTS_DIR="$EXP_PLOTS_ATARI/learning_curves"
+LOG_FILE="$EXP_LOG_DIR/atari.log"
+mkdir -p "$RESULTS_DIR" "$PLOTS_DIR" "$EXP_LOG_DIR"
 
 # --- Disk safety (shared server) -------------------------------------------
 # HuggingFace `datasets` stages load_from_disk / save_to_disk copies through
@@ -130,7 +130,7 @@ disk_watchdog() {
 
 # CPU worker count: total - 2, floor 1.
 CPU_TOTAL="$(getconf _NPROCESSORS_ONLN)"
-WORKERS=$(( CPU_TOTAL - 2 ))
+WORKERS="${N_WORKERS:-$(( CPU_TOTAL - 2 ))}"
 if [ "$WORKERS" -lt 1 ]; then WORKERS=1; fi
 echo "[atari_curves] $WORKERS workers, $N_GPUS GPUs, n_rounds=$N_ROUNDS" | tee -a "$LOG_FILE"
 echo "[atari_curves] start: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE"
@@ -153,6 +153,7 @@ python -m imitation.experiments.ftrl.run_experiment \
     --n-rounds "$N_ROUNDS" \
     --eval-interval 5 \
     --output-dir "$RESULTS_DIR" \
+    --expert-cache-dir "$EXP_EXPERT_CACHE" \
     --inner-early-stop \
     --no-outer-early-stop \
     --n-workers "$WORKERS" \
@@ -178,10 +179,10 @@ echo "[atari_curves] plotting ..." | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir "$RESULTS_DIR" \
-    --output-dir "$PLOTS_DIR" \
+    --output-dir "$PLOTS_DIR" --flat-output \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[atari_curves] JSONs:"
-find "$RESULTS_DIR" -name "*.json" -not -path "*/scratch/*" -not -path "*/tb/*" | wc -l | tee -a "$LOG_FILE"
+find "$RESULTS_DIR" -mindepth 2 -maxdepth 2 -name "*.json" | wc -l | tee -a "$LOG_FILE"
 echo "[atari_curves] PNGs in $PLOTS_DIR/:"
 ls "$PLOTS_DIR/" 2>&1 | tee -a "$LOG_FILE"

@@ -43,11 +43,11 @@ N_GPUS="${N_GPUS:-0}"
 COVERAGE_SEED="${COVERAGE_SEED:-0}"
 
 RESULTS_DIR="$EXP_LC_COVERAGE"
-PLOTS_DIR="$RESULTS_DIR/plots"
-COV_DIR="$RESULTS_DIR/plots/coverage"
+PLOTS_DIR="$EXP_PLOTS_COVERAGE/learning_curves"
+COV_DIR="$EXP_PLOTS_COVERAGE/coverage"
 CACHE_DIR="$RESULTS_DIR/dqn_cache"
-LOG_FILE="$RESULTS_DIR/run.log"
-mkdir -p "$RESULTS_DIR" "$PLOTS_DIR" "$COV_DIR" "$CACHE_DIR"
+LOG_FILE="$EXP_LOG_DIR/coverage.log"
+mkdir -p "$RESULTS_DIR" "$PLOTS_DIR" "$COV_DIR" "$CACHE_DIR" "$EXP_LOG_DIR"
 
 # CPU worker count: total - 2, floor 1.
 CPU_TOTAL="$(getconf _NPROCESSORS_ONLN)"
@@ -81,7 +81,7 @@ echo "[coverage_full] sweep done: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG
 echo "[coverage_full] learning-curve plots ..." | tee -a "$LOG_FILE"
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir "$RESULTS_DIR" \
-    --output-dir "$PLOTS_DIR" \
+    --output-dir "$PLOTS_DIR" --flat-output \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[coverage_full] t-SNE coverage + recoverability per env ..." | tee -a "$LOG_FILE"

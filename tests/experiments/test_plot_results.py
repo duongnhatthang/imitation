@@ -185,6 +185,15 @@ def test_plot_env(tmp_path):
     assert out_path.stat().st_size > 1000  # non-trivial PNG
 
 
+def test_plot_all_flat_output(tmp_path):
+    results_dir = tmp_path / "data"
+    _populate_results(results_dir, envs=["CartPole-v1"], seeds=1)
+    output = tmp_path / "plots" / "classical" / "learning_curves"
+    paths = plot_all(results_dir, output, flat_output=True)
+    assert paths == [output / "CartPole-v1.png"]
+    assert paths[0].is_file()
+
+
 def test_plot_all(tmp_path):
     """plot_all generates one PNG per env."""
     results_dir = tmp_path / "results"
