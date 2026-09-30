@@ -2,6 +2,9 @@
 
 Status snapshot: 2026-09-30 22:05 UTC, before the approved pilot launch.
 
+Newer: the CartPole pilot status is in
+[`CARTPOLE_PILOT_STATUS.md`](CARTPOLE_PILOT_STATUS.md).
+
 This note explains three parts of [`STUDY_RESULTS.md`](STUDY_RESULTS.md) that
 earlier drafts described with too much jargon: the coarse-observation table
 learner used in the classical diagnostic, the held-out audit and its lower

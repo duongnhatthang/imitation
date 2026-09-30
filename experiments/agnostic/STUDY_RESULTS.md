@@ -2,6 +2,9 @@
 
 Status snapshot: 2026-09-30 22:05 UTC, before the approved pilot launch.
 
+Newer: the CartPole pilot status is in
+[`CARTPOLE_PILOT_STATUS.md`](CARTPOLE_PILOT_STATUS.md).
+
 > **This is a diagnostic status report, not final results.**
 >
 > - **The intended fixed BC was never run.** What the code and earlier drafts
