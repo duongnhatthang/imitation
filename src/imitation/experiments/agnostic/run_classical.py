@@ -1,6 +1,6 @@
 """Classical agnostic imitation runner.
 
-Stage 1 provides only ``prepare-expert``: train a PPO expert with the inherited
+Stage 1 ``prepare-expert``: train a PPO expert with the inherited
 convergence trainer, then qualify it on fresh deterministic episodes against a
 threshold frozen before training. Example::
 
@@ -9,7 +9,20 @@ threshold frozen before training. Example::
         --qualification-seed 1000 --eval-episodes 100 \\
         --deadline 2026-10-07T01:01:00Z
 
-Exit codes: 0 complete and qualified (fresh or verified reuse), 1 failed,
+Stage 2 ``audit`` and ``run-cell`` are implemented in `classical`; they use
+exit code 0 for complete, 1 for partial or failed, 2 for invalid arguments,
+and 3 for a refused preparation or non-fresh output directory. Example::
+
+    python -m imitation.experiments.agnostic.run_classical run-cell \\
+        --env CartPole-v1 --preparation-dir PREP --representation severe \\
+        --output-dir PATH --seed 0 --deadline 2026-10-07T01:01:00Z
+
+Their ``result.json`` has top-level ``status``, ``protocol`` (alias of
+``schema``), ``env_name``, ``seed``, ``expert_sha256``, and for ``run-cell``
+``representation``; the nested ``config`` and ``preparation`` keep the same
+values. Only ``status == "complete"`` is complete.
+
+Stage 1 exit codes: 0 complete and qualified (fresh or verified reuse), 1 failed,
 partial, or not qualified, 2 invalid arguments, 3 refused because the output
 directory holds different, incomplete, or unverifiable evidence, or another
 invocation owns it.
@@ -44,7 +57,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 import gymnasium as gym
 from stable_baselines3 import PPO
 
-from imitation.experiments.agnostic import pilot, rollouts
+from imitation.experiments.agnostic import classical, pilot, quantized, rollouts
 from imitation.experiments.ftrl import env_utils, expert_training
 from imitation.util import util
 
@@ -512,7 +525,86 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="JSON object merged over the env's convergence config.",
     )
     prep.add_argument("--max-eval-env-steps", type=int, default=None)
+
+    aud = sub.add_parser("audit", help="Stage 2 alias audit (diagnostic labels).")
+    cell = sub.add_parser("run-cell", help="Stage 2 FTL / BC-iid / fixed BC cell.")
+    for stage2 in (aud, cell):
+        stage2.add_argument("--env", required=True, choices=SUPPORTED_ENVS)
+        stage2.add_argument("--preparation-dir", required=True, type=pathlib.Path)
+        stage2.add_argument("--output-dir", required=True, type=pathlib.Path)
+        stage2.add_argument("--seed", required=True, type=int)
+        stage2.add_argument(
+            "--deadline",
+            required=True,
+            type=rollouts.parse_utc_deadline,
+            help="Aware deadline; clamped to classical.HARD_CAP.",
+        )
+    aud.add_argument("--episodes", type=int, default=classical.DEFAULT_AUDIT_EPISODES)
+    aud.add_argument("--delta", type=float, default=classical.DEFAULT_DELTA)
+    cell.add_argument(
+        "--representation",
+        required=True,
+        choices=quantized.REPRESENTATIONS,
+    )
+    cell.add_argument("--budget", type=int, default=classical.DEFAULT_BUDGET)
+    cell.add_argument("--batch", type=int, default=classical.DEFAULT_BATCH)
+    cell.add_argument(
+        "--checkpoints",
+        type=int,
+        nargs="+",
+        default=list(classical.DEFAULT_CHECKPOINTS),
+    )
+    cell.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=classical.DEFAULT_EVAL_EPISODES,
+    )
     return parser.parse_args(argv)
+
+
+def _stage2_main(args: argparse.Namespace) -> int:
+    """Run ``audit`` or ``run-cell`` and print a summary of the fresh record."""
+    try:
+        if args.command == "audit":
+            code = classical.audit(
+                args.env,
+                args.preparation_dir,
+                args.output_dir,
+                seed=args.seed,
+                deadline=args.deadline,
+                episodes=args.episodes,
+                delta=args.delta,
+            )
+        else:
+            code = classical.run_cell(
+                args.env,
+                args.preparation_dir,
+                args.representation,
+                args.output_dir,
+                seed=args.seed,
+                deadline=args.deadline,
+                budget=args.budget,
+                batch=args.batch,
+                checkpoints=args.checkpoints,
+                eval_episodes=args.eval_episodes,
+            )
+    except ValueError as exc:
+        logger.error("Invalid arguments: %s", exc)
+        return EXIT_USAGE
+    # A refused directory belongs to someone else; never report its status.
+    if code != classical.EXIT_REFUSED:
+        record_path = args.output_dir / classical.RESULT_FILE
+        record = pilot.read_json(record_path)
+        print(
+            json.dumps(
+                {
+                    "status": record.get("status"),
+                    "record": str(record_path),
+                    "exit_code": code,
+                },
+            ),
+        )
+    return code
 
 
 def main(
@@ -530,6 +622,8 @@ def main(
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parse_args(argv)
+    if args.command != "prepare-expert":
+        return _stage2_main(args)
     try:
         code = prepare_expert(
             args.env,
