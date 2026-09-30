@@ -1,0 +1,112 @@
+{
+  "schema": "agnostic-classical-confirmation-manifest-v1",
+  "study": "Agnostic classical confirmation",
+  "cell_protocol": "agnostic-classical-cell/1",
+  "audit_protocol": "agnostic-classical-audit/1",
+  "source_stage2_files": {
+    "quantized.py": "25bca9d0b71128f51a3286ff27c0c286db92117a513c42395d719892187bfb48",
+    "classical.py": "b503bad34a36b0cd0fe1488b0abee0eb4e2fc7b6bdcfb90f8c2709df36712a37"
+  },
+  "candidate_env_order": [
+    "CartPole-v1",
+    "Acrobot-v1",
+    "MountainCar-v0"
+  ],
+  "selection_rule": "First two candidates in predeclared order passing frozen expert qualification, at least one positive alias bound, numerical stability, and pilot runtime gates. No algorithm effect used for selection. Both predeclared representations retained.",
+  "envs": [
+    {
+      "env_name": "CartPole-v1",
+      "n_actions": 2,
+      "expert_sha256": "05d52f5512c68fb151d2d87877e54de592bd73a1afa4fa2261419e07462d646b",
+      "preparation_config_sha256": "1e8841b553ed3c328efecc8e1bcb6f8deda8078325ceb94e16b232e63572e76e",
+      "quantizer_sha256": {
+        "mild": "69c9ca1799671acd1e7fd302d466a4153d5e0a64ed1380fd9a8932713358ca08",
+        "severe": "1e28384d0cd3e8494a3a4e23323c15043c5be3afdefe7a6c91d07caf90e0b45f"
+      },
+      "audit": {
+        "result_sha256": "58a291581b5156725f5963aacc996347ab8987a4e5d719ab3a90ba67385293f6",
+        "samples_sha256": "cca92c488b8fbb8d696b3e6a59d0a38b028fdfbc7e913ec83128c0922766df77",
+        "seed": 900101,
+        "episodes": 4096,
+        "delta": 0.008333333333333333
+      }
+    },
+    {
+      "env_name": "Acrobot-v1",
+      "n_actions": 3,
+      "expert_sha256": "adfc76d3fc9644226e98475088493ec380022a26945f5f9af3045f3aee727604",
+      "preparation_config_sha256": "070551c63b4294a9686da108bc03a8b25a25f7205d04c6fd361fd3495ac704e9",
+      "quantizer_sha256": {
+        "mild": "b072d95251a1d6627cf2d2d80664149e631a1fd89a69bde43b8045def9543e6e",
+        "severe": "dfe8e4eaa546d7f507a505f3a31bc688d3bddf508d004d7e18f51b16a6cbff69"
+      },
+      "audit": {
+        "result_sha256": "4baee272466b0535f661b4bc0704f196151c7c777e5d00a5414141aeb8ea9bc4",
+        "samples_sha256": "62545c7cca8d030094632dadb09bc098a0f88259c406977cdd1e0306f3af81a5",
+        "seed": 900101,
+        "episodes": 4096,
+        "delta": 0.008333333333333333
+      }
+    }
+  ],
+  "representations": [
+    "mild",
+    "severe"
+  ],
+  "seeds": [
+    1000,
+    1001,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1007,
+    1008,
+    1009,
+    1010,
+    1011,
+    1012,
+    1013,
+    1014,
+    1015,
+    1016,
+    1017,
+    1018,
+    1019
+  ],
+  "excluded_pilot_seeds": [
+    0,
+    1,
+    2
+  ],
+  "budget": 4096,
+  "batch": 16,
+  "checkpoints": [
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096
+  ],
+  "eval_episodes": 100,
+  "analysis": {
+    "confidence_level": 0.95,
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 20260930,
+    "auc_budget_range": [
+      128,
+      4096
+    ]
+  },
+  "package_versions": {
+    "gymnasium": "0.29.1",
+    "imitation": "1.0.1.dev0",
+    "numpy": "1.26.4",
+    "python": "3.10.21",
+    "stable_baselines3": "2.2.1",
+    "torch": "2.4.1+cu121"
+  },
+  "source_stage1_sha256": "9f7d4f29595a78f82466fd65a86b2c9b8c0b184926684a8a821df557a9ff88aa"
+}
