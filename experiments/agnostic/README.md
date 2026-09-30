@@ -1,5 +1,18 @@
 # Agnostic imitation experiments: public commands
 
+Current diagnostic results, source revisions, and limitations are in
+[`STUDY_RESULTS.md`](STUDY_RESULTS.md). The intended fixed BC was never run:
+the legacy output named `fixed_bc` is a BC-iid refit alias. These commands
+reproduce that historical diagnostic, not a corrected three-method study.
+The next comparison is described in
+[`PIPELINE_RESTRICTION_PROPOSAL.md`](PIPELINE_RESTRICTION_PROPOSAL.md). Only its
+initial six-run CartPole pilot is approved. That pilot is being implemented and
+has not run yet, so no result from it exists. The wider eight-environment pilot
+and main campaign, other masks, time-limit changes, tuning, and the other
+numeric settings remain unapproved. A plain-language explainer of the bins,
+audit bound, and toy is in
+[`EXPLAINER_BINS_AUDIT_TOY.md`](EXPLAINER_BINS_AUDIT_TOY.md).
+
 Paths below are placeholders. Replace `PREP_DIR`, `AUDIT_ROOT`, `RESULTS_ROOT`,
 `MANIFEST.json`, and `FRESH_OUTPUT_DIR` with your own locations. No command here
 records hosts, job argv, or machine details, and none should be added to
