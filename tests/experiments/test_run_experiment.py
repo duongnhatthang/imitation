@@ -5,6 +5,139 @@ import json
 import numpy as np
 import pytest
 
+
+def test_lr_sweep_dispatches_cold_start_and_zero_beta(tmp_path, monkeypatch):
+    import sys
+    from imitation.experiments.ftrl import run_experiment, run_lr_sweep
+
+    configs = []
+
+    def already_done(config):
+        configs.append(config)
+        return True
+
+    monkeypatch.setattr(run_experiment, "_is_already_done", already_done)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_lr_sweep",
+            "--envs",
+            "CartPole-v1",
+            "--seeds",
+            "1",
+            "--total-obs",
+            "4",
+            "--samples-per-round-values",
+            "1",
+            "--lr-values",
+            "0.001",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+    run_lr_sweep.main()
+    assert len(configs) == 1
+    assert configs[0].warm_start is False
+    assert configs[0].beta_rampdown == 0
+
+
+def test_uniform_expert_order_is_random_and_repeatable():
+    from imitation.experiments.ftrl.run_experiment import (
+        _collect_and_subsample_transitions,
+    )
+
+    pool = list(range(100))
+    first = _collect_and_subsample_transitions(
+        pool, 100, "uniform", np.random.default_rng(7)
+    )
+    again = _collect_and_subsample_transitions(
+        pool, 100, "uniform", np.random.default_rng(7)
+    )
+    other = _collect_and_subsample_transitions(
+        pool, 100, "uniform", np.random.default_rng(8)
+    )
+    assert first == again
+    assert sorted(first) == pool
+    assert first != pool
+    assert first != other
+
+
+@pytest.mark.parametrize("early_stop", [False, True])
+def test_baseline_data_and_evaluation_budget(tmp_path, monkeypatch, early_stop):
+    """Exercise real collection, training, persistence, and checkpoint loading."""
+    from stable_baselines3 import PPO
+    from imitation.experiments.ftrl.policy_utils import load_policy_checkpoint
+    from imitation.experiments.ftrl import coverage_data, env_baselines, run_experiment
+
+    expert = PPO(
+        "MlpPolicy", "CartPole-v1", n_steps=8, batch_size=8, seed=10, device="cpu"
+    )
+    monkeypatch.setattr(
+        run_experiment.experts, "get_or_train_expert", lambda *a, **kw: expert.policy
+    )
+    monkeypatch.setattr(
+        env_baselines,
+        "load_or_compute_baselines",
+        lambda *a, **kw: {"expert_return": 100.0, "random_return": 10.0},
+    )
+    monkeypatch.setattr(env_baselines, "validate_expert_quality", lambda *a: (True, ""))
+    trained = [0]
+    original_train = run_experiment._inner_train
+
+    def train(*args, **kwargs):
+        result = original_train(*args, **kwargs)
+        trained[0] = kwargs["round_num"]
+        return result
+
+    def evaluate(*args, **kwargs):
+        return dict(
+            normalized_return=0.0,
+            disagreement_rate=0.0,
+            d_eval_size=10,
+            evaluated_round=trained[0],
+            episode_returns=[10.0, 12.0],
+        )
+
+    monkeypatch.setattr(run_experiment, "_inner_train", train)
+    monkeypatch.setattr(run_experiment, "_compute_round_eval", evaluate)
+    results = {}
+    for algo in ("bc_iid", "bc", "ftl", "ftrl"):
+        trained[0] = 0
+        config = _make_config(
+            algo,
+            tmp_path,
+            n_rounds=3,
+            samples_per_round=1,
+            eval_interval=1,
+            bc_n_epochs=1,
+            inner_early_stop=early_stop,
+            trajectories_per_round=3,
+        )
+        results[algo] = run_single(config)
+        if algo != "bc":
+            for row in results[algo]["per_round"]:
+                assert row["evaluated_round"] == row["round"]
+        final = results[algo]["per_round"][-1]
+        if algo in ("ftl", "ftrl", "bc_iid"):
+            assert final["trajectories_collected_this_round"] == 3
+            assert final["n_observations"] == 3
+            assert final["collection_steps"] >= 9
+        assert final["episode_returns"] == [10.0, 12.0]
+        loaded = load_policy_checkpoint(final["checkpoint"])
+        assert loaded is not None
+    assert results["bc"]["expert_dataset"]["strategy"] == "prefix"
+    assert "expert_dataset" not in results["bc_iid"]
+    bc_states = coverage_data.load_algo_states(
+        config.output_dir, config.env_name, "bc", 0
+    )
+    growing_states = coverage_data.load_algo_states(
+        config.output_dir, config.env_name, "bc_iid", 0
+    )
+    assert len(bc_states.obs) == len(growing_states.obs) == 3
+    expert.get_env().close()
+
+
 from imitation.experiments.ftrl.run_experiment import (
     ExperimentConfig,
     resolve_envs,
@@ -12,12 +145,37 @@ from imitation.experiments.ftrl.run_experiment import (
 )
 
 
+@pytest.fixture
+def untrained_expert(monkeypatch):
+    """Skip PPO expert training, which test_expert_pipeline.py covers.
+
+    Also caps evaluation at a few real episodes instead of the production 100:
+    these are plumbing checks, and test_eval_utils.py covers the estimator.
+    """
+    from stable_baselines3 import PPO
+    from imitation.experiments.ftrl import eval_utils, run_experiment
+
+    expert = PPO("MlpPolicy", "CartPole-v1", seed=10, device="cpu")
+    monkeypatch.setattr(
+        run_experiment.experts, "get_or_train_expert", lambda *a, **kw: expert.policy
+    )
+    evaluate = eval_utils.eval_policy_rollout
+
+    def few_episodes(*args, n_episodes, **kwargs):
+        return evaluate(*args, n_episodes=min(n_episodes, 3), **kwargs)
+
+    monkeypatch.setattr(eval_utils, "eval_policy_rollout", few_episodes)
+    yield expert.policy
+    expert.get_env().close()
+
+
 def _make_config(algo, tmp_path, **overrides):
     """Helper to create an ExperimentConfig for testing.
 
     Inner / outer early-stop default to OFF in the fixture so the existing
     smoke tests exercise deterministic fixed-budget behavior. Tests targeting
-    early-stop semantics opt in explicitly.
+    early-stop semantics opt in explicitly. Interactive algorithms collect at
+    least ``samples_per_round`` episodes per round, so keep it small.
     """
     defaults = dict(
         algo=algo,
@@ -25,7 +183,7 @@ def _make_config(algo, tmp_path, **overrides):
         seed=0,
         policy_mode="end_to_end",
         n_rounds=3,
-        samples_per_round=300,
+        samples_per_round=5,
         l2_lambda=1e-4,
         l2_decay=False,
         warm_start=True,
@@ -41,7 +199,7 @@ def _make_config(algo, tmp_path, **overrides):
     return ExperimentConfig(**defaults)
 
 
-def test_run_ftl_cartpole(tmp_path):
+def test_run_ftl_cartpole(tmp_path, untrained_expert):
     """FTL (l2=0) smoke test on CartPole, 3 rounds."""
     config = _make_config("ftl", tmp_path)
     result = run_single(config)
@@ -60,7 +218,7 @@ def test_run_ftl_cartpole(tmp_path):
     assert saved["algo"] == "ftl"
 
 
-def test_run_ftrl_cartpole(tmp_path):
+def test_run_ftrl_cartpole(tmp_path, untrained_expert):
     """FTRL smoke test on CartPole, 3 rounds."""
     config = _make_config("ftrl", tmp_path)
     result = run_single(config)
@@ -71,28 +229,29 @@ def test_run_ftrl_cartpole(tmp_path):
         assert "train_cross_entropy" in m
         assert "l2_norm" in m
         assert "round" in m
-        assert "d_eval_size" in m
-        assert isinstance(m["d_eval_size"], int)
+        # Only evaluation rounds (eval_interval, final) roll out the learner.
+        evaluated = "checkpoint" in m
+        assert isinstance(m["d_eval_size"], int) == evaluated
 
 
-def test_run_bc_cartpole(tmp_path):
+def test_run_bc_cartpole(tmp_path, untrained_expert):
     """BC baseline smoke test on CartPole."""
     config = _make_config("bc", tmp_path)
     result = run_single(config)
 
     assert result["algo"] == "bc"
-    assert len(result["per_round"]) >= 2
+    # Fixed BC trains once and reports a single row.
+    assert len(result["per_round"]) == 1
     for m in result["per_round"]:
-        # Fixed BC does not track per-round train cross-entropy or rollout CE;
-        # these fields are present but None (static reference line in plots).
-        assert "train_cross_entropy" in m
+        # Fixed BC has no per-round training loss, but its one row is an
+        # evaluated, checkpointed policy (a static reference line in plots).
         assert m["train_cross_entropy"] is None
-        assert "rollout_cross_entropy" in m
-        assert m["rollout_cross_entropy"] is None
+        assert isinstance(m["rollout_cross_entropy"], float)
+        assert "checkpoint" in m
         assert "l2_norm" in m
 
 
-def test_run_ftrl_linear_mode(tmp_path):
+def test_run_ftrl_linear_mode(tmp_path, untrained_expert):
     """FTRL with linear policy mode on CartPole."""
     config = _make_config("ftrl", tmp_path, policy_mode="linear")
     result = run_single(config)
@@ -101,7 +260,7 @@ def test_run_ftrl_linear_mode(tmp_path):
     assert len(result["per_round"]) >= 2
 
 
-def test_run_ftrl_decaying_l2(tmp_path):
+def test_run_ftrl_decaying_l2(tmp_path, untrained_expert):
     """FTRL with decaying L2 schedule."""
     config = _make_config("ftrl", tmp_path, l2_decay=True)
     result = run_single(config)
@@ -137,23 +296,23 @@ class TestResolveEnvs:
             resolve_envs(env_group="classical", envs=["CartPole-v1"])
 
 
-def test_run_bc_dagger_cartpole(tmp_path):
-    """bc_dagger smoke test on CartPole."""
+def test_run_bc_iid_cartpole(tmp_path, untrained_expert):
+    """bc_iid smoke test on CartPole."""
     config = _make_config(
-        "bc_dagger",
+        "bc_iid",
         tmp_path,
         env_name="CartPole-v1",
         policy_mode="end_to_end",
         n_rounds=3,
-        samples_per_round=200,
+        samples_per_round=5,
         eval_interval=1,
     )
     result = run_single(config)
-    assert result["algo"] == "bc_dagger"
-    assert len(result["per_round"]) == 3
+    assert result["algo"] == "bc_iid"
+    assert len(result["per_round"]) == 4
     # Data budget invariant: round k has exactly k * samples_per_round obs
     for i, r in enumerate(result["per_round"]):
-        assert r["n_observations"] == (i + 1) * 200
+        assert r["n_observations"] == i * 5
     # rollout_cross_entropy populated on every eval-point round
     # (with eval_interval=1, every round is an eval point)
     for r in result["per_round"]:
@@ -251,12 +410,19 @@ def test_collect_and_subsample_preserves_transitions_type():
     dones = np.zeros(n, dtype=bool)
     infos = np.array([{} for _ in range(n)])
     trans = types.Transitions(
-        obs=obs, acts=acts, infos=infos, next_obs=next_obs, dones=dones,
+        obs=obs,
+        acts=acts,
+        infos=infos,
+        next_obs=next_obs,
+        dones=dones,
     )
 
     rng = np.random.default_rng(7)
     out = _collect_and_subsample_transitions(
-        trans, n_target=10, strategy="uniform", rng=rng,
+        trans,
+        n_target=10,
+        strategy="uniform",
+        rng=rng,
     )
 
     # Type preserved
@@ -277,18 +443,16 @@ def test_collect_and_subsample_preserves_transitions_type():
     # And prefix strategy returns the first 10
     rng2 = np.random.default_rng(7)
     prefix = _collect_and_subsample_transitions(
-        trans, n_target=10, strategy="prefix", rng=rng2,
+        trans,
+        n_target=10,
+        strategy="prefix",
+        rng=rng2,
     )
     np.testing.assert_array_equal(prefix.acts, np.arange(10))
 
 
-def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
-    """With strategy='uniform', FTL's round demos should not be the prefix.
-
-    Run FTL on CartPole with samples_per_round=50 and n_rounds=2. Inspect
-    the demo dir for round 1 and confirm the selected transitions span a
-    wider range of source timesteps than a sequential prefix would.
-    """
+def test_ftl_round_demos_retain_samples_per_round(tmp_path, untrained_expert):
+    """FTL's uniform round demos retain exactly samples_per_round transitions."""
     from imitation.data import serialize
     from imitation.experiments.ftrl.run_experiment import (
         ExperimentConfig,
@@ -301,7 +465,7 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
         seed=0,
         policy_mode="linear",
         n_rounds=2,
-        samples_per_round=50,
+        samples_per_round=5,
         l2_lambda=0.0,
         l2_decay=False,
         warm_start=True,
@@ -316,8 +480,12 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
 
     # Scratch dir is where FTL wrote the per-round demos
     round_dir = (
-        tmp_path / "results" / "scratch" / "ftl_CartPole-v1_seed0"
-        / "demos" / "round-000"
+        tmp_path
+        / "results"
+        / "scratch"
+        / "ftl_CartPole-v1_seed0"
+        / "demos"
+        / "round-000"
     )
     assert round_dir.exists(), f"Missing round_dir: {round_dir}"
     demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
@@ -325,10 +493,10 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
     total = 0
     for p in demo_paths:
         total += sum(len(t) for t in serialize.load(p))
-    assert total == 50
+    assert total == 5
 
 
-def test_ftl_with_small_bc_batch_size(tmp_path):
+def test_ftl_with_small_bc_batch_size(tmp_path, untrained_expert):
     """FTL works with samples_per_round < default BC batch_size when bc_batch_size is set.
 
     With samples_per_round=15 and bc_batch_size=15, BC's batch fits and FTL
@@ -367,8 +535,11 @@ def test_compute_val_nll_handles_empty_returns_inf():
     from imitation.experiments.ftrl.run_experiment import _compute_val_nll
     from imitation.policies.base import FeedForward32Policy
     import gymnasium as gym
+
     env = gym.make("CartPole-v1")
-    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    policy = FeedForward32Policy(
+        env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3
+    )
     val_obs = np.zeros((0, env.observation_space.shape[0]), dtype=np.float32)
     val_acts = np.zeros((0,), dtype=np.int64)
     assert _compute_val_nll(policy, val_obs, val_acts, batch_size=32) == float("inf")
@@ -379,8 +550,11 @@ def test_compute_val_nll_finite_on_nonempty():
     from imitation.experiments.ftrl.run_experiment import _compute_val_nll
     from imitation.policies.base import FeedForward32Policy
     import gymnasium as gym
+
     env = gym.make("CartPole-v1")
-    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    policy = FeedForward32Policy(
+        env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3
+    )
     val_obs = np.random.randn(64, env.observation_space.shape[0]).astype(np.float32)
     val_acts = np.random.randint(0, env.action_space.n, size=64).astype(np.int64)
     val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=32)
@@ -393,8 +567,11 @@ def test_compute_val_nll_preserves_policy_mode():
     from imitation.experiments.ftrl.run_experiment import _compute_val_nll
     from imitation.policies.base import FeedForward32Policy
     import gymnasium as gym
+
     env = gym.make("CartPole-v1")
-    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    policy = FeedForward32Policy(
+        env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3
+    )
     val_obs = np.random.randn(8, env.observation_space.shape[0]).astype(np.float32)
     val_acts = np.random.randint(0, env.action_space.n, size=8).astype(np.int64)
 
@@ -414,8 +591,11 @@ def test_compute_val_nll_handles_batch_size_larger_than_n():
     from imitation.experiments.ftrl.run_experiment import _compute_val_nll
     from imitation.policies.base import FeedForward32Policy
     import gymnasium as gym
+
     env = gym.make("CartPole-v1")
-    policy = FeedForward32Policy(env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3)
+    policy = FeedForward32Policy(
+        env.observation_space, env.action_space, lr_schedule=lambda _: 1e-3
+    )
     val_obs = np.random.randn(7, env.observation_space.shape[0]).astype(np.float32)
     val_acts = np.random.randint(0, env.action_space.n, size=7).astype(np.int64)
     val_nll = _compute_val_nll(policy, val_obs, val_acts, batch_size=64)
@@ -428,10 +608,18 @@ def test_split_transitions_for_val_deterministic_and_sized():
 
     n = 500  # large enough to avoid fallback
     train_idx_a, val_idx_a = _split_transitions_for_val(
-        n_transitions=n, seed=42, round_num=3, val_frac=0.1, min_val_size=32,
+        n_transitions=n,
+        seed=42,
+        round_num=3,
+        val_frac=0.1,
+        min_val_size=32,
     )
     train_idx_b, val_idx_b = _split_transitions_for_val(
-        n_transitions=n, seed=42, round_num=3, val_frac=0.1, min_val_size=32,
+        n_transitions=n,
+        seed=42,
+        round_num=3,
+        val_frac=0.1,
+        min_val_size=32,
     )
     np.testing.assert_array_equal(train_idx_a, train_idx_b)
     np.testing.assert_array_equal(val_idx_a, val_idx_b)
@@ -444,7 +632,11 @@ def test_split_transitions_for_val_returns_none_when_too_small():
 
     # n=100, val_frac=0.1 → n_val=10 < min_val_size=32 → fallback
     train_idx, val_idx = _split_transitions_for_val(
-        n_transitions=100, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+        n_transitions=100,
+        seed=0,
+        round_num=0,
+        val_frac=0.1,
+        min_val_size=32,
     )
     assert train_idx is None
     assert val_idx is None
@@ -456,7 +648,11 @@ def test_split_transitions_for_val_partition_no_overlap():
 
     n = 500
     train_idx, val_idx = _split_transitions_for_val(
-        n_transitions=n, seed=7, round_num=2, val_frac=0.1, min_val_size=32,
+        n_transitions=n,
+        seed=7,
+        round_num=2,
+        val_frac=0.1,
+        min_val_size=32,
     )
     assert train_idx is not None and val_idx is not None
     assert set(train_idx).isdisjoint(set(val_idx))
@@ -470,7 +666,11 @@ def test_split_transitions_for_val_boundary_equals_min_val():
 
     # n=320, val_frac=0.1, min_val=32 → n_val = floor(32.0) = 32 → split, not fallback
     train_idx, val_idx = _split_transitions_for_val(
-        n_transitions=320, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+        n_transitions=320,
+        seed=0,
+        round_num=0,
+        val_frac=0.1,
+        min_val_size=32,
     )
     assert train_idx is not None and val_idx is not None
     assert val_idx.shape[0] == 32
@@ -483,7 +683,11 @@ def test_split_transitions_for_val_boundary_one_below_min_val():
 
     # n=319, val_frac=0.1, min_val=32 → n_val = floor(31.9) = 31 → fallback
     train_idx, val_idx = _split_transitions_for_val(
-        n_transitions=319, seed=0, round_num=0, val_frac=0.1, min_val_size=32,
+        n_transitions=319,
+        seed=0,
+        round_num=0,
+        val_frac=0.1,
+        min_val_size=32,
     )
     assert train_idx is None and val_idx is None
 
@@ -543,46 +747,71 @@ def test_experiment_config_accepts_new_es_fields(tmp_path):
 def test_should_outer_early_stop_fires_on_plateau_below_ceiling():
     """Disagreement plateau below ceiling → fires."""
     from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+
     history = [0.02] * 10
-    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
-                                    disagreement_ceiling=0.05) is True
+    assert (
+        _should_outer_early_stop(
+            history, patience=5, min_delta=0.005, disagreement_ceiling=0.05
+        )
+        is True
+    )
 
 
 def test_should_outer_early_stop_blocked_above_ceiling():
     """Even with plateau, blocked by ceiling."""
     from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+
     history = [0.30] * 10
-    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
-                                    disagreement_ceiling=0.05) is False
+    assert (
+        _should_outer_early_stop(
+            history, patience=5, min_delta=0.005, disagreement_ceiling=0.05
+        )
+        is False
+    )
 
 
 def test_should_outer_early_stop_needs_2x_patience_points():
     """Doesn't fire before 2*patience points are available."""
     from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+
     history = [0.02] * 9  # less than 2*5
-    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
-                                    disagreement_ceiling=0.05) is False
+    assert (
+        _should_outer_early_stop(
+            history, patience=5, min_delta=0.005, disagreement_ceiling=0.05
+        )
+        is False
+    )
 
 
 def test_should_outer_early_stop_blocked_when_still_improving():
     """Strictly-decreasing history below ceiling should NOT fire (plateau gate)."""
     from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+
     # Strictly improving from 0.10 → 0.02 over 10 evals; all below ceiling.
     history = [0.10, 0.08, 0.07, 0.06, 0.05, 0.04, 0.04, 0.03, 0.03, 0.02]
-    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
-                                    disagreement_ceiling=0.05) is False
+    assert (
+        _should_outer_early_stop(
+            history, patience=5, min_delta=0.005, disagreement_ceiling=0.05
+        )
+        is False
+    )
 
 
 def test_should_outer_early_stop_fires_at_exact_ceiling():
     """current_mean == ceiling allows stopping (>= semantics, > comparison)."""
     from imitation.experiments.ftrl.run_experiment import _should_outer_early_stop
+
     # Flat at exactly the ceiling → plateau + current_mean == ceiling → fires.
     history = [0.05] * 10
-    assert _should_outer_early_stop(history, patience=5, min_delta=0.005,
-                                    disagreement_ceiling=0.05) is True
+    assert (
+        _should_outer_early_stop(
+            history, patience=5, min_delta=0.005, disagreement_ceiling=0.05
+        )
+        is True
+    )
 
 
-def test_inner_train_fixed_budget_records_stop_epoch(tmp_path):
+def test_inner_train_fixed_budget_records_stop_epoch(tmp_path, untrained_expert):
     """With inner_early_stop=False, each per-round dict records stop_epoch == bc_n_epochs."""
     config = _make_config(
         "bc",
@@ -595,11 +824,13 @@ def test_inner_train_fixed_budget_records_stop_epoch(tmp_path):
     result = run_single(config)
     assert len(result["per_round"]) >= 1
     for m in result["per_round"]:
-        assert m.get("inner_es_stop_epoch") == 3, f"Expected stop_epoch=3, got {m.get('inner_es_stop_epoch')}"
+        assert (
+            m.get("inner_es_stop_epoch") == 3
+        ), f"Expected stop_epoch=3, got {m.get('inner_es_stop_epoch')}"
         assert m.get("inner_es_fallback") in (None, "")
 
 
-def test_inner_train_early_stop_records_stop_epoch(tmp_path):
+def test_inner_train_early_stop_records_stop_epoch(tmp_path, untrained_expert):
     """With inner_early_stop=True and a large enough dataset, BC fixed records
     inner_es_stop_epoch <= bc_n_epochs and a non-empty val NLL trajectory.
     """
@@ -608,6 +839,7 @@ def test_inner_train_early_stop_records_stop_epoch(tmp_path):
         tmp_path,
         bc_n_epochs=20,
         n_rounds=2,
+        samples_per_round=300,  # fixed BC: 600 transitions, a 60-row val split
         inner_early_stop=True,
         inner_early_stop_patience=3,
         inner_early_stop_min_epochs=2,
@@ -627,7 +859,7 @@ def test_inner_train_early_stop_records_stop_epoch(tmp_path):
         assert len(traj) == stop_ep
 
 
-def test_inner_train_fallback_on_small_dataset(tmp_path):
+def test_inner_train_fallback_on_small_dataset(tmp_path, untrained_expert):
     """With val_frac × |D| < min_val_size, falls back to fixed budget and
     logs inner_es_fallback="dataset_too_small".
     """
@@ -659,6 +891,7 @@ def test_is_already_done_resume_is_n_rounds_aware(tmp_path):
     from imitation.experiments.ftrl.run_experiment import (
         _is_already_done,
         _result_path,
+        _config_metadata,
     )
 
     cfg20 = _make_config("ftl", tmp_path, n_rounds=20, samples_per_round=1)
@@ -672,11 +905,7 @@ def test_is_already_done_resume_is_n_rounds_aware(tmp_path):
     with open(out, "w") as f:
         json.dump(
             {
-                "config": {
-                    "samples_per_round": cfg20.samples_per_round,
-                    "n_rounds": cfg20.n_rounds,
-                    "eval_interval": cfg20.eval_interval,
-                },
+                "config": _config_metadata(cfg20),
                 "per_round": [],
             },
             f,
@@ -684,6 +913,13 @@ def test_is_already_done_resume_is_n_rounds_aware(tmp_path):
 
     # Same n_rounds → resume (skip).
     assert _is_already_done(cfg20) is True
+
+    stored = json.loads(out.read_text())
+    legacy = json.loads(out.read_text())
+    legacy["config"].pop("protocol_version")
+    out.write_text(json.dumps(legacy))
+    assert _is_already_done(cfg20) is False
+    out.write_text(json.dumps(stored))
 
     # Higher n_rounds at the same (algo, env, seed) path → re-run (extend).
     cfg200 = _make_config("ftl", tmp_path, n_rounds=200, samples_per_round=1)

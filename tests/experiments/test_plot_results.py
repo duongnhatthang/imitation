@@ -4,6 +4,7 @@ import json
 import pathlib
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from imitation.experiments.ftrl.plot_results import (
@@ -151,26 +152,27 @@ def test_compute_cumulative_loss(tmp_path):
     assert all(cum[i] <= cum[i + 1] for i in range(len(cum) - 1))
 
 
-def test_compute_cumulative_regret(tmp_path):
-    """Cumulative regret is non-negative (best algo has regret=0)."""
-    results_dir = tmp_path / "results"
-    _populate_results(results_dir, seeds=2)
-
-    df = load_results(results_dir)
-    df = compute_cumulative_loss(df)
-    df = compute_cumulative_regret(df)
-
-    assert "cum_regret" in df.columns
-    # At each (env, seed, round), at least one algo should have regret ~0
-    for (env, seed, rnd), group in df.groupby(["env", "seed", "round"]):
-        min_regret = group["cum_regret"].min()
-        assert min_regret == pytest.approx(0.0, abs=1e-10)
+def test_compute_cumulative_regret():
+    """Cumulative excess CE subtracts expert CE at logged evaluation points."""
+    df = pd.DataFrame(
+        {
+            "algo": ["bc_iid"] * 4,
+            "env": ["CartPole-v1"] * 4,
+            "seed": [0] * 4,
+            "round": [0, 1, 2, 3],
+            "rollout_cross_entropy": [1.0, None, 0.5, 0.2],
+            "expert_rollout_cross_entropy": [0.1, None, 0.2, 0.3],
+        }
+    )
+    result = compute_cumulative_regret(compute_cumulative_loss(df))
+    np.testing.assert_allclose(result["cum_regret"], [0.9, np.nan, 1.2, 1.1])
 
 
 def test_plot_env(tmp_path):
     """plot_env generates a PNG file with 4 subplots."""
     results_dir = tmp_path / "results"
     _populate_results(results_dir, envs=["CartPole-v1"], seeds=2)
+    _write_fake_result(results_dir, "bc_iid", "CartPole-v1", 0)
 
     df = load_results(results_dir)
     df = compute_cumulative_loss(df)
@@ -181,6 +183,15 @@ def test_plot_env(tmp_path):
 
     assert out_path.exists()
     assert out_path.stat().st_size > 1000  # non-trivial PNG
+
+
+def test_plot_all_flat_output(tmp_path):
+    results_dir = tmp_path / "data"
+    _populate_results(results_dir, envs=["CartPole-v1"], seeds=1)
+    output = tmp_path / "plots" / "classical" / "learning_curves"
+    paths = plot_all(results_dir, output, flat_output=True)
+    assert paths == [output / "CartPole-v1.png"]
+    assert paths[0].is_file()
 
 
 def test_plot_all(tmp_path):

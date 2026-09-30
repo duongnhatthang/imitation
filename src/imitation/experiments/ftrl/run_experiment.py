@@ -12,12 +12,14 @@ import argparse
 import copy
 import dataclasses
 import gc
+import hashlib
 import json
 import logging
 import math
 import multiprocessing
 import os
 import pathlib
+import random
 import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -33,7 +35,66 @@ from imitation.util import logger as imit_logger
 
 logger = logging.getLogger(__name__)
 
-ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_dagger"]
+ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_iid", "bc_prefix", "bc_pool"]
+DEFAULT_ALGOS = ["ftl", "ftrl", "bc", "bc_iid"]
+
+# Algorithms that collect fresh expert-labeled rollouts each round.
+INTERACTIVE_ALGOS = ("ftl", "ftrl", "bc_iid")
+# BC baselines that replay a fixed offline expert dataset one round at a time
+# through the same trainer as bc_iid, so only the data differs:
+#   bc_prefix - round t trains on the first t transitions of the chronological
+#               dataset (identical to fixed BC's dataset, consumed in order)
+#   bc_pool   - round t trains on t uniform draws from that same fixed pool
+#               (this is the behavior of the removed ``bc_dagger``)
+OFFLINE_BC_ALGOS = ("bc_prefix", "bc_pool")
+# Everything that runs the shared round loop in ``_run_dagger_variant``.
+ROUND_LOOP_ALGOS = INTERACTIVE_ALGOS + OFFLINE_BC_ALGOS
+
+# The expert is cached per environment and reused by every cell, so training it
+# must not depend on which cell happened to miss the cache first. Pinning this
+# keeps a fresh expert_cache reproducible; an existing cache is unaffected.
+EXPERT_TRAINING_SEED = 0
+
+
+def _seed_everything(seed: int) -> None:
+    """Seed every global RNG a cell can reach.
+
+    ``run_single`` seeds its own ``np.random.Generator`` and torch; this also
+    pins Python's ``random`` and numpy's legacy global RNG, which SB3 and the
+    gymnasium wrappers still use, so rerunning the same (env, algo, seed) with
+    the same code reproduces the same result.
+    """
+    random.seed(seed)
+    np.random.seed(int(seed) % (2**32))
+    th.manual_seed(seed)
+    if th.cuda.is_available():
+        th.cuda.manual_seed_all(seed)
+
+
+def _config_metadata(config):
+    """Record every experiment setting and the actual uncommitted source version."""
+    settings = dataclasses.asdict(config)
+    for key in ("output_dir", "expert_cache_dir"):
+        settings[key] = str(settings[key])
+    settings["protocol_version"] = 5
+    digest = hashlib.sha256()
+    for name in (
+        "run_experiment.py",
+        "expert_dataset.py",
+        "eval_utils.py",
+        "policy_utils.py",
+    ):
+        digest.update(pathlib.Path(__file__).with_name(name).read_bytes())
+    package_root = pathlib.Path(__file__).parents[2]
+    for rel in (
+        "algorithms/ftrl.py",
+        "algorithms/dagger.py",
+        "algorithms/bc.py",
+        "data/rollout.py",
+    ):
+        digest.update((package_root / rel).read_bytes())
+    settings["implementation_sha256"] = digest.hexdigest()
+    return settings
 
 
 def _free_memory() -> None:
@@ -127,8 +188,37 @@ class ExperimentConfig:
     # `_split_transitions_for_val`).
     inner_early_stop_min_val_size: int = 32
     inner_early_stop_min_epochs: int = 3
-    subsample_strategy: str = "uniform"  # "uniform" or "prefix"
+    # None selects the algorithm default: temporal BC, uniform interactive data.
+    subsample_strategy: Optional[str] = None
+    trajectories_per_round: int = (
+        1  # minimum complete rollouts, independent of training batches
+    )
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
+
+    def __post_init__(self) -> None:
+        if self.beta_rampdown < 0:
+            raise ValueError("beta_rampdown must be non-negative")
+        if self.subsample_strategy is None:
+            self.subsample_strategy = (
+                "prefix" if self.algo in ("bc", "bc_prefix") else "uniform"
+            )
+        if self.subsample_strategy not in ("uniform", "prefix"):
+            raise ValueError("subsample_strategy must be 'uniform' or 'prefix'")
+        if self.algo in ("bc_iid", "bc_pool") and self.subsample_strategy != "uniform":
+            raise ValueError(f"{self.algo} requires uniform sampling")
+        if self.algo == "bc_prefix" and self.subsample_strategy != "prefix":
+            raise ValueError("bc_prefix requires prefix sampling")
+        if self.trajectories_per_round < 1 or self.samples_per_round < 1:
+            raise ValueError(
+                "trajectories_per_round and samples_per_round must be positive"
+            )
+        # Within-round independence: the m samples retained in a round must come
+        # from m *distinct* trajectories, so a round never collects fewer
+        # complete episodes than the samples it keeps. At m = 1 this is a no-op.
+        if self.algo in INTERACTIVE_ALGOS:
+            self.trajectories_per_round = max(
+                self.trajectories_per_round, self.samples_per_round
+            )
 
 
 def _compute_round_eval(
@@ -175,6 +265,7 @@ def _compute_round_eval(
         "normalized_return": round(float(norm_ret), 6),
         "disagreement_rate": round(float(eval_res.current_round_disagreement), 6),
         "d_eval_size": int(obs.shape[0]),
+        "episode_returns": [float(value) for value in eval_res.episode_returns],
     }
 
 
@@ -241,7 +332,7 @@ def _inner_train(
     For ``inner_early_stop=False`` (this task) runs the underlying BC training
     once with ``n_epochs=config.bc_n_epochs``. For DAgger callers this routes
     through ``extend_and_update`` so the round counter advances and demos
-    aggregate; for BC / BC-DAgger callers it calls ``bc_trainer.train`` directly.
+    aggregate; fixed BC calls ``bc_trainer.train`` directly.
 
     The val-split early-stop branch lands in Task 7.
 
@@ -343,6 +434,10 @@ def _inner_train(
         val_acts = np.stack([t["acts"] for t in val_subset])
 
     # 5. Re-bind BC trainer to train-only.
+    original_batch_size = bc_trainer.batch_size
+    original_minibatch_size = bc_trainer.minibatch_size
+    if len(train_subset) < original_minibatch_size:
+        bc_trainer.batch_size = bc_trainer.minibatch_size = len(train_subset)
     bc_trainer.set_demonstrations(train_subset)
 
     # 6. Loop epochs with val-NLL early stop.
@@ -381,10 +476,9 @@ def _inner_train(
     if best_state is not None:
         bc_trainer.policy.load_state_dict(best_state)
 
-    # 8. Defensive: restore the full data loader so any downstream code that
-    #    consults it (currently none in this branch — both DAgger's next
-    #    extend_and_update and bc_dagger's fresh bc_trainer rebuild it from
-    #    scratch — but kept for forward compatibility).
+    # 8. Restore the full data loader for subsequent training and diagnostics.
+    bc_trainer.batch_size = original_batch_size
+    bc_trainer.minibatch_size = original_minibatch_size
     bc_trainer.set_demonstrations(full_transitions)
 
     # 9. For DAgger callers, append per-round metrics now that training is
@@ -452,13 +546,30 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         Results dict with per-round metrics.
     """
     start_time = time.time()
+    _seed_everything(config.seed)
     rng = np.random.default_rng(config.seed)
 
     # Device selection: classical MDPs use CPU (tiny networks, GPU adds overhead).
     # Atari uses the worker's assigned GPU if available, else CPU.
     use_gpu = env_utils.is_atari(config.env_name) and _WORKER_GPU_ID is not None
-    if not use_gpu and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # Recorded in the result JSON: "which device did this cell actually run on"
+    # should be answerable from the artifacts, not from process archaeology. It
+    # is also passed explicitly to every trainer below, because "auto" is not
+    # safe here: SB3's get_device("auto") returns cuda whenever CUDA is merely
+    # *available*, and a CPU-only cell would then put its 4x2 linear policy on a
+    # GPU and train it at batch size 1 -- several times slower than the CPU, and
+    # with every worker piling onto the same card.
+    # CUDA_VISIBLE_DEVICES is deliberately left alone: CUDA may already be
+    # initialized in this process, and changing visibility afterwards makes
+    # torch report devices it then refuses to deserialize onto.
+    device_used = f"cuda:{_WORKER_GPU_ID}" if use_gpu else "cpu"
+    logger.info(
+        "%s/%s/seed%s on %s",
+        config.algo,
+        config.env_name,
+        config.seed,
+        device_used,
+    )
 
     # Create env
     if env_utils.is_atari(config.env_name):
@@ -483,8 +594,11 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         config.env_name,
         venv,
         cache_dir=config.expert_cache_dir,
-        rng=rng,
-        seed=config.seed,
+        # A pinned seed and a dedicated stream: the expert is shared across all
+        # cells, so it must not depend on which cell missed the cache first,
+        # and a cache miss must not perturb this cell's own RNG stream.
+        rng=np.random.default_rng(EXPERT_TRAINING_SEED),
+        seed=EXPERT_TRAINING_SEED,
     )
 
     # Seed torch's global RNG AFTER loading the expert. ``PPO.load`` resets
@@ -526,40 +640,33 @@ def run_single(config: ExperimentConfig) -> Dict[str, Any]:
         "algo": config.algo,
         "env": config.env_name,
         "seed": config.seed,
+        "device": device_used,
         "policy_mode": config.policy_mode,
-        "config": {
-            "l2_lambda": config.l2_lambda,
-            "l2_decay": config.l2_decay,
-            "n_rounds": config.n_rounds,
-            "samples_per_round": config.samples_per_round,
-            "eval_interval": config.eval_interval,
-            "warm_start": config.warm_start,
-            "beta_rampdown": config.beta_rampdown,
-            "bc_n_epochs": config.bc_n_epochs,
-            "learning_rate": config.learning_rate,
-        },
+        "config": _config_metadata(config),
         "baselines": baselines,
         "per_round": [],
     }
 
-    if config.algo in ("ftl", "ftrl"):
+    if config.algo in ROUND_LOOP_ALGOS:
         result["per_round"] = _run_dagger_variant(
             config,
             venv,
             expert_policy,
             rng,
             baselines,
+            device=device_used,
         )
     elif config.algo == "bc":
-        result["per_round"] = _run_bc(config, venv, expert_policy, rng, baselines)
-    elif config.algo == "bc_dagger":
-        result["per_round"] = _run_bc_dagger(
-            config, venv, expert_policy, rng, baselines
+        result["per_round"] = _run_bc(
+            config, venv, expert_policy, rng, baselines, device=device_used
         )
     else:
         raise ValueError(f"Unknown algo: {config.algo}")
 
     elapsed = time.time() - start_time
+    if hasattr(config, "_expert_dataset_source"):
+        result["expert_dataset"] = config._expert_dataset_source
+
     result["elapsed_seconds"] = round(elapsed, 1)
 
     # Save result
@@ -577,7 +684,8 @@ def _truncate_trajectory(traj: types.Trajectory, n: int) -> types.Trajectory:
     """Return the first ``n`` transitions of ``traj`` as a new Trajectory.
 
     Mid-episode cut => terminal=False. Used to make each DAgger round contribute
-    exactly samples_per_round expert labels, matching BC / BC (growing dataset) bookkeeping.
+    exactly samples_per_round expert labels, matching the other baselines'
+    observation budgets.
     """
     assert 0 < n < len(traj), (n, len(traj))
     new_infos = None if traj.infos is None else traj.infos[:n]
@@ -606,7 +714,7 @@ def _truncate_round_demos(
 
     Keeps whole saved trajectories while their cumulative length <= n_target,
     then cuts the next trajectory mid-episode to fill the remainder. Matches
-    BC / BC (growing dataset) which slice upfront-collected transitions to an exact N.
+    fixed BC, which slices upfront-collected transitions to an exact N.
     """
     # Demos are saved as HuggingFace dataset directories (suffix is still .npz).
     demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
@@ -641,66 +749,131 @@ def _truncate_round_demos(
         _save_dagger_demo(traj, idx, round_dir, rng, prefix="truncated")
 
 
+def _single_step_traj(flat, k: int) -> types.Trajectory:
+    """Wrap transition ``k`` of a flattened batch as a 1-step pseudo-trajectory.
+
+    ``obs = [obs_k, next_obs_k]``, ``acts = [act_k]``, ``terminal = False`` -- the
+    shape ``_save_dagger_demo`` writes and the FTRL trainer's loader expects.
+    """
+    obs_arr = flat.obs
+    next_obs_arr = flat.next_obs
+    acts_arr = flat.acts
+    infos_arr = getattr(flat, "infos", None)
+    # Some Transition implementations expose rews when available.
+    rews_arr = getattr(flat, "rews", None)
+
+    pair_obs = np.stack([obs_arr[k], next_obs_arr[k]], axis=0)
+    info = None if infos_arr is None else np.array([infos_arr[k]])
+    if rews_arr is not None:
+        return types.TrajectoryWithRew(
+            obs=pair_obs,
+            acts=np.array([acts_arr[k]]),
+            infos=info,
+            rews=np.array([rews_arr[k]], dtype=np.float32),
+            terminal=False,
+        )
+    return types.Trajectory(
+        obs=pair_obs,
+        acts=np.array([acts_arr[k]]),
+        infos=info,
+        terminal=False,
+    )
+
+
 def _uniform_round_demos(
-    round_dir: pathlib.Path, n_target: int, rng: np.random.Generator
+    round_dir: pathlib.Path,
+    n_target: int,
+    rng: np.random.Generator,
+    per_trajectory: bool = True,
 ) -> None:
-    """Rewrite ``round_dir`` to contain exactly ``n_target`` transitions
-    sampled uniformly without replacement from the flattened pool.
+    """Rewrite ``round_dir`` to hold exactly ``n_target`` retained transitions.
+
+    With ``per_trajectory=True`` (the default) the *trajectory* is the sampling
+    unit: ``n_target`` distinct trajectories are drawn uniformly without
+    replacement from the round's rollouts, and exactly one state is then drawn
+    uniformly at random from each. Each retained sample is therefore drawn by
+    picking an episode and then a uniform time step within that episode: an
+    independent draw (within the round's fixed-policy batch) from the
+    episode-normalized state distribution, rather than one of ``m`` draws from
+    a pool in which a single long trajectory can dominate. With fixed episode
+    lengths this equals uniform fixed-horizon occupancy sampling; when lengths
+    differ it need not equal transition-weighted visitation, since each episode
+    gets equal mass regardless of its length.
+    ``ExperimentConfig.__post_init__`` raises ``trajectories_per_round`` to
+    ``samples_per_round`` so enough trajectories are always available.
+
+    With ``per_trajectory=False`` the previous behavior is used: every
+    transition of the round is pooled and ``n_target`` are drawn uniformly from
+    that pool, so several retained samples may share a trajectory.
+
+    When the round collected exactly ``n_target`` trajectories there is nothing
+    to choose between them, so no draw is taken from ``rng``. At ``m = 1`` with
+    one trajectory per round, given identical inputs, this helper's output and
+    RNG consumption are bit-for-bit identical to the pooled version. That claim
+    covers this helper only; it does not imply that whole earlier campaigns
+    reproduce under other protocol changes.
 
     Each selected transition is written as a 1-step pseudo-trajectory with
-    ``terminal=False``, preserving the HF-dataset format the FTRL trainer
-    reads (see ``_save_dagger_demo``).
+    ``terminal=False``, preserving the HuggingFace-dataset format the FTRL
+    trainer reads (see ``_save_dagger_demo``).
     """
     demo_paths = sorted(p for p in round_dir.iterdir() if p.name.endswith(".npz"))
     trajs: List[types.Trajectory] = []
     for p in demo_paths:
         trajs.extend(serialize.load(p))
 
-    all_flat = rollout.flatten_trajectories(trajs)
-    if len(all_flat) < n_target:
-        raise RuntimeError(
-            f"Round at {round_dir}: collected {len(all_flat)} "
-            f"transitions, need {n_target}"
-        )
-
-    idx = rng.choice(len(all_flat), size=n_target, replace=False)
-    idx.sort()
-
-    # Build n_target single-step trajectories. Each has obs=[obs, next_obs],
-    # acts=[act], infos=None, terminal=False.
     selected: List[types.Trajectory] = []
-    obs_arr = all_flat.obs
-    next_obs_arr = all_flat.next_obs
-    acts_arr = all_flat.acts
-    infos_arr = all_flat.infos
-    # Some Transition implementations expose rews when available.
-    rews_arr = getattr(all_flat, "rews", None)
-
-    for k in idx:
-        pair_obs = np.stack([obs_arr[k], next_obs_arr[k]], axis=0)
-        info = None if infos_arr is None else np.array([infos_arr[k]])
-        if rews_arr is not None:
-            traj = types.TrajectoryWithRew(
-                obs=pair_obs,
-                acts=np.array([acts_arr[k]]),
-                infos=info,
-                rews=np.array([rews_arr[k]], dtype=np.float32),
-                terminal=False,
+    if per_trajectory:
+        if len(trajs) < n_target:
+            raise RuntimeError(
+                f"Round at {round_dir}: collected {len(trajs)} trajectories, "
+                f"need {n_target} for one-sample-per-trajectory sampling"
             )
+        if len(trajs) == n_target:
+            # Nothing to choose: leave the RNG stream untouched so the m = 1
+            # path stays bit-compatible with the previous pooled sampling.
+            traj_idx = list(range(len(trajs)))
         else:
-            traj = types.Trajectory(
-                obs=pair_obs,
-                acts=np.array([acts_arr[k]]),
-                infos=info,
-                terminal=False,
+            traj_idx = sorted(
+                int(t) for t in rng.choice(len(trajs), size=n_target, replace=False)
             )
-        selected.append(traj)
+        for t in traj_idx:
+            flat = rollout.flatten_trajectories([trajs[int(t)]])
+            k = rng.choice(len(flat), size=1, replace=False)
+            selected.append(_single_step_traj(flat, int(k[0])))
+    else:
+        all_flat = rollout.flatten_trajectories(trajs)
+        if len(all_flat) < n_target:
+            raise RuntimeError(
+                f"Round at {round_dir}: collected {len(all_flat)} "
+                f"transitions, need {n_target}"
+            )
+        idx = rng.choice(len(all_flat), size=n_target, replace=False)
+        idx.sort()
+        selected = [_single_step_traj(all_flat, int(k)) for k in idx]
 
     # Wipe the round dir and rewrite with the sampled pseudo-trajectories.
     for p in demo_paths:
         shutil.rmtree(p) if p.is_dir() else p.unlink()
     for j, traj in enumerate(selected):
         _save_dagger_demo(traj, j, round_dir, rng, prefix="uniform")
+
+
+def _save_offline_round_demos(
+    transitions, round_dir: pathlib.Path, rng: np.random.Generator
+) -> None:
+    """Write a slice of a fixed offline dataset as this round's demos.
+
+    Used by ``bc_prefix`` and ``bc_pool``, which collect nothing. Writing them in
+    exactly the format ``_uniform_round_demos`` produces means the trainer, the
+    aggregation and the coverage visualisation treat offline and interactive
+    rounds identically, so the only difference between those baselines and
+    ``bc_iid`` is which transition arrives at round t.
+    """
+    for j in range(len(transitions)):
+        _save_dagger_demo(
+            _single_step_traj(transitions, j), j, round_dir, rng, prefix="offline"
+        )
 
 
 def _save_transitions_as_demos(transitions, scratch_dir, round_num, rng):
@@ -733,15 +906,33 @@ def _save_transitions_as_demos(transitions, scratch_dir, round_num, rng):
     _save_dagger_demo(traj, 0, demo_dir, rng)
 
 
+def _learner_only_beta(round_num: int) -> float:
+    """Keep the learner in control from the first collection round."""
+    return 0.0
+
+
 def _run_dagger_variant(
     config: ExperimentConfig,
     venv,
     expert_policy,
     rng: np.random.Generator,
     baselines: Dict[str, float],
+    device: str = "cpu",
 ) -> List[Dict[str, Any]]:
-    """Run FTL or FTRL (DAgger variants)."""
-    from imitation.algorithms.dagger import LinearBetaSchedule
+    """Run FTL, FTRL, BC-iid, BC-prefix or BC-pool on shared mechanics.
+
+    Every algorithm routed here uses the same configurable FTRL trainer, the
+    same aggregation of retained round samples and the same on-policy
+    evaluation. They differ only in where round t's transitions come from:
+
+    * ``ftl`` / ``ftrl`` use learner control by default. An explicit positive
+      beta rampdown enables initial expert mixing.
+    * ``bc_iid`` holds beta = 1, so every round is a fresh expert episode, and
+      retains one uniformly random state from each.
+    * ``bc_prefix`` / ``bc_pool`` collect nothing at all: they replay a fixed
+      offline expert dataset, in chronological order or in uniform draws.
+    """
+    from imitation.algorithms.dagger import ExponentialBetaSchedule, LinearBetaSchedule
 
     # Create policy
     if config.policy_mode == "linear":
@@ -755,7 +946,7 @@ def _run_dagger_variant(
         use_trainable_params_loss = False
 
     # L2 schedule
-    if config.algo == "ftl":
+    if config.algo in ("ftl", "bc_iid") + OFFLINE_BC_ALGOS:
         l2_schedule = ftrl.ConstantL2Schedule(0.0)
     elif config.l2_decay:
         l2_schedule = ftrl.DecayingL2Schedule(config.l2_lambda)
@@ -788,6 +979,7 @@ def _run_dagger_variant(
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
         batch_size=initial_batch_size,
+        device=device,
     )
 
     # Create scratch dir for this run. Clear any stale contents from a
@@ -807,7 +999,18 @@ def _run_dagger_variant(
         warm_start=config.warm_start,
         track_per_round_loss=True,
         use_trainable_params_loss=use_trainable_params_loss,
-        beta_schedule=LinearBetaSchedule(config.beta_rampdown),
+        # beta = 1 keeps the expert in control of collection, which is what
+        # makes bc_iid's states draws from d^{pi^E}. The offline baselines never
+        # roll out, so their schedule is inert and only set for consistency.
+        beta_schedule=(
+            (
+                LinearBetaSchedule(config.beta_rampdown)
+                if config.beta_rampdown > 0
+                else _learner_only_beta
+            )
+            if config.algo in ("ftl", "ftrl")
+            else ExponentialBetaSchedule(1.0)
+        ),
         custom_logger=custom_logger,
     )
 
@@ -821,6 +1024,7 @@ def _run_dagger_variant(
         venv,
         baselines,
     )
+    round0_eval["checkpoint"] = _save_policy(config, policy, 0)
     disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
         {
@@ -833,10 +1037,67 @@ def _run_dagger_variant(
         }
     )
 
+    # The offline BC baselines replay a fixed dataset instead of collecting.
+    # With ``subsample_strategy='prefix'`` this is byte-for-byte the artifact
+    # fixed BC uses, so bc_prefix at round t trains on exactly fixed BC's first
+    # t transitions.
+    offline_data = None
+    offline_collection_steps = 0
+    if config.algo in OFFLINE_BC_ALGOS:
+        offline_data = _shared_expert_data(config, venv, expert_policy)
+        budget = config.n_rounds * config.samples_per_round
+        if len(offline_data) < budget:
+            raise RuntimeError(
+                f"{config.algo}: offline dataset has {len(offline_data)} "
+                f"transitions but the run needs {budget}"
+            )
+        source = getattr(config, "_expert_dataset_source", None) or {}
+        offline_collection_steps = int(source.get("collection_steps", 0) or 0)
+
     cum_obs = 0
+    collection_steps = 0
     stopped_early = False
     for round_num in range(1, config.n_rounds + 1):
-        # --- 1. Eval current policy BEFORE collecting new training data ---
+        if offline_data is not None:
+            # --- Replay this round's slice of the fixed offline dataset ---
+            lo = (round_num - 1) * config.samples_per_round
+            round_dir = trainer._demo_dir_path_for_round()
+            round_dir.mkdir(parents=True, exist_ok=True)
+            _save_offline_round_demos(
+                offline_data[lo : lo + config.samples_per_round], round_dir, rng
+            )
+            collected = []
+            # The whole dataset was collected up front, so the expert-interaction
+            # cost is a constant, not something that grows with the round.
+            collection_steps = offline_collection_steps
+        else:
+            # --- Collect expert-labeled rollouts for this round ---
+            collector = trainer.create_trajectory_collector()
+            sample_until = rollout.make_sample_until(
+                min_timesteps=config.samples_per_round,
+                min_episodes=config.trajectories_per_round,
+            )
+            collected = rollout.generate_trajectories(
+                policy=expert_policy,
+                venv=collector,
+                sample_until=sample_until,
+                deterministic_policy=True,
+                rng=collector.rng,
+            )
+            collected_steps = sum(len(traj) for traj in collected)
+            collection_steps += collected_steps
+
+            round_dir = trainer._demo_dir_path_for_round()
+            if config.subsample_strategy == "uniform":
+                _uniform_round_demos(round_dir, config.samples_per_round, rng)
+            else:
+                _truncate_round_demos(round_dir, config.samples_per_round, rng)
+
+        # --- Train on all accumulated demos ---
+        inner_log = _inner_train(trainer, config, round_num=round_num, is_dagger=True)
+        cum_obs += config.samples_per_round
+
+        # --- Evaluate the policy at the reported training budget ---
         is_first = round_num == 1
         is_interval = round_num % config.eval_interval == 0
         is_final = round_num == config.n_rounds
@@ -866,35 +1127,14 @@ def _run_dagger_variant(
                     f"{config.outer_early_stop_patience} eval points)"
                 )
 
-        # --- 2. Collect expert demos for this round ---
-        collector = trainer.create_trajectory_collector()
-        sample_until = rollout.make_sample_until(
-            min_timesteps=max(config.samples_per_round, trainer.batch_size),
-            min_episodes=1,
-        )
-        rollout.generate_trajectories(
-            policy=expert_policy,
-            venv=collector,
-            sample_until=sample_until,
-            deterministic_policy=True,
-            rng=collector.rng,
-        )
-
-        round_dir = trainer._demo_dir_path_for_round()
-        if config.subsample_strategy == "uniform":
-            _uniform_round_demos(round_dir, config.samples_per_round, rng)
-        else:
-            _truncate_round_demos(round_dir, config.samples_per_round, rng)
-
-        # --- 3. Train on all accumulated demos ---
-        inner_log = _inner_train(trainer, config, round_num=round_num, is_dagger=True)
-        cum_obs += config.samples_per_round
-
         metrics = list(trainer.get_metrics())
         m = metrics[-1]
         round_data: Dict[str, Any] = {
             "round": round_num,
             "n_observations": cum_obs,
+            "collection_steps": collection_steps,
+            "collection_expert_queries": collection_steps,
+            "trajectories_collected_this_round": len(collected),
             "train_cross_entropy": round(m.cross_entropy, 6),
             "l2_norm": round(m.l2_norm, 6),
             "total_loss": round(m.total_loss, 6),
@@ -908,6 +1148,9 @@ def _run_dagger_variant(
 
         if eval_data is not None:
             round_data.update(eval_data)
+            round_data["checkpoint"] = _save_policy(
+                config, bc_trainer.policy, round_num
+            )
 
         per_round.append(round_data)
         if stopped_early:
@@ -939,7 +1182,6 @@ def _collect_and_subsample_transitions(
                 f"pool has {len(all_transitions)}"
             )
         idx = rng.choice(len(all_transitions), size=n_target, replace=False)
-        idx.sort()  # stable order for reproducibility across backends
         if isinstance(all_transitions, types.TransitionsMinimal):
             # Build a new Transitions(-like) dataclass with each numpy field
             # gathered by the index array. ``__getitem__`` only supports
@@ -953,12 +1195,107 @@ def _collect_and_subsample_transitions(
     raise ValueError(f"Unknown subsample strategy: {strategy!r}")
 
 
+def _save_policy(config, policy, round_num):
+    """Retain evaluated policies so recovery tests do not require retraining."""
+    name = config.result_name_override or config.algo
+    path = (
+        config.output_dir
+        / "checkpoints"
+        / f"{name}_{config.env_name.replace('/', '_')}_seed{config.seed}"
+        / f"round-{round_num:05d}.pt"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    policy.save(path)
+    return str(path)
+
+
+def _shared_expert_data(config, venv, expert_policy):
+    """Cache fixed BC data with its sampling strategy and expert provenance."""
+    from imitation.experiments.ftrl import expert_dataset
+
+    budget = config.n_rounds * config.samples_per_round
+    metadata = dict(
+        version=5,
+        env=config.env_name,
+        seed=config.seed,
+        budget=budget,
+        strategy=config.subsample_strategy,
+        expert=expert_dataset.policy_digest(expert_policy),
+    )
+
+    canonical_pool = None
+    pool_source = None
+    if config.algo == "bc_pool":
+        pool_config = dataclasses.replace(
+            config, algo="bc", subsample_strategy="prefix"
+        )
+        canonical_pool = _shared_expert_data(pool_config, venv, expert_policy)
+        pool_source = pool_config._expert_dataset_source
+        metadata["pool_sha256"] = pool_source["sha256"]
+
+    def collect():
+        data_rng = np.random.default_rng(config.seed)
+        if canonical_pool is not None:
+            selected = _collect_and_subsample_transitions(
+                canonical_pool, budget, "uniform", data_rng
+            )
+            return selected, {
+                "collection_steps": pool_source["collection_steps"],
+                "trajectories_collected": pool_source["trajectories_collected"],
+            }
+        # A fresh environment makes collection independent of baseline evaluation
+        # and Atari life-reset wrapper state in the worker's training environment.
+        if env_utils.is_atari(config.env_name):
+            from stable_baselines3.common.vec_env import VecTransposeImage
+            from imitation.experiments.ftrl.atari_utils import make_atari_venv
+
+            data_env = VecTransposeImage(
+                make_atari_venv(config.env_name, n_envs=1, seed=config.seed)
+            )
+        else:
+            data_env = env_utils.make_env(config.env_name, n_envs=1, rng=data_rng)
+        try:
+            trajectories = rollout.generate_trajectories(
+                policy=expert_policy,
+                venv=data_env,
+                sample_until=rollout.make_sample_until(
+                    min_timesteps=budget, min_episodes=1
+                ),
+                deterministic_policy=True,
+                rng=data_rng,
+                shuffle=config.subsample_strategy != "prefix",
+            )
+        finally:
+            data_env.close()
+        selected = _collect_and_subsample_transitions(
+            rollout.flatten_trajectories(list(trajectories)),
+            budget,
+            config.subsample_strategy,
+            data_rng,
+        )
+        return selected, {
+            "collection_steps": sum(len(traj) for traj in trajectories),
+            "trajectories_collected": len(trajectories),
+        }
+
+    data, source = expert_dataset.load_or_collect(
+        config.output_dir / "expert_datasets",
+        metadata,
+        collect,
+    )
+    config._expert_dataset_source = source
+    # Collection cache hits and misses must leave evaluation in the same RNG state.
+    venv.seed(config.seed + 100000)
+    return data
+
+
 def _run_bc(
     config: ExperimentConfig,
     venv,
     expert_policy,
     rng: np.random.Generator,
     baselines: Dict[str, float],
+    device: str = "cpu",
 ) -> List[Dict[str, Any]]:
     """Fixed BC baseline: train once on the full expert dataset.
 
@@ -974,24 +1311,7 @@ def _run_bc(
             venv.observation_space, venv.action_space
         )
 
-    sample_until = rollout.make_sample_until(
-        min_timesteps=total_timesteps, min_episodes=1
-    )
-    trajs = rollout.generate_trajectories(
-        policy=expert_policy,
-        venv=venv,
-        sample_until=sample_until,
-        deterministic_policy=True,
-        rng=rng,
-    )
-    all_transitions = rollout.flatten_trajectories(list(trajs))
-    if len(all_transitions) > total_timesteps:
-        all_transitions = _collect_and_subsample_transitions(
-            all_transitions,
-            n_target=total_timesteps,
-            strategy=config.subsample_strategy,
-            rng=rng,
-        )
+    all_transitions = _shared_expert_data(config, venv, expert_policy)
 
     bc_scratch = (
         config.output_dir / "scratch" / f"bc_{config.env_name}_seed{config.seed}"
@@ -1013,6 +1333,7 @@ def _run_bc(
         batch_size=min(config.bc_batch_size, len(all_transitions)),
         optimizer_kwargs={"lr": config.learning_rate},
         custom_logger=custom_logger,
+        device=device,
     )
     inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
 
@@ -1023,6 +1344,7 @@ def _run_bc(
         baselines,
     )
 
+    eval_data["checkpoint"] = _save_policy(config, bc_trainer.policy, config.n_rounds)
     l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
     l2_norm = sum(l2_norms) / 2
 
@@ -1037,186 +1359,6 @@ def _run_bc(
             **eval_data,
         }
     ]
-
-
-def _run_bc_dagger(
-    config: ExperimentConfig,
-    venv,
-    expert_policy,
-    rng: np.random.Generator,
-    baselines: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    """BC (growing dataset) baseline.
-
-    Per-round ERM on a growing PREFIX of the expert dataset, sized to
-    match DAgger's aggregated observation budget. Eval uses the same
-    aggregated D_eval^t buffer construction as FTL/FTRL+DAgger (spec §3.4).
-
-    A round-0 eval (fresh policy, before any training) is also emitted,
-    and the outer round loop early-stops when disagreement_rate plateaus.
-    """
-    total_timesteps = config.n_rounds * config.samples_per_round
-
-    sample_until = rollout.make_sample_until(
-        min_timesteps=total_timesteps, min_episodes=1
-    )
-    trajs = rollout.generate_trajectories(
-        policy=expert_policy,
-        venv=venv,
-        sample_until=sample_until,
-        deterministic_policy=True,
-        rng=rng,
-    )
-    all_transitions = rollout.flatten_trajectories(list(trajs))
-    if len(all_transitions) < total_timesteps:
-        raise RuntimeError(
-            f"BC (growing dataset): collected {len(all_transitions)} "
-            f"transitions, need {total_timesteps}"
-        )
-    all_transitions = _collect_and_subsample_transitions(
-        all_transitions,
-        n_target=total_timesteps,
-        strategy=config.subsample_strategy,
-        rng=rng,
-    )
-
-    bcd_scratch = (
-        config.output_dir / "scratch" / f"bc_dagger_{config.env_name}_seed{config.seed}"
-    )
-    if bcd_scratch.exists():
-        shutil.rmtree(bcd_scratch)
-    spr = config.samples_per_round
-    for _round in range(1, config.n_rounds + 1):
-        _save_transitions_as_demos(
-            all_transitions[(_round - 1) * spr : _round * spr], bcd_scratch, _round, rng
-        )
-
-    warm_start = env_utils.is_atari(config.env_name)
-
-    # Build the initial fresh policy for round 0.
-    if config.policy_mode == "linear":
-        policy = policy_utils.create_linear_policy(expert_policy)
-    else:
-        policy = policy_utils.create_end_to_end_policy(
-            venv.observation_space, venv.action_space
-        )
-
-    disagreement_history: List[float] = []
-    per_round: List[Dict[str, Any]] = []
-
-    # Round 0: evaluate fresh policy.
-    round0_eval = _compute_round_eval(
-        policy,
-        expert_policy,
-        venv,
-        baselines,
-    )
-    disagreement_history.append(round0_eval["disagreement_rate"])
-    per_round.append(
-        {
-            "round": 0,
-            "n_observations": 0,
-            "train_cross_entropy": None,
-            "l2_norm": None,
-            "total_loss": None,
-            **round0_eval,
-        }
-    )
-
-    stopped_early = False
-    for round_num in range(1, config.n_rounds + 1):
-        # --- 1. Eval current policy ---
-        is_first = round_num == 1
-        is_interval = round_num % config.eval_interval == 0
-        is_final = round_num == config.n_rounds
-        should_eval = is_first or is_interval or is_final
-
-        eval_data: Optional[Dict[str, Any]] = None
-        if should_eval:
-            eval_data = _compute_round_eval(
-                policy,
-                expert_policy,
-                venv,
-                baselines,
-            )
-            disagreement_history.append(eval_data["disagreement_rate"])
-
-            if config.outer_early_stop and _should_outer_early_stop(
-                disagreement_history,
-                config.outer_early_stop_patience,
-                config.outer_early_stop_min_delta,
-                disagreement_ceiling=config.outer_early_stop_disagreement_ceiling,
-            ):
-                stopped_early = True
-                logger.info(
-                    f"bc_dagger/{config.env_name}/seed{config.seed}: "
-                    f"early stop at round {round_num} "
-                    f"(disagreement plateau over "
-                    f"{config.outer_early_stop_patience} eval points)"
-                )
-
-        # --- 2. Train on growing prefix of expert data ---
-        k = round_num * config.samples_per_round
-        prefix = all_transitions[:k]
-
-        if not warm_start:
-            if config.policy_mode == "linear":
-                policy = policy_utils.create_linear_policy(expert_policy)
-            else:
-                policy = policy_utils.create_end_to_end_policy(
-                    venv.observation_space, venv.action_space
-                )
-
-        custom_logger = imit_logger.configure(
-            str(
-                config.output_dir
-                / "tb"
-                / f"bc_dagger_{config.env_name}_{config.seed}_r{round_num}"
-            ),
-            format_strs=[],
-        )
-        bc_trainer = bc.BC(
-            observation_space=venv.observation_space,
-            action_space=venv.action_space,
-            rng=rng,
-            policy=policy,
-            demonstrations=prefix,
-            batch_size=min(config.bc_batch_size, len(prefix)),
-            optimizer_kwargs={"lr": config.learning_rate},
-            custom_logger=custom_logger,
-        )
-        inner_log = _inner_train(
-            bc_trainer, config, round_num=round_num, is_dagger=False
-        )
-        policy = bc_trainer.policy
-
-        l2_norms = [th.sum(th.square(w)).item() for w in policy.parameters()]
-        l2_norm = sum(l2_norms) / 2
-
-        round_data: Dict[str, Any] = {
-            "round": round_num,
-            "n_observations": k,
-            "train_cross_entropy": None,
-            "l2_norm": round(l2_norm, 6),
-            "total_loss": None,
-            "rollout_cross_entropy": None,
-            "expert_rollout_cross_entropy": None,
-            "normalized_return": None,
-            "disagreement_rate": None,
-            "d_eval_size": None,
-            **inner_log,
-        }
-
-        if eval_data is not None:
-            round_data.update(eval_data)
-
-        per_round.append(round_data)
-        if stopped_early:
-            break
-
-        _free_memory()
-
-    return per_round
 
 
 def _result_path(config: ExperimentConfig) -> pathlib.Path:
@@ -1240,35 +1382,58 @@ def _is_already_done(config: ExperimentConfig) -> bool:
     try:
         with open(out_file) as f:
             cached_cfg = json.load(f).get("config", {})
-        return (
-            cached_cfg.get("samples_per_round") == config.samples_per_round
-            and cached_cfg.get("n_rounds") == config.n_rounds
-            and cached_cfg.get("eval_interval") == config.eval_interval
-        )
+        return cached_cfg == _config_metadata(config)
     except (json.JSONDecodeError, OSError):
         return False
 
 
 _WORKER_GPU_ID: Optional[int] = None
+# How long a pool worker waits for its GPU assignment before falling back to CPU.
+_GPU_HANDOUT_TIMEOUT_S = 30
 
 
 def _worker_init(gpu_queue):
-    """Pool initializer: assign each worker to a GPU from the queue."""
+    """Pool initializer: assign each worker to a GPU from the queue.
+
+    The parent fills the queue before creating the pool, but
+    ``multiprocessing.Queue.put`` only hands the item to a feeder thread, so a
+    worker that starts quickly can find it still empty. ``get_nowait`` then
+    silently left that worker on CPU for the whole sweep -- on Atari that is the
+    difference between using every visible card and using only some of them, and
+    it is exactly the "silently misplaced worker" failure the GPU mask in run.sh
+    is trying to avoid. Block briefly instead, and say what each worker got.
+    """
     global _WORKER_GPU_ID
     try:
-        gpu_id = gpu_queue.get_nowait()
+        gpu_id = gpu_queue.get(timeout=_GPU_HANDOUT_TIMEOUT_S)
     except Exception:
         gpu_id = None
+        logger.warning(
+            "worker %s got no GPU assignment within %ss; running on CPU",
+            os.getpid(),
+            _GPU_HANDOUT_TIMEOUT_S,
+        )
     if gpu_id is not None:
         _WORKER_GPU_ID = gpu_id
-        # Best-effort CUDA device assignment
+        # Best-effort CUDA device assignment. The index counts over the visible
+        # devices, so it follows CUDA_VISIBLE_DEVICES rather than the physical
+        # card number.
         try:
             import torch as _th
 
             if _th.cuda.is_available():
                 _th.cuda.set_device(gpu_id)
+                logger.info("worker %s -> cuda:%s", os.getpid(), gpu_id)
+            else:
+                logger.warning(
+                    "worker %s was assigned GPU %s but CUDA is unavailable",
+                    os.getpid(),
+                    gpu_id,
+                )
         except Exception:
-            pass
+            logger.warning(
+                "worker %s could not select GPU %s", os.getpid(), gpu_id, exc_info=True
+            )
 
 
 def _run_single_wrapper(args):
@@ -1307,6 +1472,9 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         policy_mode=args.policy_mode,
                         n_rounds=args.n_rounds,
                         samples_per_round=args.samples_per_round,
+                        trajectories_per_round=getattr(
+                            args, "trajectories_per_round", 1
+                        ),
                         l2_lambda=args.l2_lambda,
                         l2_decay=args.l2_decay,
                         warm_start=args.warm_start,
@@ -1316,6 +1484,7 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         output_dir=pathlib.Path(args.output_dir),
                         expert_cache_dir=pathlib.Path(args.expert_cache_dir),
                         learning_rate=args.learning_rate,
+                        subsample_strategy=getattr(args, "subsample_strategy", None),
                         outer_early_stop=args.outer_early_stop,
                         outer_early_stop_patience=args.outer_early_stop_patience,
                         outer_early_stop_min_delta=args.outer_early_stop_min_delta,
@@ -1346,7 +1515,7 @@ def main():
     parser.add_argument(
         "--algos",
         nargs="+",
-        default=ALL_ALGOS,
+        default=DEFAULT_ALGOS,
         choices=ALL_ALGOS,
         help="Algorithms to run",
     )
@@ -1361,7 +1530,11 @@ def main():
         "--samples-per-round",
         type=int,
         default=1,
-        help="Min timesteps per DAgger round (default: 1)",
+        help=(
+            "Retained samples per round (default: 1). Interactive algorithms "
+            "keep one state per distinct trajectory; offline BC baselines use "
+            "their selected fixed-data sampling rule."
+        ),
     )
     # Python 3.8 doesn't have argparse.BooleanOptionalAction, so we pair
     # store_true / store_false on a shared dest.
@@ -1466,20 +1639,23 @@ def main():
     parser.add_argument(
         "--warm-start",
         action="store_true",
-        default=True,
-        help="Keep policy weights between rounds (default)",
+        default=False,
+        help="Keep policy weights and optimizer state between rounds",
     )
     parser.add_argument(
         "--no-warm-start",
         dest="warm_start",
         action="store_false",
-        help="Reinitialize trainable params each round",
+        help="Reinitialize trainable params and optimizer state each round (default)",
     )
     parser.add_argument(
         "--beta-rampdown",
         type=int,
-        default=15,
-        help="Rounds for beta schedule linear rampdown",
+        default=0,
+        help=(
+            "Expert-mixing rampdown rounds; 0 keeps learner control throughout "
+            "(default)"
+        ),
     )
     parser.add_argument(
         "--bc-n-epochs", type=int, default=20, help="Number of BC training epochs"
@@ -1537,7 +1713,39 @@ def main():
         default=1,
         help="Total number of shards. Each process runs configs[shard_idx::n_shards]",
     )
+    parser.add_argument(
+        "--trajectories-per-round",
+        "--traj-per-round",
+        type=int,
+        default=1,
+        help=(
+            "Minimum complete trajectories in each interactive round (default 1). "
+            "Raised to --samples-per-round automatically so each retained sample "
+            "comes from its own trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--subsample-strategy",
+        choices=["uniform", "prefix"],
+        default=None,
+        help=(
+            "Sampling override. Defaults per algorithm: bc and bc_prefix use "
+            "prefix; ftl, ftrl, bc_iid and bc_pool use uniform. bc_iid/bc_pool "
+            "require uniform and bc_prefix requires prefix."
+        ),
+    )
     args = parser.parse_args()
+    if args.trajectories_per_round < 1:
+        parser.error("--trajectories-per-round must be positive")
+    if args.samples_per_round < 1:
+        parser.error("--samples-per-round must be positive")
+    if args.subsample_strategy == "prefix" and set(args.algos) & {
+        "bc_iid",
+        "bc_pool",
+    }:
+        parser.error("bc_iid and bc_pool require uniform sampling")
+    if args.subsample_strategy == "uniform" and "bc_prefix" in args.algos:
+        parser.error("bc_prefix requires prefix sampling")
     args.envs = resolve_envs(env_group=args.env_group, envs=args.envs)
 
     logging.basicConfig(
@@ -1707,6 +1915,7 @@ def main():
             logger.error(
                 f"  FAILED: {e['algo']}/{e['env']}/seed{e['seed']}: {e['error']}"
             )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,21 @@ def test_subsample_respects_cap():
     assert len(f) <= 1000 and len(f) == len(l) == len(r) == len(idx)
 
 
+def test_subsample_balances_algorithms_with_many_rounds():
+    labels = np.repeat(["ftl", "ftrl", "bc", "bc_iid"], 1000)
+    rounds = np.concatenate(
+        [np.arange(1000), np.arange(1000), np.zeros(1000), np.arange(1000)]
+    )
+    feats = np.arange(4000).reshape(-1, 1)
+    _, selected, _, _ = tsne_coverage.subsample(feats, labels, rounds, cap=800)
+    assert dict(zip(*np.unique(selected, return_counts=True))) == {
+        "ftl": 200,
+        "ftrl": 200,
+        "bc": 200,
+        "bc_iid": 200,
+    }
+
+
 def test_coverage_metrics_unique_counts_distinct_states():
     feats = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
     labels = np.array(["dense", "dense", "dense", "spread", "spread"], dtype=object)

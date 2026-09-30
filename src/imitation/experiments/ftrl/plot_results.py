@@ -1,4 +1,4 @@
-"""Plotting for FTL vs FTRL vs BC (growing dataset) vs BC experiment results.
+"""Plotting for FTL vs FTRL vs BC-iid vs BC experiment results.
 
 Generates per-environment figures with 4 subplots (linear x-axis by default):
   1. Rollout cross-entropy on the aggregated D_eval^t buffer (log y)
@@ -35,7 +35,9 @@ matplotlib.use("Agg")
 ALGO_COLORS: Dict[str, str] = {
     "ftl": "#1f77b4",  # blue
     "ftrl": "#d62728",  # red
-    "bc_dagger": "#2ca02c",  # green
+    "bc_iid": "#2ca02c",  # green
+    "bc_pool": "#9467bd",  # purple (fixed pool, uniform draws)
+    "bc_prefix": "#8c564b",  # brown (fixed pool, chronological)
     "bc": "#17a663",  # dark green (dashed reference)
     "expert": "#555555",  # gray (dashed reference)
 }
@@ -43,7 +45,9 @@ ALGO_COLORS: Dict[str, str] = {
 ALGO_LABELS: Dict[str, str] = {
     "ftl": "FTL+DAgger",
     "ftrl": "FTRL+DAgger",
-    "bc_dagger": "BC (growing dataset)",
+    "bc_iid": "BC-iid",
+    "bc_pool": "BC-pool",
+    "bc_prefix": "BC-prefix",
     "bc": "BC (fixed)",
     "expert": "Expert",
 }
@@ -51,12 +55,14 @@ ALGO_LABELS: Dict[str, str] = {
 ALGO_LINESTYLES: Dict[str, str] = {
     "ftl": "-",
     "ftrl": "-",
-    "bc_dagger": "-",
+    "bc_iid": "-",
+    "bc_pool": "-",
+    "bc_prefix": "-",
     "bc": "--",
     "expert": "--",
 }
 
-LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_dagger", "bc"}
+LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_iid", "bc_pool", "bc_prefix", "bc"}
 
 
 def _draw_bc_hlines(
@@ -100,16 +106,16 @@ LOSS_SUBTITLE_LINES = [
         r"$a^*(s)=\arg\max_a \pi^*(a|s).$"
     ),
     (
-        r"$D_{\mathrm{eval}}^t$: 10-episode rollout of the current "
+        r"$D_{\mathrm{eval}}^t$: 100-episode rollout of the current "
         r"learner $\pi^t$ (labeled with expert argmax). Not aggregated."
     ),
     (
-        r"Cum. regret: $\sum_{t=1}^T [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
-        r"where $\ell_t(\pi^*)$ is the expert's CE on the same $D_{\mathrm{eval}}^t$."
+        r"Cumulative excess CE: $\sum_{t\ \mathrm{logged}} [\ell_t(\pi^t)-\ell_t(\pi^*)]$ "
+        r"on the same $D_{\mathrm{eval}}^t$ at each logged evaluation."
     ),
     (
-        "x-axis = cumulative expert queries (= transitions labeled by "
-        r"$\pi^*$). All algorithms evaluated at equal expert-label budget."
+        "x-axis = retained training observations. Fixed BC uses the full dataset budget; "
+        "collection and evaluation queries are additional."
     ),
 ]
 
@@ -597,7 +603,7 @@ def plot_env(
         "Disagreement Rate",
         log_scale=True,
         y_clip_floor=1e-3,
-        allowed_algos={"ftl", "ftrl", "bc_dagger", "bc"},
+        allowed_algos={"ftl", "ftrl", "bc_iid", "bc_pool", "bc_prefix", "bc"},
         band=band,
     )
 
@@ -606,7 +612,7 @@ def plot_env(
         ax4,
         env_df,
         "cum_regret",
-        r"Cumulative Regret (vs Expert $\pi^*$)",
+        r"Cumulative Evaluated Excess CE (vs Expert $\pi^*$)",
         allowed_algos=LOSS_SUBPLOT_ALGOS,
         band=band,
     )
@@ -638,6 +644,7 @@ def plot_all(
     show_expert_on_loss: bool = True,
     calibration_data: Optional[Dict[str, Any]] = None,
     band: str = "ci",
+    flat_output: bool = False,
 ) -> List[pathlib.Path]:
     """Generate plots for all environments.
 
@@ -649,6 +656,8 @@ def plot_all(
         calibration_data: Optional dict from lr_calibration.json, keyed by env.
         band: Uncertainty band type forwarded to ``plot_env`` — ``"ci"`` or
             ``"sem"``.
+
+        flat_output: Save directly in output_dir, without another environment-family folder.
 
     Returns:
         List of saved plot file paths.
@@ -667,9 +676,10 @@ def plot_all(
     saved_paths = []
     for env_name in sorted(df["env"].unique()):
         safe_name = env_name.replace("/", "_")
-        out_path = (
-            pathlib.Path(output_dir) / _env_category(env_name) / f"{safe_name}.png"
-        )
+        parent = pathlib.Path(output_dir)
+        if not flat_output:
+            parent /= _env_category(env_name)
+        out_path = parent / f"{safe_name}.png"
         cal = (calibration_data or {}).get(env_name)
         plot_env(
             df,
@@ -686,7 +696,7 @@ def plot_all(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot FTL vs FTRL vs BC (growing dataset) vs BC experiment results",
+        description="Plot FTL vs FTRL vs BC-iid vs BC experiment results",
     )
     parser.add_argument(
         "--results-dir",
@@ -732,6 +742,11 @@ def main():
         help="Uncertainty band: 'ci' (IQM + 95%% bootstrap CI, default) or "
         "'sem' (mean ± 1 SEM)",
     )
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help="Save directly in output-dir without a family subfolder",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -751,6 +766,7 @@ def main():
         show_expert_on_loss=args.show_expert_on_loss,
         calibration_data=calibration_data,
         band=args.band,
+        flat_output=args.flat_output,
     )
     if paths:
         logger.info(f"Generated {len(paths)} plots in {args.output_dir}")

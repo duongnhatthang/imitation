@@ -178,3 +178,17 @@ experiments/expert_cache_ent_default/
 docs/superpowers/
 experiments/logs/
 experiments/ent_coef_zero_experiment.py
+
+# Organized experiment runs, local plot mirror, and private operations state
+experiments/runs/
+experiments/plots/
+experiments/.local/
+experiments/l2_sweep/
+experiments/env_profile/
+experiments/coverage/
+
+# Local monitoring and archives
+runstate/
+results_*/
+_archive_*/
+AGENTS.md

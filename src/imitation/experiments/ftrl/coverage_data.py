@@ -16,7 +16,7 @@ from sklearn.preprocessing import StandardScaler
 
 from imitation.data import serialize
 
-ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_dagger"]
+ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_iid", "bc_prefix", "bc_pool"]
 _ROUND_RE = re.compile(r"round-(\d+)")
 
 

@@ -10,6 +10,18 @@ from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
 
 
+def load_policy_checkpoint(path, device="cpu"):
+    """Load our own policy.save checkpoints across SB3/PyTorch versions.
+
+    These trusted experiment artifacts contain constructor metadata as well as
+    weights. Explicit loading avoids PyTorch 2.6's changed weights-only default.
+    """
+    saved = th.load(path, map_location=device, weights_only=False)
+    policy = ActorCriticPolicy(**saved["data"])
+    policy.load_state_dict(saved["state_dict"])
+    return policy.to(device)
+
+
 def create_end_to_end_policy(
     obs_space: spaces.Space,
     act_space: spaces.Space,
