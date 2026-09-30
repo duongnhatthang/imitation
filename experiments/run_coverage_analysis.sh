@@ -10,16 +10,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+source experiments/paths.sh
+
 ENV="CartPole-v1"
-RESULTS_DIR="${COVERAGE_RESULTS_DIR:-experiments/coverage/classical}"
-PLOTS_DIR="$RESULTS_DIR/plots/coverage"
-CACHE_DIR="${COVERAGE_CACHE_DIR:-experiments/coverage/dqn_cache}"
+RESULTS_DIR="${COVERAGE_RESULTS_DIR:-$EXP_LC_COVERAGE}"
+PLOTS_DIR="$EXP_PLOTS_COVERAGE/coverage"
+CACHE_DIR="${COVERAGE_CACHE_DIR:-$RESULTS_DIR/dqn_cache}"
 mkdir -p "$PLOTS_DIR" "$CACHE_DIR"
 
-# Require every algo's demos (not just ftrl): bc/bc_dagger persist demos too, and a
+# Require every algo's demos (not just ftrl): bc/bc_iid persist demos too, and a
 # stale ftl/ftrl-only dir would otherwise skip the sweep and drop the offline panels.
 NEED_SWEEP=0
-for algo in ftl ftrl bc bc_dagger; do
+for algo in ftl ftrl bc bc_iid; do
   if [ ! -d "$RESULTS_DIR/scratch/${algo}_${ENV}_seed0/demos" ]; then
     NEED_SWEEP=1
   fi
@@ -28,7 +30,7 @@ if [ "$NEED_SWEEP" -eq 1 ]; then
   echo "[coverage] missing scratch demos for one or more algos; running short CartPole sweep ..."
   python -m imitation.experiments.ftrl.run_experiment \
       --envs "$ENV" \
-      --algos ftl ftrl bc bc_dagger \
+      --algos ftl ftrl bc bc_iid \
       --seeds 1 \
       --samples-per-round 1 \
       --n-rounds 30 \

@@ -25,6 +25,7 @@ def test_build_and_plot_writes_png_and_cache(tmp_path):
     for rnd in range(3):
         _demo(tmp_path, "ftrl", 0, rnd, 40, val=float(rnd))
     _demo(tmp_path, "bc", 0, 0, 40, val=0.0)
+    _demo(tmp_path, "bc_iid", 0, 0, 40, val=2.0)
     out = tmp_path / "plots" / "CartPole-v1.png"
     metrics = plot_tsne_coverage.build_and_plot(
         tmp_path,
@@ -38,6 +39,7 @@ def test_build_and_plot_writes_png_and_cache(tmp_path):
     assert out.exists()
     assert out.with_suffix(".npz").exists()  # embedding cache
     assert "ftrl" in metrics["coverage_2d"] and "bc" in metrics["coverage_2d"]
+    assert "bc_iid" in metrics["coverage_2d"]
 
 
 def test_build_and_plot_scaler_path_unchanged(tmp_path):
@@ -50,3 +52,31 @@ def test_build_and_plot_scaler_path_unchanged(tmp_path):
         tmp_path, "CartPole-v1", 0, out, perplexities=(15,), seeds=(0,)
     )
     assert out.exists() and "ftrl" in metrics["coverage_2d"]
+
+
+def test_cli_separates_dataset_seeds(tmp_path):
+    for seed, count in ((0, 40), (1, 60)):
+        for algo in ("bc", "ftrl"):
+            _demo(tmp_path, algo, seed, 0, count)
+        plot_tsne_coverage.main(
+            [
+                "--results-dir",
+                str(tmp_path),
+                "--env",
+                "CartPole-v1",
+                "--seed",
+                str(seed),
+                "--output-dir",
+                str(tmp_path / "plots"),
+                "--perplexity",
+                "15",
+                "--tsne-seed",
+                "0",
+                "1",
+            ]
+        )
+        path = tmp_path / "plots" / f"CartPole-v1_seed{seed}.npz"
+        with np.load(path) as saved:
+            assert saved["dataset_seed"] == seed
+            assert len(saved["features"]) == 2 * count
+            assert saved["embedding_seed"] in (0, 1)

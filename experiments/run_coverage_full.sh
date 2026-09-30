@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full coverage run: an FTRL sweep (which now persists per-round demos for ALL
-# four algos -- ftl, ftrl, bc, bc_dagger) followed by the three post-hoc
+# four algos -- ftl, ftrl, bc, bc_iid) followed by the three post-hoc
 # visualizations (t-SNE state coverage, recoverability mu(s), runtime) plus the
 # standard learning-curve plots. One command produces the whole deliverable.
 #
@@ -43,11 +43,11 @@ N_GPUS="${N_GPUS:-0}"
 COVERAGE_SEED="${COVERAGE_SEED:-0}"
 
 RESULTS_DIR="$EXP_LC_COVERAGE"
-PLOTS_DIR="$RESULTS_DIR/plots"
-COV_DIR="$RESULTS_DIR/plots/coverage"
+PLOTS_DIR="$EXP_PLOTS_COVERAGE/learning_curves"
+COV_DIR="$EXP_PLOTS_COVERAGE/coverage"
 CACHE_DIR="$RESULTS_DIR/dqn_cache"
-LOG_FILE="$RESULTS_DIR/run.log"
-mkdir -p "$RESULTS_DIR" "$PLOTS_DIR" "$COV_DIR" "$CACHE_DIR"
+LOG_FILE="$EXP_LOG_DIR/coverage.log"
+mkdir -p "$RESULTS_DIR" "$PLOTS_DIR" "$COV_DIR" "$CACHE_DIR" "$EXP_LOG_DIR"
 
 # CPU worker count: total - 2, floor 1.
 CPU_TOTAL="$(getconf _NPROCESSORS_ONLN)"
@@ -63,7 +63,7 @@ echo "[coverage_full] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.run_experiment \
     --envs "${ENV_ARR[@]}" \
-    --algos ftl ftrl bc bc_dagger \
+    --algos ftl ftrl bc bc_iid \
     --seeds "$SEEDS" \
     --samples-per-round 1 \
     --n-rounds "$N_ROUNDS" \
@@ -81,7 +81,7 @@ echo "[coverage_full] sweep done: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG
 echo "[coverage_full] learning-curve plots ..." | tee -a "$LOG_FILE"
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir "$RESULTS_DIR" \
-    --output-dir "$PLOTS_DIR" \
+    --output-dir "$PLOTS_DIR" --flat-output \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[coverage_full] t-SNE coverage + recoverability per env ..." | tee -a "$LOG_FILE"

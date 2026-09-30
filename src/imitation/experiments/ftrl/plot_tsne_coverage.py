@@ -1,6 +1,7 @@
 """Render per-environment t-SNE coverage grids colored by data-arrival round."""
 
 import argparse
+import json
 import pathlib
 from typing import Optional, Sequence
 
@@ -135,14 +136,34 @@ def render_coverage_figure(
     plt.close(fig)
 
 
-def render_coverage_diff(
-    embedding, algo_labels, out_path, env_name, n_bins=40, both_gray=True
-):
-    """Region map on the shared embedding: where ftl/ftrl explore vs bc (offline).
+# Which algorithms each side of the coverage-difference map represents.
+# ``left`` is the interactive side whose occupancy measure we claim is broader;
+# ``right`` is the offline/expert-distribution side it is compared against.
+# Default: FTL-DAgger's {d^{pi_t}} versus BC-iid's d^{pi^E} training data.
+COVERAGE_DIFF_SIDES = {"left": ("ftl",), "right": ("bc_iid",)}
 
-    Grids the 2-D embedding and paints each cell by which family occupies it:
-    interactive-only (ftl/ftrl but not bc), bc-only, both (light gray), or empty
-    (white). Highlights what interaction discovers beyond the offline dataset.
+
+def render_coverage_diff(
+    embedding,
+    algo_labels,
+    out_path,
+    env_name,
+    n_bins=40,
+    both_gray=True,
+    left_algos=None,
+    right_algos=None,
+):
+    """Region map on the shared embedding: where one side goes and the other does not.
+
+    Grids the 2-D embedding and paints each cell by which side occupies it:
+    left-only, right-only, both (light gray), or empty (white).
+
+    Defaults to ``COVERAGE_DIFF_SIDES``: FTL-DAgger versus BC-iid. That is the
+    comparison the visitation-overlap claim needs -- BC-iid trains on draws from
+    the expert's own occupancy measure d^{pi^E}, so any region FTL reaches and
+    BC-iid does not is coverage that interaction bought, not coverage that a
+    bigger expert dataset would have supplied. Pass ``left_algos`` /
+    ``right_algos`` to contrast any other pair of algorithm sets.
     """
     import matplotlib.patches as mpatches
 
@@ -157,8 +178,18 @@ def render_coverage_diff(
         hist, _, _ = np.histogram2d(x[mask], y[mask], bins=[xe, ye])
         return hist > 0
 
-    bc = occupied(algo_labels == "bc")
-    inter_mask = np.isin(algo_labels, ["ftl", "ftrl"])
+    left_algos = tuple(left_algos or COVERAGE_DIFF_SIDES["left"])
+    right_algos = tuple(right_algos or COVERAGE_DIFF_SIDES["right"])
+    bc_mask = np.isin(algo_labels, list(right_algos))
+    inter_mask = np.isin(algo_labels, list(left_algos))
+    if not bc_mask.any() or not inter_mask.any():
+        print(
+            f"WARNING: coverage diff for {env_name} skipped; "
+            f"left={left_algos} has {int(inter_mask.sum())} points, "
+            f"right={right_algos} has {int(bc_mask.sum())}."
+        )
+        return
+    bc = occupied(bc_mask)
     inter = occupied(inter_mask)
     both = bc & inter
     c_bc = (0.55, 0.68, 0.90)  # light blue
@@ -183,7 +214,6 @@ def render_coverage_diff(
     # consistent for a reader comparing them. Alpha is kept lower than the
     # panels (0.6) so the region colors still read through the markers.
     jrng = np.random.default_rng(0)
-    bc_mask = algo_labels == "bc"
     bx, by, bsize, _ = _sized_jittered_scatter(
         x[bc_mask], y[bc_mask], xrange, yrange, None, jrng
     )
@@ -194,10 +224,19 @@ def render_coverage_diff(
     ax.scatter(ix, iy, s=isize, c="#b25000", alpha=0.35, edgecolors="none")
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_title(f"Coverage difference: {env_name}  (grid {n_bins}x{n_bins})")
+    left_name = "/".join(left_algos)
+    right_name = "/".join(right_algos)
+    ax.set_title(
+        f"Coverage difference: {env_name}  "
+        f"({left_name} vs {right_name}, grid {n_bins}x{n_bins})"
+    )
     handles = [
-        mpatches.Patch(color=c_int, label="ftl/ftrl only (interaction discovers)"),
-        mpatches.Patch(color=c_bc, label="bc only (offline, not revisited)"),
+        mpatches.Patch(
+            color=c_int, label=f"{left_name} only (interaction discovers)"
+        ),
+        mpatches.Patch(
+            color=c_bc, label=f"{right_name} only (not revisited on-policy)"
+        ),
         mpatches.Patch(color=c_both, label="both"),
         mpatches.Patch(facecolor="white", edgecolor="0.7", label="neither"),
     ]
@@ -293,10 +332,21 @@ def build_and_plot(
         rounds=rounds,
         perplexity=result.perplexity,
         trustworthiness=result.trustworthiness,
+        dataset_seed=seed,
+        embedding_seed=result.seed,
+        search_seeds=np.asarray(seeds),
+        search_perplexities=np.asarray(perplexities),
     )
     diff_path = out_path.parent / f"{out_path.stem}_coverage_diff.png"
     render_coverage_diff(result.embedding, algo, diff_path, env_name)
     return {
+        "dataset_seed": seed,
+        "embedding_seed": result.seed,
+        "perplexity": result.perplexity,
+        "training_counts": {state.algo: len(state.obs) for state in states},
+        "display_counts": {
+            str(label): int(np.sum(algo == label)) for label in np.unique(algo)
+        },
         "coverage_2d": metrics_2d,
         "coverage_highdim": metrics_hd,
         "coverage_unique": metrics_uniq,
@@ -330,7 +380,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         help="Directory containing cached PPO expert policies for Atari CNN features.",
     )
     args = parser.parse_args(argv)
-    out = pathlib.Path(args.output_dir) / f"{args.env.replace('/', '_')}.png"
+    out = (
+        pathlib.Path(args.output_dir)
+        / f"{args.env.replace('/', '_')}_seed{args.seed}.png"
+    )
     metrics = build_and_plot(
         args.results_dir,
         args.env,
@@ -343,6 +396,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         expert_cache=args.expert_cache,
     )
     print(f"Wrote {out}; trustworthiness={metrics['trustworthiness']:.3f}")
+    out.with_suffix(".json").write_text(json.dumps(metrics, indent=2))
 
 
 if __name__ == "__main__":

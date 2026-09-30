@@ -84,7 +84,9 @@ def train_classical_expert_until_converged(
         policy_kwargs=dict(net_arch=[64, 64]),
         seed=seed,
         verbose=0,
-        **ppo_kwargs,
+        # Last, so no per-env config can move this MLP off the CPU: SB3's
+        # "auto" would pick CUDA whenever it is available.
+        **{**ppo_kwargs, "device": "cpu"},
     )
 
     best_norm = -float("inf")
@@ -118,8 +120,7 @@ def train_classical_expert_until_converged(
             return_window.append(norm_ret)
 
             improved = (
-                norm_ret > best_norm + tolerance
-                or self_ce < best_self_ce - tolerance
+                norm_ret > best_norm + tolerance or self_ce < best_self_ce - tolerance
             )
             if improved:
                 best_norm = max(best_norm, norm_ret)
