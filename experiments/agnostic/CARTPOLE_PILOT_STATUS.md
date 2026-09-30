@@ -1,6 +1,6 @@
 # CartPole restriction pilot: status
 
-Status snapshot: 2026-09-30, after the position mask audit was verified.
+Status snapshot: 2026-09-30 22:22 UTC, after the audit and data gates passed.
 
 This note is the current status of the paired CartPole restriction pilot
 described in [`CARTPOLE_PILOT_PROTOCOL.md`](CARTPOLE_PILOT_PROTOCOL.md).
@@ -46,13 +46,27 @@ observation can match the expert on both states of a conflicting pair. It
 bounds neither return nor on-policy imitation error, and no labels from the
 audit are used for training.
 
-## What is not done yet
+## Shared data verified; learning runs dispatched
 
-- **No learning curves exist yet.** Nothing in this note measures BC, DAgger,
-  or any learner under the mask.
-- **Shared data job:** running now on private compute.
-- **Six seed 300 runs:** will start only after the shared data job passes its
-  gate.
+The shared-data job completed with exit 0. Result, source, expert and dataset
+hashes were independently checked. Both datasets retain 1,000 labels, but their
+acquisition is different:
+
+| Dataset | Complete expert episodes | Environment steps | Retained labels |
+| --- | ---: | ---: | ---: |
+| Fixed BC chronological pool | 2 | 1,000 | 1,000 |
+| BC-iid independent-episode stream | 1,000 | 500,000 | 1,000 |
+
+Their content hashes differ. Full and restricted runs of each method consume
+the same corresponding dataset. The original normalization measurement used
+500 expert and 500 random episodes, yielding returns 500.0 and 22.95. The data
+job took 312.47 seconds of controller-measured worker time, including both
+acquisition and normalization.
+
+- **Six seed 300 runs:** dispatched under the frozen manifest after both gates
+  passed. Four run concurrently, with two waiting for a worker.
+- **No completed learning comparison is available yet.** The audit and shared
+  datasets are not evidence of an FTL performance advantage.
 - **Limits:** original stage deadline 2026-10-01 04:09 UTC, at most 2 hours
   per job, at most 4 workers.
 - **No wider experiment is approved.**
