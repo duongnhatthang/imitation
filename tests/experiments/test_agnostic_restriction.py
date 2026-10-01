@@ -15,10 +15,16 @@ import pytest
 import torch as th
 from stable_baselines3 import PPO
 
+from imitation.algorithms import bc, ftrl
+from imitation.data import types
 from imitation.experiments.agnostic import restriction
 from imitation.experiments.ftrl import env_utils, policy_utils, run_experiment
 
 BASELINES = {"expert_return": 500.0, "random_return": 22.0}
+STRONG = "cart_position_angular_velocity_zero"
+MASKS = ("cart_position_zero", STRONG)
+# Observation coordinates each mask hides (x is 0, theta_dot is 3).
+HIDDEN = {"cart_position_zero": (0,), STRONG: (0, 3)}
 
 
 @pytest.fixture(scope="module")
@@ -45,6 +51,12 @@ def _obs(n=64, seed=0):
 def _with_x(obs, x):
     out = obs.copy()
     out[:, 0] = x
+    return out
+
+
+def _with(obs, indices, value):
+    out = obs.copy()
+    out[:, list(indices)] = value
     return out
 
 
@@ -108,12 +120,13 @@ def test_identity_factory_reproduces_previous_linear_policy(expert):
     _assert_same_outputs(_outputs(previous, obs), _outputs(identity, obs))
 
 
-def test_head_initialization_is_identical_across_conditions(expert):
+@pytest.mark.parametrize("restriction_id", MASKS)
+def test_head_initialization_is_identical_across_conditions(expert, restriction_id):
     th.manual_seed(3)
     full = restriction.make_linear_policy(expert, "identity")
     rng_full = th.get_rng_state()
     th.manual_seed(3)
-    restricted = restriction.make_linear_policy(expert, "cart_position_zero")
+    restricted = restriction.make_linear_policy(expert, restriction_id)
     rng_restricted = th.get_rng_state()
 
     assert th.equal(rng_full, rng_restricted)
@@ -125,33 +138,58 @@ def test_head_initialization_is_identical_across_conditions(expert):
 # ---------------------------------------------------------------------------
 
 
-def test_restriction_zeroes_cart_position_before_frozen_features(expert):
+def test_stronger_mask_keeps_cart_velocity_and_pole_angle_only():
+    mask = restriction.get_restriction(STRONG)
+    obs = _obs(n=8, seed=2)
+    masked = mask.apply(obs)
+
+    assert mask.zeroed_indices == (0, 3) and mask.obs_shape == (4,)
+    np.testing.assert_array_equal(masked[:, [0, 3]], 0.0)
+    np.testing.assert_array_equal(masked[:, [1, 2]], obs[:, [1, 2]])
+    with th.no_grad():
+        torch_masked = restriction.ObservationMask(STRONG)(th.as_tensor(obs))
+    np.testing.assert_array_equal(torch_masked.numpy(), masked)
+    # The historical x-only mask stays registered so old checkpoints load.
+    assert restriction.get_restriction("cart_position_zero").zeroed_indices == (0,)
+
+
+@pytest.mark.parametrize("restriction_id", MASKS)
+def test_restriction_zeroes_hidden_coordinates_before_frozen_features(
+    expert,
+    restriction_id,
+):
+    hidden = HIDDEN[restriction_id]
     th.manual_seed(11)
     full = restriction.make_linear_policy(expert, "identity")
     th.manual_seed(11)
-    restricted = restriction.make_linear_policy(expert, "cart_position_zero")
+    restricted = restriction.make_linear_policy(expert, restriction_id)
     obs = _obs()
 
-    # Every path of the restricted learner sees exactly (0, x_dot, theta,
-    # theta_dot): it equals the unrestricted twin evaluated at x = 0 ...
+    # Every path of the restricted learner equals the unrestricted twin
+    # evaluated with the hidden coordinates set to 0 ...
     _assert_same_outputs(
         _outputs(restricted, obs),
-        _outputs(full, _with_x(obs, 0.0)),
+        _outputs(full, _with(obs, hidden, 0.0)),
     )
-    # ... so it cannot distinguish states that differ only in x.
-    for x in (-1.8, 0.6, 2.3):
-        _assert_same_outputs(
-            _outputs(restricted, obs),
-            _outputs(restricted, _with_x(obs, x)),
-        )
+    # ... so it cannot distinguish states that differ only in them.
+    for value in (-1.8, 0.6, 2.3):
+        for index in hidden:
+            _assert_same_outputs(
+                _outputs(restricted, obs),
+                _outputs(restricted, _with(obs, (index,), value)),
+            )
 
 
-def test_all_extractor_aliases_are_restricted_and_only_the_head_trains(expert):
-    policy = restriction.make_linear_policy(expert, "cart_position_zero")
+@pytest.mark.parametrize("restriction_id", MASKS)
+def test_all_extractor_aliases_are_restricted_and_only_the_head_trains(
+    expert,
+    restriction_id,
+):
+    policy = restriction.make_linear_policy(expert, restriction_id)
 
     assert policy.pi_features_extractor is policy.features_extractor
     assert policy.vf_features_extractor is policy.features_extractor
-    assert policy.restriction_id == "cart_position_zero"
+    assert policy.restriction_id == restriction_id
     assert _trainable(policy) == ["action_net.bias", "action_net.weight"]
     for name, param in expert.named_parameters():
         frozen = dict(policy.named_parameters())[name]
@@ -162,9 +200,9 @@ def test_all_extractor_aliases_are_restricted_and_only_the_head_trains(expert):
 def test_masking_the_learner_never_alters_expert_inputs(expert):
     before = copy.deepcopy(expert)
     obs = _obs()
-    shifted = _with_x(obs, 1.9)
+    shifted = _with(obs, (0, 3), 1.9)
 
-    restriction.make_linear_policy(expert, "cart_position_zero")
+    restriction.make_linear_policy(expert, STRONG)
 
     _assert_same_weights(expert, before)
     assert type(expert.features_extractor) is type(before.features_extractor)
@@ -187,7 +225,7 @@ def test_unknown_restriction_and_incompatible_observations_are_refused(expert):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("restriction_id", ["identity", "cart_position_zero"])
+@pytest.mark.parametrize("restriction_id", ("identity",) + MASKS)
 def test_checkpoint_round_trip_preserves_mask_frozen_layers_and_outputs(
     expert,
     tmp_path,
@@ -208,10 +246,10 @@ def test_checkpoint_round_trip_preserves_mask_frozen_layers_and_outputs(
     assert _trainable(loaded) == ["action_net.bias", "action_net.weight"]
     obs = _obs(seed=4)
     _assert_same_outputs(_outputs(policy, obs), _outputs(loaded, obs))
-    if restriction_id == "cart_position_zero":
+    for index in HIDDEN.get(restriction_id, ()):
         _assert_same_outputs(
             _outputs(loaded, obs),
-            _outputs(loaded, _with_x(obs, -2.0)),
+            _outputs(loaded, _with(obs, (index,), -2.0)),
         )
 
 
@@ -320,6 +358,160 @@ def test_identity_fixed_bc_fit_matches_previous_fit(expert, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Online batch size: observed training minibatches
+# ---------------------------------------------------------------------------
+
+
+def _observe_fits(monkeypatch):
+    """Record every gradient minibatch size, grouped by `_inner_train` call."""
+    fits = []
+    real_inner = run_experiment._inner_train
+
+    def inner(trainer_or_bc, config, round_num, is_dagger):
+        fits.append({"round": round_num, "batches": []})
+        fits[-1]["log"] = real_inner(trainer_or_bc, config, round_num, is_dagger)
+        return fits[-1]["log"]
+
+    monkeypatch.setattr(run_experiment, "_inner_train", inner)
+    for owner in (bc.BehaviorCloningLossCalculator, ftrl.TrainableParamsLossCalculator):
+        real = owner.__call__
+
+        def call(self, policy, obs, acts, _real=real, _owner=owner):
+            # Validation NLL and round metrics run without gradients.
+            if type(self) is _owner and th.is_grad_enabled():
+                fits[-1]["batches"].append(len(acts))
+            return _real(self, policy, obs, acts)
+
+        monkeypatch.setattr(owner, "__call__", call)
+    return fits
+
+
+def _labelled_states(expert, n, seed=0):
+    obs = _obs(n=n, seed=seed)
+    acts, _ = expert.predict(obs, deterministic=True)
+    return types.Transitions(
+        obs=obs,
+        acts=np.asarray(acts),
+        next_obs=_obs(n=n, seed=seed + 1),
+        dones=np.zeros(n, dtype=bool),
+        infos=np.array([{} for _ in range(n)]),
+    )
+
+
+def _run_replay(tmp_path, expert, n_rounds, **overrides):
+    config = _config(
+        tmp_path,
+        "bc_iid",
+        n_rounds=n_rounds,
+        eval_interval=10_000,
+        # A small held-out threshold exercises the split path at tiny budgets.
+        inner_early_stop_min_val_size=3,
+        **overrides,
+    )
+    rng = np.random.default_rng(config.seed)
+    venv = env_utils.make_env("CartPole-v1", 1, rng)
+    th.manual_seed(config.seed)
+    records = run_experiment._run_dagger_variant(
+        config,
+        venv,
+        expert,
+        rng,
+        BASELINES,
+        policy_factory=lambda e: restriction.make_linear_policy(e, STRONG),
+        offline_data=_labelled_states(expert, n_rounds),
+    )
+    venv.close()
+    return config, records
+
+
+def _expected_split(t, config):
+    """Training examples and batch size the original split rule implies."""
+    n_val = int(config.inner_early_stop_val_frac * t)
+    split = n_val >= config.inner_early_stop_min_val_size
+    return (t - n_val if split else t), split
+
+
+def test_online_batch_grows_with_accumulated_labels_up_to_the_cap(
+    expert,
+    tmp_path,
+    monkeypatch,
+):
+    fits = _observe_fits(monkeypatch)
+    n_rounds = 40
+    config, records = _run_replay(
+        tmp_path,
+        expert,
+        n_rounds,
+        grow_batch_with_data=True,
+    )
+
+    assert [f["round"] for f in fits] == list(range(1, n_rounds + 1))
+    seen = set()
+    for fit, record in zip(fits, records[1:]):
+        t = fit["round"]
+        train, split = _expected_split(t, config)
+        # min(32, t), shrunk only when the held-out split leaves fewer.
+        batch = min(min(32, t), train)
+        epochs = record["inner_es_stop_epoch"]
+        assert set(fit["batches"]) == {batch}, t
+        # drop_last: an incomplete final batch is skipped every epoch.
+        assert len(fit["batches"]) == epochs * (train // batch), t
+        assert record["train_batch_size"] == batch
+        assert record["train_examples"] == train
+        assert record["train_batches_per_epoch"] == train // batch
+        assert record["train_drop_last"] is True
+        assert (record["inner_es_fallback"] is None) == split
+        seen.add((split, batch < min(32, t), batch == 32))
+    # Rounds without a split, with a split that shrinks the batch, and with
+    # the batch capped at 32 past 32 labels all occurred.
+    assert {(False, False, False), (True, True, False), (True, False, True)} <= seen
+
+
+def test_default_online_batch_keeps_the_original_minibatch_of_one(
+    expert,
+    tmp_path,
+    monkeypatch,
+):
+    fits = _observe_fits(monkeypatch)
+    config, records = _run_replay(tmp_path, expert, 33)
+
+    assert config.grow_batch_with_data is False
+    for fit, record in zip(fits, records[1:]):
+        train, _ = _expected_split(fit["round"], config)
+        assert set(fit["batches"]) == {1}
+        assert len(fit["batches"]) == record["inner_es_stop_epoch"] * train
+        assert record["train_batch_size"] == 1
+
+
+def test_fixed_bc_fit_records_its_observed_batch_and_split(
+    expert,
+    tmp_path,
+    monkeypatch,
+):
+    fits = _observe_fits(monkeypatch)
+    config = _config(tmp_path, "bc", n_rounds=40, inner_early_stop_min_val_size=3)
+    venv = env_utils.make_env("CartPole-v1", 1, np.random.default_rng(0))
+    _, inner_log = run_experiment._fit_fixed_bc(
+        config,
+        venv,
+        restriction.make_linear_policy(expert, STRONG),
+        _labelled_states(expert, 40),
+        np.random.default_rng(0),
+        device="cpu",
+        tb_tag="observed",
+    )
+    venv.close()
+
+    [fit] = fits
+    # 40 labels: 4 held out, 36 trained in minibatches of 32 (4 dropped).
+    assert set(fit["batches"]) == {32}
+    assert len(fit["batches"]) == inner_log["inner_es_stop_epoch"]
+    assert inner_log["train_batch_size"] == 32
+    assert inner_log["train_examples"] == 36
+    assert inner_log["train_batches_per_epoch"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Mask audit on the real CartPole simulator
 # ---------------------------------------------------------------------------
 
@@ -346,7 +538,11 @@ def _balancing_rule(o):
 def test_audit_finds_conflicts_when_the_expert_uses_cart_position():
     expert = RuleExpert(_balancing_rule)
 
-    audit = restriction.audit_cartpole_position(expert, reset_seed=301)
+    audit = restriction.audit_cartpole_position(
+        expert,
+        reset_seed=301,
+        restriction_id="cart_position_zero",
+    )
 
     assert audit["status"] == "conflict_found"
     assert audit["restriction_id"] == "cart_position_zero"
@@ -396,12 +592,59 @@ def test_audit_finds_conflicts_when_the_expert_uses_cart_position():
     assert "on-policy" in audit["claim"]
 
 
+def test_stronger_mask_audit_reuses_the_same_x_witnesses():
+    # The fixed x-grid pairs share x_dot, theta and theta_dot, so they also
+    # collide under the coarser mask: same states, physics checks and labels.
+    x_only = restriction.audit_cartpole_position(
+        RuleExpert(_balancing_rule),
+        reset_seed=301,
+        restriction_id="cart_position_zero",
+    )
+    expert = RuleExpert(_balancing_rule)
+    strong = restriction.audit_cartpole_position(
+        expert,
+        reset_seed=301,
+        restriction_id=STRONG,
+    )
+
+    assert strong["restriction_id"] == STRONG
+    assert strong["status"] == "conflict_found"
+    assert strong["expert_predict_calls"] == expert.calls
+    assert strong["base_states"] == x_only["base_states"]
+    assert strong["n_conflicting_pairs"] == x_only["n_conflicting_pairs"] > 0
+    drop = ("masked_observation",)
+    for a, b in zip(strong["states"], x_only["states"]):
+        assert {k: v for k, v in a.items() if k not in drop} == {
+            k: v for k, v in b.items() if k not in drop
+        }
+        full = a["observation"]
+        assert a["masked_observation"] == [0.0, full[1], full[2], 0.0]
+    assert strong["pairs"] == x_only["pairs"]
+    # Only cart position varies within a pair: nothing about theta_dot.
+    for pair in strong["pairs"]:
+        assert pair["x_a"] != pair["x_b"]
+    assert "angular velocity" in strong["witness_scope"]
+
+
+def test_audit_refuses_restrictions_that_keep_cart_position():
+    with pytest.raises(ValueError, match="cart position"):
+        restriction.audit_cartpole_position(
+            RuleExpert(_balancing_rule),
+            reset_seed=301,
+            restriction_id="identity",
+        )
+
+
 def test_audit_without_conflicts_is_uncertified_and_keeps_every_pair():
     # Ignores cart position, and falls over quickly, so later bases are
     # unavailable and recorded as such.
     expert = RuleExpert(lambda o: 0)
 
-    audit = restriction.audit_cartpole_position(expert, reset_seed=301)
+    audit = restriction.audit_cartpole_position(
+        expert,
+        reset_seed=301,
+        restriction_id=STRONG,
+    )
 
     assert audit["status"] == "restriction_uncertified"
     assert audit["n_conflicting_pairs"] == 0

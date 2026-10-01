@@ -1,5 +1,5 @@
 {
-  "schema": "cartpole-restriction-pilot-analysis/1",
+  "schema": "cartpole-restriction-pilot-analysis/2",
   "scope": "derived summary of the six-run CartPole restriction pilot; raw records, checkpoints and logs remain private",
   "provenance": {
     "source_commit": "2896ffe",
@@ -32,7 +32,7 @@
     "stream_file_sha256": "34f9d6fa5ab9c7020262c7e502632f8a842e5e2321109f7c4f3e57e80b796531",
     "stream_pairs_sha256": "451320030207973c84a7bace480dcb04cb97be0695f2505f2531aef6760ff669",
     "analysis_script": "experiments/agnostic/analyze_cartpole_pilot.py",
-    "analysis_script_sha256": "8770b54026ade84390170480b766d11a0b00259895c0f3cb97e53b980fab7a9d",
+    "analysis_script_sha256": "ef7c7dca1606194553b74e56598eef5669cdbebc5cbae7975393db65521b0e3a",
     "config_sha256_recomputed_and_matched": {
       "data": "6a65e5beb32280d7d3ebeb1720e746183c07dcf643f7027789c9a3d777036722",
       "run-ftl-identity": "8ba113196907e747a345065514bc145bc668b9ef8d760420bd2a5afc60430829",
@@ -47,7 +47,8 @@
         "SHA-256 of every analyzed result and inventory file; complete jobs matched against the controller result hash",
         "config_sha256 of the data job and six runs, with the producer's canonical JSON (sorted keys, compact separators)",
         "data result hash cited by every run",
-        "normalized_return of every saved evaluation checked against (mean episode return - random_return) / (expert_return - random_return) on its raw episode returns and stored references, within the producer's six-decimal rounding; the stored value is reported, never replaced"
+        "normalized_return of every saved FTL and BC-iid evaluation and of each offline BC reference evaluation checked against (mean episode return - random_return) / (expert_return - random_return) on its raw episode returns and stored references, within the producer's six-decimal rounding; the stored value is reported, never replaced; inactive BC prefix evaluations are not read for metrics",
+        "offline BC reference: exactly one record at the full budget, with a saved evaluation and checkpoint, whose prefix digest equals the whole pool's pairs digest"
       ],
       "compared_for_equality_only": [
         "campaign source hash across the three inventories",
@@ -470,7 +471,7 @@
   },
   "matched_budget": {
     "labels": 640,
-    "rule": "maximum of the intersection of the six sets of evaluated label counts",
+    "rule": "maximum of the intersection of the four online (FTL and BC-iid) sets of evaluated label counts; offline BC is not part of it",
     "points": {
       "run-ftl-identity": {
         "labels": 640,
@@ -498,34 +499,6 @@
         "rollout_cross_entropy": 0.464458,
         "disagreement_rate": 0.2839,
         "expert_rollout_cross_entropy": 0.091888,
-        "eval_env_steps": 50000
-      },
-      "run-bc-identity": {
-        "labels": 640,
-        "round": 640,
-        "mean_return": 500.0,
-        "min_return": 500.0,
-        "max_return": 500.0,
-        "episodes": 100,
-        "episodes_at_cap": 100,
-        "normalized_return": 1.0,
-        "rollout_cross_entropy": 0.263521,
-        "disagreement_rate": 0.00646,
-        "expert_rollout_cross_entropy": 0.223668,
-        "eval_env_steps": 50000
-      },
-      "run-bc-cart_position_zero": {
-        "labels": 640,
-        "round": 640,
-        "mean_return": 500.0,
-        "min_return": 500.0,
-        "max_return": 500.0,
-        "episodes": 100,
-        "episodes_at_cap": 100,
-        "normalized_return": 1.0,
-        "rollout_cross_entropy": 0.544523,
-        "disagreement_rate": 0.28618,
-        "expert_rollout_cross_entropy": 0.094161,
         "eval_env_steps": 50000
       },
       "run-bc_iid-identity": {
@@ -558,6 +531,55 @@
       }
     }
   },
+  "bc_reference": {
+    "definition": "original _run_bc: one policy per observation condition trained once on the whole offline pool and drawn as a flat reference",
+    "labels": 1000,
+    "label_matched_to_online": false,
+    "points": {
+      "run-bc-identity": {
+        "labels": 1000,
+        "round": 1000,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.238094,
+        "disagreement_rate": 0.03684,
+        "expert_rollout_cross_entropy": 0.221909,
+        "eval_env_steps": 50000,
+        "trained_on": "the whole offline pool",
+        "pool_pairs_sha256": "f20eda3b8204dac388f4d2aca280b8935a9c2153cdb9744c9b991b8d6b7f2128",
+        "checkpoint": "checkpoints/bc_CartPole-v1_seed300/round-01000.pt",
+        "inner_es_stop_epoch": 20,
+        "inner_es_fallback": null,
+        "reference_fit_seconds": 1.0154109559953213,
+        "reference_eval_seconds": 31.873004628985655
+      },
+      "run-bc-cart_position_zero": {
+        "labels": 1000,
+        "round": 1000,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.561774,
+        "disagreement_rate": 0.28526,
+        "expert_rollout_cross_entropy": 0.091906,
+        "eval_env_steps": 50000,
+        "trained_on": "the whole offline pool",
+        "pool_pairs_sha256": "f20eda3b8204dac388f4d2aca280b8935a9c2153cdb9744c9b991b8d6b7f2128",
+        "checkpoint": "checkpoints/bc_CartPole-v1_seed300/round-01000.pt",
+        "inner_es_stop_epoch": 20,
+        "inner_es_fallback": null,
+        "reference_fit_seconds": 1.028041113022482,
+        "reference_eval_seconds": 32.989710565976566
+      }
+    }
+  },
   "own_endpoints": {
     "run-ftl-identity": {
       "labels": 640,
@@ -585,34 +607,6 @@
       "rollout_cross_entropy": 0.437751,
       "disagreement_rate": 0.26492,
       "expert_rollout_cross_entropy": 0.101091,
-      "eval_env_steps": 50000
-    },
-    "run-bc-identity": {
-      "labels": 1000,
-      "round": 1000,
-      "mean_return": 500.0,
-      "min_return": 500.0,
-      "max_return": 500.0,
-      "episodes": 100,
-      "episodes_at_cap": 100,
-      "normalized_return": 1.0,
-      "rollout_cross_entropy": 0.238094,
-      "disagreement_rate": 0.03684,
-      "expert_rollout_cross_entropy": 0.221909,
-      "eval_env_steps": 50000
-    },
-    "run-bc-cart_position_zero": {
-      "labels": 1000,
-      "round": 1000,
-      "mean_return": 500.0,
-      "min_return": 500.0,
-      "max_return": 500.0,
-      "episodes": 100,
-      "episodes_at_cap": 100,
-      "normalized_return": 1.0,
-      "rollout_cross_entropy": 0.561774,
-      "disagreement_rate": 0.28526,
-      "expert_rollout_cross_entropy": 0.091906,
       "eval_env_steps": 50000
     },
     "run-bc_iid-identity": {
@@ -645,9 +639,30 @@
     }
   },
   "return_ceiling": {
-    "trained_evaluations": 477,
-    "trained_evaluations_at_cap": 477,
-    "all_trained_evaluations_at_cap": true
+    "online_trained_evaluations": 275,
+    "online_trained_evaluations_at_cap": 275,
+    "bc_reference_evaluations_at_cap": 2,
+    "all_at_cap": true
+  },
+  "erratum": {
+    "issue": "the executed pilot fitted BC separately at every evaluated pool prefix, and the previous report drew those fits as a learning curve and used a prefix fit in the matched comparison; the intended baseline is the original _run_bc, one fit on the whole offline dataset drawn flat",
+    "correction": "only the stored fit on the whole pool and its saved evaluation are used, per condition; prefix fits are not a baseline and are neither plotted nor summarized; their values stay in the private raw records",
+    "historical_fits": [
+      101,
+      101
+    ],
+    "historical_fit_budgets": {
+      "count": 101,
+      "first": 1,
+      "last": 1000
+    },
+    "independence": "by reading the source: before every fit torch was reseeded, a fresh policy built, the trainer given a fresh generator with the run seed, and the validation split seeded by the seed and round 0, on CPU; the full-pool fit does not depend on earlier fits; not verified by a rerun",
+    "evaluation_rng": "the reference evaluation reused the run's environment after the earlier evaluations, so it is the saved estimate for the final policy, not an exact standalone rerun",
+    "earlier_evaluation_episodes": [
+      10000,
+      10000
+    ],
+    "cost": "historical BC job costs are unchanged and charged in full; the reference fit and evaluation timers are part of them, not additional"
   },
   "pairing": {
     "round0_ftl_bc_iid_identical_within_condition": true,
@@ -733,6 +748,8 @@
     "Null values are unknown, never zero.",
     "Controller wall time is worker wall time, not CPU or GPU hours or money.",
     "Original expert preparation, local review and plotting are out of scope.",
-    "Round-loop fits are timed within collection_and_training; fixed BC has no in-run collection, so those recorded 0.0 phase timers are structural."
+    "Round-loop fits are timed within collection_and_training; the historical offline BC job has no in-run collection, so those recorded 0.0 phase timers are structural.",
+    "runs holds the physical record of all six jobs as recorded, including every historical BC prefix fit and evaluation in its counts and wall time; only bc_reference is the offline BC result.",
+    "Offline BC is trained on the whole pool and is never label matched to the online curves."
   ]
 }

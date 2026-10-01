@@ -1,5 +1,10 @@
 # CartPole restriction pilot: protocol and CLI
 
+> Historical: this is protocol `/1` (x-only mask, prefix-fitted BC, online
+> minibatch 1), run at source `2896ffe`. The current runner implements
+> protocol `/2`; see `CARTPOLE_STRONGER_MASK_PROTOCOL.md`. Only this note was
+> added; the text below is unchanged.
+
 STATUS: the first CartPole step of `PIPELINE_RESTRICTION_PROPOSAL.md` is
 approved. Implementation status is as of 2026-09-30 22:05 UTC, before any
 scientific launch: code and tests exist and no pilot job has been run. Later

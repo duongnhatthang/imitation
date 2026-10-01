@@ -1,5 +1,22 @@
 # CartPole restriction pilot: status
 
+> **Correction: fixed BC.** The two historical jobs labelled fixed BC each
+> performed 101 growing-prefix fits (1, 10, 20, ..., 1,000 labels), each
+> evaluated and checkpointed. They were therefore not the requested baseline,
+> a single offline BC fit on the whole 1,000-label pool. Corrected reporting
+> in [`CARTPOLE_PILOT_RESULTS.md`](CARTPOLE_PILOT_RESULTS.md) uses only each
+> job's stored full 1,000-label fit and its evaluation, drawn as a horizontal
+> reference. BC-prefix and BC-pool are not active comparisons and get no extra
+> plots. The actual historical cost is retained: the worker time and counts
+> below include all 101 fits and evaluations per job. The 640-label common
+> budget is unchanged when computed from the four FTL and BC-iid curves only;
+> offline BC at 1,000 labels is not label matched to it. Mentions below of
+> fixed-BC prefixes or curves describe the historical execution.
+>
+> This remains the status of the historical pilot with the cart-position-only
+> (x-only) mask. It is not the new stronger-mask run, which has not run; its
+> protocol is being prepared separately in a new document.
+
 Final status: all six pilot jobs are terminal as of September 30, 2026,
 6:17 pm Phoenix time (October 1, 01:17 UTC).
 

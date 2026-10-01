@@ -1,11 +1,18 @@
 """Runner for the approved CartPole learner-only restriction pilot.
 
+Protocol ``/2`` (the stronger-mask pilot) for runs and the audit; the data
+job and its schema are unchanged from protocol ``/1``. Protocol ``/1``, the
+x-only pilot with prefix-fitted BC and online minibatch 1, is historical
+(source ``2896ffe``) and is not reproduced by this module.
+
 Three commands, each writing one fresh output directory:
 
 ``audit``
-    Paired-state mask audit of ``cart_position_zero`` with the qualified
+    Paired-state x-grid audit of `PILOT_RESTRICTION` with the qualified
     expert on the diagnostic reset seed `AUDIT_SEED` (see
-    `restriction.audit_cartpole_position`). Its labels never reach training.
+    `restriction.audit_cartpole_position`). It reuses the fixed x-grid
+    witnesses, so it shows only that expert labels conflict under the mask.
+    Its labels never reach training.
 ``data``
     Acquires, once, the expert data that full and restricted runs share: the
     fixed-BC chronological pool (complete expert episodes until at least
@@ -18,28 +25,32 @@ Three commands, each writing one fresh output directory:
     does (500 deterministic expert episodes, 500 uniform random episodes), on
     a dedicated environment. Physical acquisition is charged to this job.
 ``run``
-    One (method, restriction) run on the pilot seed. The learner is the
-    previous pipeline's linear policy (expert clone, frozen features,
-    reinitialized ``action_net``) built by `restriction.make_linear_policy`, so
-    the restriction acts before the frozen features on every path while the
-    expert keeps reading full observations. FTL (beta 0) and BC-iid use
+    One (method, restriction) run on the pilot seed, restriction one of
+    `RUN_RESTRICTIONS`. The learner is the previous pipeline's linear policy
+    (expert clone, frozen features, reinitialized ``action_net``) built by
+    `restriction.make_linear_policy`, so the restriction acts before the
+    frozen features on every path while the expert keeps reading full
+    observations. FTL (beta 0) and BC-iid use
     ``run_experiment._run_dagger_variant`` unchanged except for its explicit
-    hooks: FTL collects with learner control as before; BC-iid replays the
-    shared stream in order, one state per round, through the same trainer.
-    Fixed BC cold-fits, at every plotted budget B, the first B pool
-    transitions with ``run_experiment._fit_fixed_bc`` (the routine of
-    ``_run_bc``), reseeding torch before each fit so every point is the
-    standalone fit at B. Evaluation is ``_compute_round_eval`` (100
-    deterministic episodes, normalized return, learner and expert rollout
-    cross-entropy, disagreement, raw episode returns); evaluated policies are
-    checkpointed with their restriction. No mixture is computed.
+    hooks and ``grow_batch_with_data``: FTL collects with learner control as
+    before; BC-iid replays the shared stream in order, one state per round,
+    through the same trainer. Fixed BC is the offline baseline of ``_run_bc``:
+    one cold fit on the whole pool with ``run_experiment._fit_fixed_bc`` and
+    one evaluation, a frozen policy that is a flat reference, not a curve.
+    Evaluation is ``_compute_round_eval`` (100 deterministic episodes,
+    normalized return, learner and expert rollout cross-entropy,
+    disagreement, raw episode returns); evaluated policies are checkpointed
+    with their restriction. No mixture is computed. Data from another source
+    version are accepted only when ``expected_data_sha256`` pins the exact
+    bytes of the data record (`BATCH_RULE`, `FIXED_BC_RULE`).
 
 Differences from the previous pipeline, all deliberate: expert data for fixed
 BC and BC-iid come from the shared data job instead of the per-run
 environment, so full and restricted runs see identical data (verified by
 hash); baselines are measured once per data job on a dedicated environment
 whose random-action sampler is seeded; the expert comes from a verified
-qualified preparation rather than the expert cache.
+qualified preparation rather than the expert cache; online methods train with
+the batch rule fixed BC uses.
 
 Safety: every command verifies its inputs before claiming a fresh, empty
 output directory, and refuses anything else without reading it. The
@@ -82,17 +93,21 @@ from imitation.experiments.ftrl import (
 
 logger = logging.getLogger(__name__)
 
-PROTOCOL = "agnostic-cartpole-restriction-pilot/1"
+PROTOCOL = "agnostic-cartpole-restriction-pilot/2"
 AUDIT_SCHEMA = PROTOCOL + "/audit"
-DATA_SCHEMA = PROTOCOL + "/data"
 RUN_SCHEMA = PROTOCOL + "/run"
+# The data job's producer semantics are unchanged, so it keeps protocol /1.
+DATA_PROTOCOL = "agnostic-cartpole-restriction-pilot/1"
+DATA_SCHEMA = DATA_PROTOCOL + "/data"
 
 ENV_NAME = "CartPole-v1"
 EPISODE_CAP = 500
 PILOT_SEED = 300
 AUDIT_SEED = 301
 METHODS = ("ftl", "bc", "bc_iid")
-RESTRICTION_IDS = tuple(restriction.RESTRICTIONS)
+PILOT_RESTRICTION = "cart_position_angular_velocity_zero"
+# cart_position_zero stays registered for historical checkpoints only.
+RUN_RESTRICTIONS = ("identity", PILOT_RESTRICTION)
 DEFAULT_BUDGET = 1000
 EVAL_INTERVAL = 10
 BC_EPOCHS = 20
@@ -155,6 +170,30 @@ EVALUATION_RULE = (
     "Each evaluation step makes one learner and one expert predict call; "
     "the expert's rollout cross-entropy is a forward pass over the same states."
 )
+POOL_RULE = (
+    "complete expert episodes until >= budget transitions; first budget kept in "
+    "order"
+)
+STREAM_RULE = (
+    "budget independent complete expert episodes; one uniformly selected "
+    "pre-action state per episode"
+)
+BATCH_RULE = (
+    "Online methods: before each round's data are loaded, batch and minibatch "
+    "are min(bc_batch_size, accumulated labels). Fixed BC: min(bc_batch_size, "
+    "dataset size). When the held-out split runs and leaves fewer training "
+    "examples than that, the batch shrinks to the training split. Loaders "
+    "shuffle and drop the incomplete final batch every epoch (drop_last). "
+    "Records give the loader actually trained on (train_batch_size, "
+    "train_examples, train_batches_per_epoch, train_drop_last)."
+)
+FIXED_BC_RULE = (
+    "Offline fixed BC: one cold fit on all n_rounds pool labels with "
+    "run_experiment._fit_fixed_bc (torch reseeded first) and one evaluation. "
+    "The frozen policy is a flat reference across the online label axis, not "
+    "a function of it; it never fits prefixes."
+)
+_SHA256_HEX = "0123456789abcdef"
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +636,7 @@ def _check_cap(venv=None) -> int:
 
 def _base_record(schema, identity, limits, clock) -> Dict[str, Any]:
     return {
-        "protocol": PROTOCOL,
+        "protocol": DATA_PROTOCOL if schema == DATA_SCHEMA else PROTOCOL,
         "schema": schema,
         "env_name": ENV_NAME,
         "episode_cap": EPISODE_CAP,
@@ -676,10 +715,11 @@ def run_audit(
             guard,
             lambda: {
                 "config": {
-                    "restriction_id": restriction.AUDIT_RESTRICTION,
+                    "restriction_id": PILOT_RESTRICTION,
                     "reset_seed": AUDIT_SEED,
                     "grid": list(restriction.AUDIT_X_GRID),
                     "base_steps": list(restriction.AUDIT_BASE_STEPS),
+                    "witness_scope": restriction.AUDIT_WITNESS_SCOPE,
                 },
                 "audit_status": (live["audit"] or {}).get("status"),
                 # The audit reports its costs only when it finishes.
@@ -697,6 +737,7 @@ def run_audit(
         live["audit"] = restriction.audit_cartpole_position(
             expert,
             AUDIT_SEED,
+            restriction_id=PILOT_RESTRICTION,
             check=guard.check,
         )
 
@@ -739,10 +780,8 @@ def prepare_data(
             "seed": seed,
             "budget": int(budget),
             "baseline_episodes": int(baseline_episodes),
-            "pool": "complete expert episodes until >= budget transitions; "
-            "first budget kept in order",
-            "stream": "budget independent complete expert episodes; one "
-            "uniformly selected pre-action state per episode",
+            "pool": POOL_RULE,
+            "stream": STREAM_RULE,
             "expert_action_rule": classical.ACTION_RULE,
         }
         state, writer = _start(
@@ -825,31 +864,94 @@ def _observed_baseline(live) -> Optional[Dict[str, Any]]:
     }
 
 
-def _verify_data(data_dir, seed, identity, n_rounds):
-    """Check the shared data job and return its record, data and file digest."""
+def _validate_pin(expected_data_sha256: Optional[str]) -> Optional[str]:
+    if expected_data_sha256 is None:
+        return None
+    pin = expected_data_sha256
+    if (
+        not isinstance(pin, str)
+        or len(pin) != 64
+        or any(c not in _SHA256_HEX for c in pin)
+    ):
+        raise classical.Refused(
+            f"expected data SHA256 must be 64 lowercase hex digits: {pin!r}",
+        )
+    return pin
+
+
+def _finite_baselines(baselines) -> bool:
+    keys = ("expert_return", "random_return", "expert_self_ce")
+    return isinstance(baselines, dict) and all(
+        isinstance(baselines.get(k), (int, float))
+        and not isinstance(baselines.get(k), bool)
+        and math.isfinite(baselines[k])
+        for k in keys
+    )
+
+
+def _verify_data(data_dir, seed, identity, n_rounds, expected_data_sha256=None):
+    """Check the shared data job and return its record, data, digest, acceptance.
+
+    The record is hashed and parsed from the same bytes. Every check below
+    applies whatever the source version; a record from another source version
+    is accepted only if ``expected_data_sha256`` equals its SHA256, and a pin
+    that does not match refuses even same-source data.
+    """
     data_dir = pathlib.Path(data_dir)
     path = data_dir / RESULT_FILE
     try:
-        record = pilot.read_json(path)
-        record_sha = pilot.sha256_file(path)
+        raw = path.read_bytes()
+        record = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise classical.Refused(f"Unreadable data record {path}: {exc}")
+    record_sha = hashlib.sha256(raw).hexdigest()
+    if expected_data_sha256 is not None and record_sha != expected_data_sha256:
+        raise classical.Refused(
+            f"Data record {path} has SHA256 {record_sha}, not the pinned "
+            f"{expected_data_sha256}",
+        )
+    if not isinstance(record, dict):
+        raise classical.Refused(f"{path} is not a data record")
+    config = record.get("config")
+    config = config if isinstance(config, dict) else {}
+    source = record.get("source")
+    source = source if isinstance(source, dict) else {}
+    files = source.get("files")
+    current = source_identity()
     checks = {
         "schema": record.get("schema") == DATA_SCHEMA,
+        "protocol": record.get("protocol") == DATA_PROTOCOL,
         "status_complete": record.get("status") == "complete",
         "env_name": record.get("env_name") == ENV_NAME,
         "episode_cap": record.get("episode_cap") == EPISODE_CAP,
         "seed": record.get("seed") == seed,
+        "config_sha256": record.get("config_sha256") == pilot.config_digest(config),
+        "config_seed": config.get("seed") == seed,
+        "config_budget": isinstance(config.get("budget"), int)
+        and config["budget"] >= n_rounds,
+        "config_rules": config.get("pool") == POOL_RULE
+        and config.get("stream") == STREAM_RULE
+        and config.get("expert_action_rule") == classical.ACTION_RULE,
+        "source_combined_sha256": isinstance(files, dict)
+        and source.get("combined_sha256") == pilot.config_digest(files),
+        "source_file_set": isinstance(files, dict)
+        and sorted(files) == sorted(current["files"]),
+        "package_versions": record.get("package_versions") == pilot.package_versions(),
         "expert_sha256": record.get("expert_sha256") == identity["expert_sha256"],
-        "policy_state_sha256": (record.get("preparation") or {}).get(
-            "policy_state_sha256",
-        )
-        == identity["policy_state_sha256"],
-        "baselines": isinstance(record.get("baselines"), dict),
+        "preparation_identity": record.get("preparation") == identity,
+        "baselines": _finite_baselines(record.get("baselines")),
     }
     failed = sorted(k for k, ok in checks.items() if not ok)
     if failed:
         raise classical.Refused(f"Data record {path} failed checks {failed}")
+    same_source = files == current["files"]
+    if not same_source and expected_data_sha256 is None:
+        raise classical.Refused(
+            f"Data record {path} was produced by source "
+            f"{source['combined_sha256']}, not the current "
+            f"{current['combined_sha256']}; reusing it requires pinning its "
+            "exact SHA256 (expected_data_sha256)",
+        )
     datasets = {}
     for name, file_name in (("pool", POOL_FILE), ("stream", STREAM_FILE)):
         entry = (record.get("datasets") or {}).get(name) or {}
@@ -861,10 +963,23 @@ def _verify_data(data_dir, seed, identity, n_rounds):
         data = ExpertData.load(data_path)
         if data.pairs_sha256() != entry.get("pairs_sha256"):
             raise classical.Refused(f"{data_path} content does not match its record")
+        if entry.get("n") != len(data):
+            raise classical.Refused(f"{data_path} size does not match its record")
         if len(data) < n_rounds:
             raise classical.Refused(f"{name} holds {len(data)} < {n_rounds} labels")
         datasets[name] = data
-    return record, datasets, record_sha
+    acceptance = {
+        "rule": "same_source" if same_source else "pinned_different_source",
+        "expected_data_sha256": expected_data_sha256,
+        "data_result_sha256": record_sha,
+        "checks": sorted(checks),
+        "producer_protocol": record["protocol"],
+        "producer_schema": record["schema"],
+        "producer_source": source,
+        "producer_package_versions": record["package_versions"],
+        "current_source_combined_sha256": current["combined_sha256"],
+    }
+    return record, datasets, record_sha, acceptance
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +1005,7 @@ def _experiment_config(method, seed, n_rounds, eval_interval, output_dir):
         expert_cache_dir=pathlib.Path(output_dir) / "unused-expert-cache",
         learning_rate=LEARNING_RATE,
         outer_early_stop=False,
+        grow_batch_with_data=True,
     )
 
 
@@ -905,28 +1021,36 @@ def run_job(
     job_limit_seconds: float,
     n_rounds: int = DEFAULT_BUDGET,
     eval_interval: int = EVAL_INTERVAL,
+    expected_data_sha256: Optional[str] = None,
     clock: Callable[[], datetime.datetime] = rollouts.utc_now,
 ) -> int:
     """Run one (method, restriction) pilot job into a fresh directory."""
     output_dir = pathlib.Path(output_dir).absolute()
     try:
         _validate_limits(seed, job_limit_seconds)
+        pin = _validate_pin(expected_data_sha256)
         if method not in METHODS:
             raise classical.Refused(f"method must be one of {METHODS}: {method!r}")
-        try:
-            restriction.get_restriction(restriction_id)
-        except ValueError as exc:
-            raise classical.Refused(str(exc))
+        if restriction_id not in RUN_RESTRICTIONS:
+            raise classical.Refused(
+                f"restriction must be one of {RUN_RESTRICTIONS}: {restriction_id!r}",
+            )
         if int(n_rounds) <= 0 or int(eval_interval) <= 0:
             raise classical.Refused("n_rounds and eval_interval must be positive")
         _check_cap()
         expert, identity = _load_expert(preparation_dir)
-        data_record, datasets, data_sha = _verify_data(
+        data_record, datasets, data_sha, acceptance = _verify_data(
             data_dir,
             seed,
             identity,
             n_rounds,
+            pin,
         )
+        if method == "bc" and len(datasets["pool"]) != n_rounds:
+            raise classical.Refused(
+                f"fixed BC fits the whole pool once: n_rounds {n_rounds} must "
+                f"equal the pool size {len(datasets['pool'])}",
+            )
         guard, limits = _deadlines(deadline, job_limit_seconds, clock)
     except classical.Refused as exc:
         return _refused(exc)
@@ -950,7 +1074,13 @@ def run_job(
         "beta": {"ftl": 0.0, "bc_iid": 1.0, "bc": None}[method],
         "eval_episodes": 100,
         "eval_deterministic": True,
-        "eval_budgets": eval_budgets(n_rounds, eval_interval),
+        "eval_budgets": (
+            [n_rounds]
+            if method == "bc"
+            else [0] + eval_budgets(n_rounds, eval_interval)
+        ),
+        "fixed_bc": FIXED_BC_RULE if method == "bc" else None,
+        "batch_rule": BATCH_RULE,
         "mixture": False,
         "experiment": experiment,
     }
@@ -1092,6 +1222,7 @@ def run_job(
                         "pairs_sha256"
                     ],
                     "baselines": data_record["baselines"],
+                    "acceptance": acceptance,
                 },
                 "scratch_demos": demos_rel if method != "bc" else None,
                 "trained_pairs_sha256": live["trained_pairs_sha256"],
@@ -1137,46 +1268,52 @@ def run_job(
             state["in_flight"] = "reading back the trained demonstrations"
 
     def run_fixed_bc(venv):
+        # One offline fit on the whole pool, as in run_experiment._run_bc.
         lengths = shared_entry["stats"]["episode_lengths"]
-        for b in eval_budgets(n_rounds, eval_interval):
-            state["in_flight"] = f"fixed BC fit at budget {b}"
-            guard.check(f"fixed BC fit at budget {b}")
-            th.manual_seed(seed)
-            fit_start = time.monotonic()
-            trainer, inner_log = run_experiment._fit_fixed_bc(
-                config,
-                venv,
-                factory(expert),
-                shared.transitions(b),
-                np.random.default_rng(seed),
-                device=DEVICE,
-                tb_tag=f"bc_budget{b:05d}",
-            )
-            state["in_flight"] = f"fixed BC evaluation at budget {b}"
-            eval_start = time.monotonic()
-            evaluation = run_experiment._compute_round_eval(
-                trainer.policy,
-                expert,
-                venv,
-                baselines,
-            )
-            eval_end = time.monotonic()
-            checkpoint = run_experiment._save_policy(config, trainer.policy, b)
-            append(
-                {
-                    "round": b,
-                    "n_observations": b,
-                    "prefix_pairs_sha256": shared.pairs_sha256(b),
-                    "logical": pool_logical_cost(lengths, b),
-                    **inner_log,
-                    **evaluation,
-                    "checkpoint": relative(checkpoint),
-                    "wall_seconds": {
-                        "fit": eval_start - fit_start,
-                        "eval": eval_end - eval_start,
-                    },
+        transitions = shared.transitions(n_rounds)
+        trained = pairs_sha256(transitions.obs, transitions.acts)
+        if trained != shared_entry["pairs_sha256"]:
+            raise RuntimeError("Fixed BC would train on data other than the pool")
+        state["in_flight"] = "fixed BC fit on the full pool"
+        guard.check("fixed BC fit on the full pool")
+        th.manual_seed(seed)
+        fit_start = time.monotonic()
+        trainer, inner_log = run_experiment._fit_fixed_bc(
+            config,
+            venv,
+            factory(expert),
+            transitions,
+            np.random.default_rng(seed),
+            device=DEVICE,
+            tb_tag="bc_full_pool",
+        )
+        state["in_flight"] = "fixed BC evaluation"
+        eval_start = time.monotonic()
+        evaluation = run_experiment._compute_round_eval(
+            trainer.policy,
+            expert,
+            venv,
+            baselines,
+        )
+        eval_end = time.monotonic()
+        checkpoint = run_experiment._save_policy(config, trainer.policy, n_rounds)
+        live["trained_pairs_sha256"] = trained
+        append(
+            {
+                "round": 0,
+                "n_observations": n_rounds,
+                "reference": "flat",
+                "trained_pairs_sha256": trained,
+                "logical": pool_logical_cost(lengths, n_rounds),
+                **inner_log,
+                **evaluation,
+                "checkpoint": relative(checkpoint),
+                "wall_seconds": {
+                    "fit": eval_start - fit_start,
+                    "eval": eval_end - eval_start,
                 },
-            )
+            },
+        )
 
     def body():
         start = time.monotonic()
@@ -1251,7 +1388,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--data-dir", type=pathlib.Path, required=True)
     run.add_argument("--seed", type=int, required=True)
     run.add_argument("--method", choices=METHODS, required=True)
-    run.add_argument("--restriction", choices=RESTRICTION_IDS, required=True)
+    run.add_argument("--restriction", choices=RUN_RESTRICTIONS, required=True)
+    run.add_argument(
+        "--expected-data-sha256",
+        default=None,
+        help="SHA256 of the data job's result.json bytes; required when that "
+        "record was produced by a different source version",
+    )
     return parser
 
 
@@ -1279,6 +1422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             method=args.method,
             restriction_id=args.restriction,
             seed=args.seed,
+            expected_data_sha256=args.expected_data_sha256,
             **common,
         )
     status = "refused"

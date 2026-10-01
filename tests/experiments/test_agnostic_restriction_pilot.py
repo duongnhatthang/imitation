@@ -240,7 +240,9 @@ def test_data_job_records_shared_datasets_baselines_and_physical_costs(
     prep_record = json.loads((prep / "preparation.json").read_text())
 
     assert record["status"] == "complete"
-    assert record["protocol"] == rp.PROTOCOL
+    # The data producer is unchanged, so it keeps protocol /1.
+    assert record["protocol"] == rp.DATA_PROTOCOL != rp.PROTOCOL
+    assert record["schema"] == rp.DATA_SCHEMA
     assert record["env_name"] == "CartPole-v1" and record["seed"] == 300
     assert record["episode_cap"] == 500
     assert record["expert_sha256"] == prep_record["expert_sha256"]
@@ -275,29 +277,36 @@ def test_full_and_restricted_runs_train_on_the_same_exact_data(
     name = "pool" if method == "bc" else "stream"
     shared = rp.ExpertData.load(data_dir / data["datasets"][name]["file"])
     records = {}
-    for rid in ("identity", "cart_position_zero"):
+    for rid in rp.RUN_RESTRICTIONS:
         out = tmp_path / rid
         assert _run(prep, data_dir, out, method, rid) == classical.EXIT_COMPLETE
         records[rid] = _read(out)
         record = records[rid]
         assert record["status"] == "complete"
+        assert record["protocol"] == rp.PROTOCOL and record["schema"] == rp.RUN_SCHEMA
         assert record["method"] == method and record["restriction_id"] == rid
         assert record["data"]["data_result_sha256"] == rp.pilot.sha256_file(
             data_dir / rp.RESULT_FILE,
         )
+        assert record["data"]["acceptance"]["rule"] == "same_source"
         evals = [r for r in record["records"] if r.get("normalized_return") is not None]
         budgets = [r["n_observations"] for r in evals]
         if method == "bc":
-            assert budgets == [1, 3, 6]
+            assert budgets == record["config"]["eval_budgets"] == [BUDGET]
         else:
-            assert budgets == [0, 1, 3, 6]
+            assert budgets == record["config"]["eval_budgets"] == [0, 1, 3, 6]
         for r in evals:
             b = r["n_observations"]
-            if b:
+            if method == "bc_iid" and b:
                 assert r["prefix_pairs_sha256"] == shared.pairs_sha256(b)
             assert len(r["episode_returns"]) == 100
             policy = restriction.load_policy_checkpoint(out / r["checkpoint"])
             assert policy.restriction_id == rid
+        for r in record["records"]:
+            if r.get("inner_es_stop_epoch") is not None:
+                # No held-out split at these sizes: the batch is min(32, n).
+                assert r["train_batch_size"] == min(32, r["n_observations"])
+                assert r["train_examples"] == r["n_observations"]
         acct = record["accounting"]
         done = acct["completed_records"]
         assert done["retained_labels"] == BUDGET
@@ -311,51 +320,74 @@ def test_full_and_restricted_runs_train_on_the_same_exact_data(
         assert record["snapshot"]["final"] is True
         assert acct["shared_acquisition"]["pairs_sha256"] == shared.pairs_sha256()
         assert acct["shared_acquisition"]["charged_to_this_run"] is False
-    if method == "bc":
-        # Fixed BC cold-fits every plotted prefix with the unchanged routine.
-        for r in records["identity"]["records"]:
-            assert r["logical"]["labels"] == r["n_observations"]
-            assert r["logical"]["env_steps"] >= r["n_observations"]
-        done = records["identity"]["accounting"]["completed_records"]
-        assert done["training"]["fits"] == 3
-    else:
-        for rid, record in records.items():
-            assert record["trained_pairs_sha256"] == shared.pairs_sha256(BUDGET)
-            done = record["accounting"]["completed_records"]
-            assert done["training"]["fits"] == BUDGET
+    for rid, record in records.items():
+        assert record["trained_pairs_sha256"] == shared.pairs_sha256(BUDGET)
+        done = record["accounting"]["completed_records"]
+        assert done["training"]["fits"] == (1 if method == "bc" else BUDGET)
     hashes = {
-        rid: [r.get("prefix_pairs_sha256") for r in rec["records"]]
+        rid: [
+            (r.get("prefix_pairs_sha256"), r.get("trained_pairs_sha256"))
+            for r in rec["records"]
+        ]
         for rid, rec in records.items()
     }
-    assert hashes["identity"] == hashes["cart_position_zero"]
+    assert hashes["identity"] == hashes[rp.PILOT_RESTRICTION]
 
 
-def test_fixed_bc_points_are_cold_fits_independent_of_earlier_budgets(
+def test_fixed_bc_is_one_full_pool_fit_of_the_original_routine(
     prep,
     data_dir,
     tmp_path,
 ):
-    # Budgets [1, 3] versus [1, 2, 3]: a warm start or a wrong prefix would
-    # make the policy at B = 3 depend on the earlier fits.
-    weights = []
-    for interval in (3, 1):
-        out = tmp_path / f"interval{interval}"
-        code = _run(
-            prep,
-            data_dir,
-            out,
-            "bc",
-            "cart_position_zero",
-            n_rounds=3,
-            eval_interval=interval,
-        )
-        assert code == classical.EXIT_COMPLETE
-        [last] = [r for r in _read(out)["records"] if r["n_observations"] == 3]
-        weights.append(restriction.load_policy_checkpoint(out / last["checkpoint"]))
-    first, second = (w.state_dict() for w in weights)
-    assert first.keys() == second.keys()
-    for name in first:
-        assert th.equal(first[name], second[name]), name
+    out = tmp_path / "bc"
+    # The eval interval is irrelevant to offline BC: it never fits prefixes.
+    code = _run(prep, data_dir, out, "bc", rp.PILOT_RESTRICTION, eval_interval=1)
+    assert code == classical.EXIT_COMPLETE
+    record = _read(out)
+    pool = rp.ExpertData.load(data_dir / rp.POOL_FILE)
+
+    [row] = record["records"]
+    assert row["reference"] == "flat"
+    assert row["n_observations"] == BUDGET == len(pool)
+    assert row["trained_pairs_sha256"] == pool.pairs_sha256()
+    assert row["logical"]["labels"] == BUDGET
+    assert len(row["episode_returns"]) == 100
+    assert set(row["wall_seconds"]) == {"fit", "eval"}
+    assert record["config"]["fixed_bc"] == rp.FIXED_BC_RULE
+    done = record["accounting"]["completed_records"]
+    assert done["training"]["fits"] == 1 and done["evaluation"]["evaluations"] == 1
+    checkpoints = sorted((out / "checkpoints").rglob("*.pt"))
+    assert [p.relative_to(out).as_posix() for p in checkpoints] == [row["checkpoint"]]
+
+    # The saved policy is exactly the standalone fixed-BC fit on the pool.
+    expert, _ = classical.load_verified_expert(prep, "CartPole-v1")
+    config = rp._experiment_config("bc", 300, BUDGET, 1, tmp_path / "standalone")
+    venv = env_utils.make_env("CartPole-v1", 1, np.random.default_rng(0))
+    th.manual_seed(300)
+    trainer, inner_log = rp.run_experiment._fit_fixed_bc(
+        config,
+        venv,
+        restriction.make_linear_policy(expert.policy, rp.PILOT_RESTRICTION),
+        pool.transitions(),
+        np.random.default_rng(300),
+        device="cpu",
+        tb_tag="standalone",
+    )
+    venv.close()
+    saved = restriction.load_policy_checkpoint(out / row["checkpoint"]).state_dict()
+    fitted = trainer.policy.state_dict()
+    assert saved.keys() == fitted.keys()
+    for name in saved:
+        assert th.equal(saved[name], fitted[name]), name
+    for key, value in inner_log.items():
+        assert row[key] == value, key
+
+    # A budget other than the whole pool is refused rather than prefix-fitted.
+    short = tmp_path / "short"
+    assert _run(prep, data_dir, short, "bc", "identity", n_rounds=BUDGET - 1) == (
+        classical.EXIT_REFUSED
+    )
+    assert not short.exists()
 
 
 def test_restricted_ftl_collects_learner_states_with_full_state_expert_labels(
@@ -364,7 +396,7 @@ def test_restricted_ftl_collects_learner_states_with_full_state_expert_labels(
     tmp_path,
 ):
     out = tmp_path / "ftl"
-    code = _run(prep, data_dir, out, "ftl", "cart_position_zero", n_rounds=4)
+    code = _run(prep, data_dir, out, "ftl", rp.PILOT_RESTRICTION, n_rounds=4)
     assert code == classical.EXIT_COMPLETE
     record = _read(out)
     expert, _ = classical.load_verified_expert(prep, "CartPole-v1")
@@ -376,7 +408,8 @@ def test_restricted_ftl_collects_learner_states_with_full_state_expert_labels(
     obs = np.concatenate([d.obs[:-1] for d in demos])
     acts = np.concatenate([d.acts for d in demos])
     assert len(acts) == 4
-    assert np.all(obs[:, 0] != 0)
+    # Stored demos keep the full state, hidden coordinates included.
+    assert np.all(obs[:, 0] != 0) and np.all(obs[:, 3] != 0)
     labels, _ = expert.policy.predict(obs, deterministic=True)
     np.testing.assert_array_equal(acts, labels)
     assert record["trained_pairs_sha256"] == rp.pairs_sha256(obs, acts)
@@ -404,7 +437,10 @@ def test_restricted_ftl_collects_learner_states_with_full_state_expert_labels(
     assert record["config"]["experiment"]["warm_start"] is False
     assert record["config"]["experiment"]["outer_early_stop"] is False
     assert record["config"]["experiment"]["inner_early_stop"] is True
+    assert record["config"]["experiment"]["grow_batch_with_data"] is True
     assert record["config"]["mixture"] is False
+    trained = [r for r in record["records"] if r["round"]]
+    assert [r["train_batch_size"] for r in trained] == [1, 2, 3, 4]
 
 
 def test_refusals_leave_existing_output_and_data_untouched(prep, data_dir, tmp_path):
@@ -420,6 +456,12 @@ def test_refusals_leave_existing_output_and_data_untouched(prep, data_dir, tmp_p
     )
     assert not (tmp_path / "s").exists()
     assert _run(prep, data_dir, tmp_path / "r", "bc", "bogus") == classical.EXIT_REFUSED
+    # The historical x-only mask is registered but not a run choice.
+    for method in rp.METHODS:
+        out = tmp_path / f"x-only-{method}"
+        code = _run(prep, data_dir, out, method, "cart_position_zero")
+        assert code == classical.EXIT_REFUSED
+        assert not out.exists()
 
     tampered = tmp_path / "tampered"
     shutil.copytree(data_dir, tampered)
@@ -433,6 +475,197 @@ def test_refusals_leave_existing_output_and_data_untouched(prep, data_dir, tmp_p
     assert not (tmp_path / "t").exists()
 
 
+def _sha(path):
+    return rp.pilot.sha256_file(path)
+
+
+@pytest.fixture(scope="module")
+def other_source_data_dir(prep, tmp_path_factory):
+    """A data job whose recorded producer source differs from the current one."""
+    out = tmp_path_factory.mktemp("other-source") / "data"
+    real = rp.source_identity()
+    files = dict(real["files"])
+    files["experiments/agnostic/restriction_pilot.py"] = "0" * 64
+    fake = {
+        "files": files,
+        "combined_sha256": rp.pilot.config_digest(files),
+        "git_revision": "2896ffe",
+        "git_dirty": False,
+    }
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(rp, "source_identity", lambda: fake)
+        code = rp.prepare_data(
+            out,
+            prep,
+            seed=300,
+            deadline=FAR,
+            job_limit_seconds=3600,
+            budget=BUDGET,
+            baseline_episodes=2,
+            clock=Clock(),
+        )
+    assert code == classical.EXIT_COMPLETE
+    return out
+
+
+def test_data_from_another_source_requires_its_exact_pin(
+    prep,
+    other_source_data_dir,
+    tmp_path,
+    capsys,
+):
+    data = other_source_data_dir
+    pin = _sha(data / rp.RESULT_FILE)
+    for name, value, reason in (
+        ("unpinned", None, "requires pinning its exact SHA256"),
+        ("wrong", "0" * 64, "not the pinned"),
+        ("malformed", pin.upper(), "64 lowercase hex digits"),
+        ("short", pin[:-1], "64 lowercase hex digits"),
+    ):
+        out = tmp_path / name
+        code = _run(prep, data, out, "bc_iid", "identity", expected_data_sha256=value)
+        assert code == classical.EXIT_REFUSED, name
+        assert reason in capsys.readouterr().err, name
+        assert not out.exists(), name
+
+    out = tmp_path / "pinned"
+    code = _run(prep, data, out, "bc_iid", "identity", expected_data_sha256=pin)
+    assert code == classical.EXIT_COMPLETE
+    record = _read(out)
+    acceptance = record["data"]["acceptance"]
+    producer = _read(data)["source"]
+    assert acceptance["rule"] == "pinned_different_source"
+    assert acceptance["expected_data_sha256"] == pin
+    assert acceptance["data_result_sha256"] == record["data"]["data_result_sha256"]
+    assert acceptance["data_result_sha256"] == pin
+    assert acceptance["producer_protocol"] == rp.DATA_PROTOCOL
+    assert acceptance["producer_source"] == producer
+    # The execution source is recorded separately from the producer's.
+    assert (
+        record["source"]["combined_sha256"] == rp.source_identity()["combined_sha256"]
+    )
+    assert record["source"]["combined_sha256"] != producer["combined_sha256"]
+    assert acceptance["current_source_combined_sha256"] == (
+        record["source"]["combined_sha256"]
+    )
+
+
+def test_a_matching_pin_also_binds_same_source_data(prep, data_dir, tmp_path):
+    out = tmp_path / "wrong-pin"
+    code = _run(prep, data_dir, out, "bc", "identity", expected_data_sha256="0" * 64)
+    assert code == classical.EXIT_REFUSED
+    assert not out.exists()
+    pin = _sha(data_dir / rp.RESULT_FILE)
+    out = tmp_path / "pinned"
+    code = _run(prep, data_dir, out, "bc", "identity", expected_data_sha256=pin)
+    assert code == classical.EXIT_COMPLETE
+    assert _read(out)["data"]["acceptance"]["rule"] == "same_source"
+
+
+def _mutations():
+    def config_budget(r):
+        r["config"]["budget"] += 1  # config_sha256 no longer matches
+
+    def config_rule(r):
+        r["config"]["pool"] = "prefix pool"
+        r["config_sha256"] = rp.pilot.config_digest(r["config"])
+
+    def source_map(r):
+        r["source"]["files"]["algorithms/bc.py"] = "1" * 64
+
+    def source_file_set(r):
+        files = r["source"]["files"]
+        files.pop("algorithms/bc.py")
+        r["source"]["combined_sha256"] = rp.pilot.config_digest(files)
+
+    def packages(r):
+        r["package_versions"]["torch"] = "0.0.0"
+
+    def preparation(r):
+        r["preparation"]["record_sha256"] = "2" * 64
+
+    def protocol(r):
+        r["protocol"] = rp.PROTOCOL
+
+    def baselines(r):
+        r["baselines"]["random_return"] = None
+
+    def dataset_size(r):
+        r["datasets"]["pool"]["n"] += 1
+
+    # Each edit and the refusal reason it must produce.
+    return [
+        (config_budget, "'config_sha256'"),
+        (config_rule, "'config_rules'"),
+        (source_map, "'source_combined_sha256'"),
+        (source_file_set, "'source_file_set'"),
+        (packages, "'package_versions'"),
+        (preparation, "'preparation_identity'"),
+        (protocol, "'protocol'"),
+        (baselines, "'baselines'"),
+        (dataset_size, "size does not match its record"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutate, reason",
+    _mutations(),
+    ids=lambda v: getattr(v, "__name__", ""),
+)
+def test_pinned_data_records_are_still_fully_checked(
+    prep,
+    other_source_data_dir,
+    tmp_path,
+    capsys,
+    mutate,
+    reason,
+):
+    data = tmp_path / "data"
+    shutil.copytree(other_source_data_dir, data)
+    record = _read(data)
+    mutate(record)
+    (data / rp.RESULT_FILE).write_text(json.dumps(record))
+    out = tmp_path / "run"
+    # The pin matches the edited bytes, so only the content checks can refuse.
+    code = _run(
+        prep,
+        data,
+        out,
+        "bc_iid",
+        "identity",
+        expected_data_sha256=_sha(data / rp.RESULT_FILE),
+    )
+    assert code == classical.EXIT_REFUSED
+    assert reason in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_pinned_data_files_must_match_their_recorded_bytes(
+    prep,
+    other_source_data_dir,
+    tmp_path,
+    capsys,
+):
+    data = tmp_path / "data"
+    shutil.copytree(other_source_data_dir, data)
+    stream = rp.ExpertData.load(data / rp.STREAM_FILE)
+    stream.obs[0, 3] += 1.0
+    (data / rp.STREAM_FILE).unlink()
+    stream.save(data / rp.STREAM_FILE)
+    out = tmp_path / "run"
+    code = _run(
+        prep,
+        data,
+        out,
+        "bc_iid",
+        "identity",
+        expected_data_sha256=_sha(data / rp.RESULT_FILE),
+    )
+    assert code == classical.EXIT_REFUSED
+    assert "does not match its recorded digest" in capsys.readouterr().err
+    assert not out.exists()
+
+
 def test_deadline_mid_run_keeps_a_partial_record(prep, data_dir, tmp_path):
     clock = Clock(step_seconds=1.0)
     start = clock.now
@@ -442,7 +675,7 @@ def test_deadline_mid_run_keeps_a_partial_record(prep, data_dir, tmp_path):
         data_dir,
         out,
         "bc_iid",
-        "cart_position_zero",
+        rp.PILOT_RESTRICTION,
         clock=clock,
         deadline=start + datetime.timedelta(seconds=6),
     )
@@ -580,7 +813,15 @@ def test_failure_inside_baselines_keeps_datasets_and_observed_steps(
 def test_job_limit_bounds_the_effective_deadline(prep, data_dir, tmp_path):
     clock = Clock(step_seconds=1.0)
     out = tmp_path / "limited"
-    code = _run(prep, data_dir, out, "bc", "identity", clock=clock, job_limit_seconds=5)
+    code = _run(
+        prep,
+        data_dir,
+        out,
+        "bc_iid",
+        "identity",
+        clock=clock,
+        job_limit_seconds=5,
+    )
     record = _read(out)
 
     assert code == classical.EXIT_INCOMPLETE
@@ -604,7 +845,13 @@ def test_audit_job_keeps_every_pair_and_uses_no_training_data(prep, tmp_path):
 
     assert code == classical.EXIT_COMPLETE
     assert record["status"] == "complete"
+    assert record["protocol"] == rp.PROTOCOL
+    assert record["schema"] == rp.AUDIT_SCHEMA
     audit = record["audit"]
+    assert audit["restriction_id"] == rp.PILOT_RESTRICTION
+    assert record["config"]["restriction_id"] == rp.PILOT_RESTRICTION
+    assert audit["witness_scope"] == restriction.AUDIT_WITNESS_SCOPE
+    assert audit["grid"] == list(restriction.AUDIT_X_GRID)
     assert audit["reset_seed"] == rp.AUDIT_SEED == 301
     assert audit["status"] in ("conflict_found", "restriction_uncertified")
     assert audit["labels_used_for_training"] is False
@@ -652,9 +899,30 @@ def test_cli_audit_and_refusal_of_the_excluded_audit_seed(prep, data_dir, tmp_pa
         "--method",
         "ftl",
         "--restriction",
-        "cart_position_zero",
+        rp.PILOT_RESTRICTION,
         "--seed",
         "301",
     )
     assert refused.returncode == classical.EXIT_USAGE, refused.stderr
     assert not (tmp_path / "run").exists()
+
+    run = [
+        "run",
+        *common,
+        "--data-dir",
+        str(data_dir),
+        "--output-dir",
+        str(tmp_path / "pinned"),
+        "--method",
+        "bc",
+        "--restriction",
+        rp.PILOT_RESTRICTION,
+        "--seed",
+        "300",
+    ]
+    historical = _cli(*run[:-4], "--restriction", "cart_position_zero", *run[-2:])
+    assert historical.returncode == classical.EXIT_USAGE, historical.stderr
+    wrong = _cli(*run, "--expected-data-sha256", "0" * 64)
+    assert wrong.returncode == classical.EXIT_REFUSED, wrong.stderr
+    assert json.loads(wrong.stdout.strip().splitlines()[-1])["status"] == "refused"
+    assert not (tmp_path / "pinned").exists()

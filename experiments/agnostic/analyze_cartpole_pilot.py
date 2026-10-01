@@ -11,6 +11,13 @@ into a new directory only:
 The controller inventory is authoritative for terminal state and wall time. A
 timed-out run's ``result.json`` is its last saved snapshot (status ``running``,
 ``snapshot.final`` false), never a live job and never a complete result.
+
+FTL and BC-iid are learning curves. Offline BC is the original ``_run_bc``
+baseline: one policy per observation condition, trained once on the whole
+offline pool and drawn flat. The historical BC jobs also fitted earlier pool
+prefixes; only the stored full-budget fit and its evaluation are used here, and
+the prefix values stay in the private raw records. The common label budget
+comes from the four online curves only.
 """
 
 import argparse
@@ -35,7 +42,11 @@ SEED = 300
 METHODS = ("ftl", "bc", "bc_iid")
 RESTRICTIONS = ("identity", "cart_position_zero")
 RUN_IDS = tuple(f"run-{m}-{r}" for m in METHODS for r in RESTRICTIONS)
-METHOD_LABEL = {"ftl": "FTL", "bc": "Fixed BC", "bc_iid": "BC-iid"}
+# Learning-curve methods. Offline BC is a flat reference, not a curve.
+ONLINE = ("ftl", "bc_iid")
+ONLINE_IDS = tuple(f"run-{m}-{r}" for m in ONLINE for r in RESTRICTIONS)
+BC_IDS = tuple(f"run-bc-{r}" for r in RESTRICTIONS)
+METHOD_LABEL = {"ftl": "FTL", "bc": "Offline BC", "bc_iid": "BC-iid"}
 OBS_LABEL = {"identity": "full observation", "cart_position_zero": "cart position hidden"}
 COLOR = {"ftl": "#1b7837", "bc": "#2166ac", "bc_iid": "#b2182b"}
 STYLE = {"identity": "--", "cart_position_zero": "-"}
@@ -258,40 +269,94 @@ def check_normalized(job_id, r, ret, baselines):
             f"(mean return - random) / (expert - random) = {expected}")
 
 
-def curve(job_id, rec, n_episodes, cap):
-    points = []
+def evaluation_point(job_id, r, n_episodes, cap, baselines):
+    """One saved evaluation, with the stored metrics reported as recorded."""
+    ret = np.asarray(r["episode_returns"], dtype=float)
+    require(ret.size == n_episodes, f"{job_id}: evaluation with {ret.size} episodes")
+    check_normalized(job_id, r, ret, baselines)
+    return {
+        "labels": int(r["n_observations"]),
+        "round": int(r["round"]),
+        "mean_return": float(ret.mean()),
+        "min_return": float(ret.min()),
+        "max_return": float(ret.max()),
+        "episodes": int(ret.size),
+        "episodes_at_cap": int((ret == cap).sum()),
+        "normalized_return": r["normalized_return"],
+        **{k: r[k] for k in METRICS},
+        "eval_env_steps": r["d_eval_size"],
+    }
+
+
+def check_rounds(job_id, rec):
     for r in rec["records"]:
         require(r["round"] == r["n_observations"],
                 f"{job_id}: round {r['round']} has {r['n_observations']} labels")
-        if r.get("episode_returns") is None:
-            continue
-        ret = np.asarray(r["episode_returns"], dtype=float)
-        require(ret.size == n_episodes, f"{job_id}: evaluation with {ret.size} episodes")
-        check_normalized(job_id, r, ret, rec["data"]["baselines"])
-        points.append({
-            "labels": int(r["n_observations"]),
-            "round": int(r["round"]),
-            "mean_return": float(ret.mean()),
-            "min_return": float(ret.min()),
-            "max_return": float(ret.max()),
-            "episodes": int(ret.size),
-            "episodes_at_cap": int((ret == cap).sum()),
-            "normalized_return": r["normalized_return"],
-            **{k: r[k] for k in METRICS},
-            "eval_env_steps": r["d_eval_size"],
-        })
+
+
+def curve(job_id, rec, n_episodes, cap):
+    """Every saved evaluation of an online (FTL or BC-iid) run."""
+    check_rounds(job_id, rec)
+    points = [evaluation_point(job_id, r, n_episodes, cap, rec["data"]["baselines"])
+              for r in rec["records"] if r.get("episode_returns") is not None]
     labels = [p["labels"] for p in points]
     require(labels and labels == sorted(set(labels)), f"{job_id}: bad evaluation order")
     return points
 
 
-def run_row(job_id, rec, sha, job, att, points, n_rounds):
+def bc_reference(job_id, rec, n_episodes, cap, n_rounds, pool_pairs_sha256):
+    """The offline BC reference: the stored fit on the whole pool, and nothing else.
+
+    The historical job also fitted every smaller prefix. Those records are
+    neither selected nor summarized; without a saved full-budget evaluation on
+    the whole pool there is no reference and the analysis refuses.
+    """
+    check_rounds(job_id, rec)
+    ends = [r for r in rec["records"] if r["n_observations"] == n_rounds]
+    require(len(ends) == 1, f"{job_id}: expected one record at the full budget "
+            f"{n_rounds}, found {len(ends)}; refusing to substitute a prefix fit")
+    r = ends[0]
+    require(r.get("episode_returns") is not None,
+            f"{job_id}: full-budget record has no saved evaluation")
+    require(r.get("prefix_pairs_sha256") == pool_pairs_sha256,
+            f"{job_id}: full-budget fit was not on the whole offline pool")
+    require(r.get("checkpoint"), f"{job_id}: full-budget fit has no checkpoint")
+    point = evaluation_point(job_id, r, n_episodes, cap, rec["data"]["baselines"])
+    wall = r["wall_seconds"]
+    return {
+        **point,
+        "trained_on": "the whole offline pool",
+        "pool_pairs_sha256": r["prefix_pairs_sha256"],
+        "checkpoint": r["checkpoint"],
+        "inner_es_stop_epoch": r["inner_es_stop_epoch"],
+        "inner_es_fallback": r["inner_es_fallback"],
+        "reference_fit_seconds": wall["fit"],
+        "reference_eval_seconds": wall["eval"],
+    }
+
+
+def online_matched_budget(points):
+    """Largest label count evaluated by all four online curves.
+
+    Offline BC is not part of this rule: its one policy is trained on the whole
+    pool and is reported separately, never as label matched.
+    """
+    shared = set.intersection(*({p["labels"] for p in points[j]} for j in ONLINE_IDS))
+    require(shared, "no evaluation budget is shared by the four online runs")
+    return max(shared)
+
+
+def run_row(job_id, rec, sha, job, att, n_rounds):
+    """Physical record of one job: state, timing and saved counts, as recorded."""
     method, restriction = job_id.split("-", 2)[1:]
     acc = rec["accounting"]
     done = acc["completed_records"]
     last_saved_round = max(r["round"] for r in rec["records"])
+    evaluated = [r["n_observations"] for r in rec["records"]
+                 if r.get("episode_returns") is not None]
+    require(evaluated, f"{job_id}: no saved evaluation")
     if job["state"] == "complete":
-        require(points[-1]["labels"] == n_rounds and last_saved_round == n_rounds,
+        require(evaluated[-1] == n_rounds and last_saved_round == n_rounds,
                 f"{job_id}: complete run does not end at {n_rounds}")
         require(acc["totals"]["exact"] is True, f"{job_id}: complete totals not exact")
     tail = (utc(att["ended_at"]) - utc(rec["snapshot"]["written_at_utc"])).total_seconds()
@@ -310,8 +375,8 @@ def run_row(job_id, rec, sha, job, att, points, n_rounds):
         "snapshot_written_at_utc": rec["snapshot"]["written_at_utc"],
         "seconds_from_last_snapshot_to_controller_end": tail,
         "last_saved_training_round": last_saved_round,
-        "last_evaluated_labels": points[-1]["labels"],
-        "evaluations_saved": len(points),
+        "last_evaluated_labels": evaluated[-1],
+        "evaluations_saved": len(evaluated),
         "result_sha256": sha,
         "controller_result_sha256": job["result_sha256"],
         "controller_hash_check": "matched" if job["state"] == "complete"
@@ -392,7 +457,12 @@ def label(job_id):
     return f"{METHOD_LABEL[m]}, {OBS_LABEL[r]}"
 
 
-def curves_figure(points, rows, baselines, cap, ceiling, n_episodes):
+def curves_figure(points, refs, rows, baselines, cap, ceiling, n_episodes, n_rounds):
+    """Online learning curves with the offline BC reference drawn flat.
+
+    ``points`` holds the four online curves; ``refs`` the one offline BC
+    evaluation per observation condition.
+    """
     expert_return = baselines["expert_return"]
     random_return = baselines["random_return"]
     fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.8), sharex=True)
@@ -405,7 +475,7 @@ def curves_figure(points, rows, baselines, cap, ceiling, n_episodes):
          "Expert rollout cross-entropy on the same learner-visited states"),
     ]
     for ax, (key, title) in zip(axes.flat, panels):
-        for job_id in RUN_IDS:
+        for job_id in ONLINE_IDS:
             m, r = job_id.split("-", 2)[1:]
             xs = [p["labels"] for p in points[job_id]]
             ys = [np.nan if p[key] is None else p[key] for p in points[job_id]]
@@ -413,32 +483,43 @@ def curves_figure(points, rows, baselines, cap, ceiling, n_episodes):
             if rows[job_id]["controller_state"] == "timed_out":
                 ax.plot(xs[-1], ys[-1], "X", ms=9, color=COLOR[m], mec="black",
                         mew=0.8, zorder=5)
+        # One fixed policy per condition: a flat line, not a curve over labels.
+        for job_id in BC_IDS:
+            r = job_id.split("-", 2)[2]
+            if refs[job_id][key] is not None:
+                ax.axhline(refs[job_id][key], ls=STYLE[r], color=COLOR["bc"], lw=1.5,
+                           alpha=0.9, zorder=1)
         ax.set_title(title, fontsize=10.5)
-        ax.set_xlim(-15, 1015)
+        ax.set_xlim(-15, n_rounds + 15)
         ax.grid(alpha=0.3)
     ax = axes[0, 0]
     ax.axhline(1.0, color="#555555", ls=":", lw=1.2, zorder=0)
     ax.axhline(0.0, color="#999999", ls="-.", lw=1.0, zorder=0)
     # Limits follow the stored values so nothing is clipped.
-    norm = [p["normalized_return"] for j in RUN_IDS for p in points[j]]
+    norm = ([p["normalized_return"] for j in ONLINE_IDS for p in points[j]]
+            + [refs[j]["normalized_return"] for j in BC_IDS])
     ax.set_ylim(min(0.0, min(norm)) - 0.08, max(1.0, max(norm)) + 0.08)
     same = "equals" if expert_return == cap else "differs from"
     ceiling_text = (
         f"Ceiling: normalized 1 is raw {expert_return:g}, the expert reference;\n"
         f"it {same} the {cap} step cap. "
-        + ("All trained curves sit on it\nand overlap; no jitter is added."
-           if ceiling else "Curves that reach it\noverlap; no jitter is added.")
+        + ("All trained evaluations and both\noffline BC references sit on it and "
+           "overlap;\nno jitter is added." if ceiling
+           else "Lines that reach it\noverlap; no jitter is added.")
     )
-    ax.text(990, 0.93, ceiling_text, ha="right", va="top", fontsize=8.5,
+    ax.text(n_rounds - 10, 0.93, ceiling_text, ha="right", va="top", fontsize=8.5,
             color="#333333")
     ax.set_ylabel("normalized return (random 0, expert 1)")
     axes[0, 1].set_ylabel("Cross-entropy (natural log)")
     axes[1, 0].set_ylabel("fraction of visited states")
     axes[1, 1].set_ylabel("Cross-entropy (natural log)")
     for ax in axes[1]:
-        ax.set_xlabel("expert labels used for training (training round or prefix size)")
+        ax.set_xlabel("expert labels used for training (FTL and BC-iid round)")
     handles = [Line2D([], [], color=COLOR[m], lw=2.5, label=METHOD_LABEL[m])
-               for m in METHODS]
+               for m in ONLINE]
+    handles.append(Line2D([], [], color=COLOR["bc"], lw=2.5,
+                          label=f"{METHOD_LABEL['bc']}: one fit on all {n_rounds:,}\n"
+                                "pool labels, flat reference"))
     handles += [Line2D([], [], color="#444444", ls=STYLE[r], lw=1.5,
                        label=OBS_LABEL[r].capitalize()) for r in RESTRICTIONS]
     handles += [
@@ -452,8 +533,8 @@ def curves_figure(points, rows, baselines, cap, ceiling, n_episodes):
     ]
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=9, frameon=False,
                bbox_to_anchor=(0.5, 0.075))
-    fig.suptitle("CartPole restriction pilot, training seed 300: every saved evaluation",
-                 fontsize=13, fontweight="bold")
+    fig.suptitle("CartPole restriction pilot, training seed 300: online learning "
+                 "curves and the offline BC reference", fontsize=13, fontweight="bold")
     fig.text(
         0.5, 0.008,
         "Return: stored normalized_return, "
@@ -463,10 +544,12 @@ def curves_figure(points, rows, baselines, cap, ceiling, n_episodes):
         "Cross-entropy: average negative natural log probability of the expert's "
         "deterministic action, per learner-visited state; lower is better.\n"
         "Cross-entropy and disagreement are measured on each learner's own visited "
-        "states, not on a common distribution. Round 0 is the untrained initial head "
-        "(FTL, BC-iid only).\nTimed-out lines stop at their last saved evaluation and "
-        "are not extended. One training seed; per-episode cross-entropy and "
-        "disagreement were not stored, so no bands are drawn.",
+        "states, not on a common distribution. Round 0 is the untrained initial head.\n"
+        f"Offline BC: one policy per condition, trained once on all {n_rounds:,} pool "
+        "labels and evaluated once; its line is flat and has no position on the x "
+        "axis. Timed-out lines stop at their\nlast saved evaluation and are not "
+        "extended. One training seed; per-episode cross-entropy and disagreement "
+        "were not stored, so no bands are drawn.",
         ha="center", va="bottom", fontsize=8.5, color="#444444",
     )
     fig.tight_layout(rect=(0, 0.135, 1, 0.96))
@@ -484,8 +567,12 @@ def costs_figure(rows, shared, job_limit):
         ax.barh(y, minutes, color=COLOR[row["method"]], alpha=0.55 if timed_out else 0.9,
                 hatch="//" if timed_out else None, edgecolor="black", lw=0.6)
         state = "timed out" if timed_out else "complete"
-        ax.text(minutes + 1, y, f"{row['controller_elapsed_seconds']:,.2f} s, {state}",
-                va="center", fontsize=8.5)
+        text = f"{row['controller_elapsed_seconds']:,.2f} s, {state}"
+        if row["method"] == "bc":
+            # The historical job's whole time is charged, not only the reference fit.
+            text += (f"; {row['training']['fits']} fits, "
+                     f"{row['evaluation']['evaluations']} evaluations")
+        ax.text(minutes + 1, y, text, va="center", fontsize=8.5)
     audit_m = shared["audit"]["controller_elapsed_seconds"] / 60
     data_m = shared["data"]["controller_elapsed_seconds"] / 60
     y = ys[-1]
@@ -514,12 +601,14 @@ def costs_figure(rows, shared, job_limit):
     fig.text(
         0.5, 0.01,
         "Worker wall time measured by the external controller. Not CPU or GPU hours and "
-        "not a monetary cost. Original expert preparation, local review and plotting\n"
-        "are outside this cost scope. Work after a timed-out run's last snapshot is "
-        "unrecorded; its wall time is still exact to the controller's measurement.",
+        "not a monetary cost. Offline BC bars include every historical prefix fit; "
+        "only the full-pool fit is the reference.\nOriginal expert preparation, local "
+        "review and plotting are outside this cost scope. Work after a timed-out "
+        "run's last snapshot is\nunrecorded; its wall time is still exact to the "
+        "controller's measurement.",
         ha="center", va="bottom", fontsize=8, color="#444444",
     )
-    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
     return fig
 
 
@@ -541,11 +630,19 @@ def metric_row(job_id, p):
                          for k in METRICS) + " |")
 
 
+def joined(values, fmt="{:,}"):
+    """One value if all agree, else each value, so differences stay visible."""
+    vals = list(dict.fromkeys(values))
+    return " and ".join(fmt.format(v) for v in vals)
+
+
 def report(s, analysis_sha):
     rows, shared, camp = s["runs"], s["shared_preparation"], s["campaign"]
     n_done = sum(r["controller_state"] == "complete" for r in rows.values())
     n_out = len(rows) - n_done
     B = s["matched_budget"]["labels"]
+    refs, err = s["bc_reference"]["points"], s["erratum"]
+    n_bc = s["n_rounds"]
     ceil = s["return_ceiling"]
     fp = s["provenance"]
     exp_ret, rnd_ret, cap = s["expert_return"], s["random_return"], s["episode_cap"]
@@ -566,7 +663,9 @@ def report(s, analysis_sha):
         "It is analysis only. No job was relaunched, retried or extended for it, and no "
         "scientific setting changed. The raw records (results, checkpoints, logs) stay "
         "private; this report, its two figures and its two JSON files are derived "
-        "summaries.",
+        "summaries. FTL and BC-iid are learning curves; offline BC is one fixed "
+        "policy per observation condition, drawn as a flat reference (see the "
+        "erratum).",
         "",
         "## Outcome",
         "",
@@ -574,23 +673,54 @@ def report(s, analysis_sha):
         f"{num(s['job_limit_seconds'], 0)} second job limit (`timed_out`). Timed-out "
         "runs are reported up to their last saved evaluation only.",
     ]
-    if ceil["all_trained_evaluations_at_cap"]:
+    if ceil["all_at_cap"]:
         lines.append(
-            f"- Every saved evaluation of a trained policy, in all six runs and both "
+            "- Every saved evaluation of a trained FTL or BC-iid policy, in both "
             f"observation conditions, scored {cap} in all {s['eval_episodes']} episodes, "
-            "starting with the first one-label evaluation (stored normalized return 1, "
-            f"which corresponds to raw {exp_ret:g}). Return is at its ceiling and "
-            "cannot separate methods or observation conditions here.")
+            "starting with the first one-label evaluation, and so did both offline BC "
+            f"reference policies (stored normalized return 1, which corresponds to raw "
+            f"{exp_ret:g}). Return is at its ceiling and cannot separate methods or "
+            "observation conditions here.")
     else:
         lines.append(
-            f"- {ceil['trained_evaluations_at_cap']} of {ceil['trained_evaluations']} "
-            f"saved evaluations of trained policies scored {cap} in every episode; see "
-            "the curve points file for the rest.")
+            f"- {ceil['online_trained_evaluations_at_cap']} of "
+            f"{ceil['online_trained_evaluations']} saved evaluations of trained FTL "
+            f"and BC-iid policies, and {ceil['bc_reference_evaluations_at_cap']} of "
+            f"{len(refs)} offline BC reference evaluations, scored {cap} in every "
+            "episode; see the curve points file for the rest.")
     lines += [
         "- Cross-entropy and disagreement are reported as recorded; each is measured on "
         "that learner's own visited states.",
-        "- Fixed BC and BC-iid also differ in optimization (below), so their comparison "
-        "does not isolate data acquisition.",
+        "- Offline BC and BC-iid also differ in optimization (below), so their "
+        "comparison does not isolate data acquisition.",
+        "",
+        "## Erratum: offline BC",
+        "",
+        "- The intended BC baseline is the original `_run_bc`: one policy trained once "
+        "on the whole offline dataset and drawn as a flat reference. The executed "
+        f"pilot instead fitted BC separately on {joined(err['historical_fits'])} pool "
+        f"prefixes ({err['historical_fit_budgets']['first']:,} to "
+        f"{err['historical_fit_budgets']['last']:,} labels) per condition. The "
+        "previous version of this report drew those fits as a learning curve and "
+        "used a prefix fit in the matched comparison. That was wrong.",
+        f"- This version uses, per condition, only the stored fit on all {n_bc:,} pool "
+        "labels and its saved evaluation, drawn flat. The smaller prefix fits are not "
+        "a baseline. They are not plotted, tabulated or summarized here and remain "
+        "only in the private raw records.",
+        f"- The {n_bc:,}-label fit does not depend on the earlier fits. Before every "
+        "fit the job reseeded torch, built a fresh policy, gave the trainer a fresh "
+        "generator with the run seed, and seeded the validation split by the seed and "
+        "round 0, on CPU. This was checked by reading source commit "
+        f"`{SOURCE_COMMIT}`, not by a rerun. Its evaluation reused the run's "
+        f"environment, so its {s['eval_episodes']} starting states followed "
+        f"{joined(err['earlier_evaluation_episodes'])} earlier evaluation episodes. "
+        "The values are the saved estimate for that final policy, not an exact "
+        "standalone rerun.",
+        "- Costs are unchanged. Each historical BC job's controller time covers all of "
+        "its fits and evaluations and is charged in full; the reference fit's own "
+        "timers are listed separately under Cost.",
+        f"- Offline BC uses {n_bc:,} labels and the online curves are compared at "
+        f"{B:,}, so offline BC is not label matched to them.",
         "",
         "## Run status",
         "",
@@ -619,9 +749,12 @@ def report(s, analysis_sha):
         "",
         f"![Learning curves](results/{FIG_CURVES})",
         "",
-        "- Every saved evaluation is drawn. FTL and BC-iid include round 0 (the "
-        "untrained initial head); fixed BC has no round 0 evaluation and starts at one "
-        "label. Lines are not smoothed.",
+        "- Every saved FTL and BC-iid evaluation is drawn, including round 0 (the "
+        "untrained initial head). Lines are not smoothed.",
+        "- Offline BC is drawn as one flat line per condition in its own color, dashed "
+        "for full observation and solid for cart position hidden, at the value of its "
+        "single saved evaluation. A flat line is one fixed policy evaluated once, not "
+        "repeated measurements; it spans the axis for comparison only.",
         "- An X marks a timed-out run's last saved evaluation. It is a saved "
         "evaluation, not the exact training state at termination, and the line is not "
         "extended toward 1,000.",
@@ -648,28 +781,39 @@ def report(s, analysis_sha):
         "",
         "## Matched-label comparison",
         "",
-        f"The largest evaluation budget shared by all six curves is **{B:,} labels**: "
-        "the maximum of the intersection of the six sets of evaluated label counts, "
-        "taken mechanically and not by effect size. Values are descriptive for one "
-        "training seed. No winner is selected and no test is run. Return is shown as "
-        "the raw mean with the episode minimum to maximum. Cross-entropy columns use "
-        "the natural log, as defined above.",
+        "The largest evaluation budget shared by the four online curves (FTL and "
+        f"BC-iid, both conditions) is **{B:,} labels**: the maximum of the "
+        "intersection of their four sets of evaluated label counts, taken mechanically "
+        "and not by effect size. Offline BC does not enter this rule. Values are "
+        "descriptive for one training seed. No winner is selected and no test is run. "
+        "Return is shown as the raw mean with the episode minimum to maximum. "
+        "Cross-entropy columns use the natural log, as defined above.",
         "",
         "| Method | Observation | Labels | Return mean (min to max) | Learner CE | "
         "Disagreement | Expert CE |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
-    lines += [metric_row(j, s["matched_budget"]["points"][j]) for j in RUN_IDS]
+    lines += [metric_row(j, s["matched_budget"]["points"][j]) for j in ONLINE_IDS]
     lines += [
         "",
-        "Each run at its own last saved evaluation (timed-out runs end earlier, so "
-        "these rows are not matched):",
+        f"Offline BC reference, one policy per condition trained on all {n_bc:,} pool "
+        f"labels. Not label matched to the {B:,}-label rows above:",
         "",
         "| Method | Observation | Labels | Return mean (min to max) | Learner CE | "
         "Disagreement | Expert CE |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
-    lines += [metric_row(j, s["own_endpoints"][j]) for j in RUN_IDS]
+    lines += [metric_row(j, refs[j]) for j in BC_IDS]
+    lines += [
+        "",
+        "Each online run at its own last saved evaluation (timed-out runs end earlier, "
+        "so these rows are not matched):",
+        "",
+        "| Method | Observation | Labels | Return mean (min to max) | Learner CE | "
+        "Disagreement | Expert CE |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    lines += [metric_row(j, s["own_endpoints"][j]) for j in ONLINE_IDS]
     lines += [
         "",
         "## Cost",
@@ -700,7 +844,7 @@ def report(s, analysis_sha):
         "**Shared preparation, charged once.** The audit checked "
         f"{shared['audit']['checked_pairs']} pairs with "
         f"{num(shared['audit']['expert_predict_calls'])} expert predict calls. The "
-        "data job's internal timers record: fixed-BC chronological pool "
+        "data job's internal timers record: offline BC chronological pool "
         f"{data_sh['fixed_bc_pool']['elapsed_seconds']:,.2f} s for "
         f"{num(data_sh['fixed_bc_pool']['env_steps'])} expert steps "
         f"({data_sh['fixed_bc_pool']['episodes']} episodes); BC-iid stream "
@@ -712,7 +856,7 @@ def report(s, analysis_sha):
         f"({data_sh['normalization_baselines']['expert_episodes']} expert and "
         f"{data_sh['normalization_baselines']['random_episodes']} random episodes). "
         "These phase timers need not sum to the controller time. The full and masked "
-        "fixed-BC runs reuse the pool, and the full and masked BC-iid runs reuse the "
+        "offline BC runs reuse the pool, and the full and masked BC-iid runs reuse the "
         "stream, so this acquisition is not charged per run or per paired condition. "
         "FTL acquires its own labels inside each run (in-run collection below).",
         "",
@@ -737,9 +881,9 @@ def report(s, analysis_sha):
     lines += [
         "",
         "Recorded in-run phase timers (seconds). Round-loop methods time fitting "
-        "together with collection; fixed BC times fits separately and collects nothing "
-        "in the run. For timed-out runs these cover work up to the last snapshot, and "
-        "the recorded total is null.",
+        "together with collection; the historical offline BC job times all its fits "
+        "separately and collects nothing in the run. For timed-out runs these cover "
+        "work up to the last snapshot, and the recorded total is null.",
         "",
         "| Run | Setup | Collection and training | Fits | Evaluation | Recorded total | "
         "Last snapshot to controller end |",
@@ -756,26 +900,39 @@ def report(s, analysis_sha):
             f"{r['seconds_from_last_snapshot_to_controller_end']:,.2f} |")
     lines += [
         "",
+        f"Offline BC reference fit on all {n_bc:,} pool labels, from its own record "
+        "(seconds). These are part of the historical job totals above, not additional "
+        "cost:",
+        "",
+        "| Run | Fit | Evaluation | Epochs | Early-stopping fallback |",
+        "| --- | ---: | ---: | ---: | --- |",
+    ]
+    lines += [f"| {label(j)} | {refs[j]['reference_fit_seconds']:,.2f} | "
+              f"{refs[j]['reference_eval_seconds']:,.2f} | "
+              f"{num(refs[j]['inner_es_stop_epoch'])} | "
+              f"{refs[j]['inner_es_fallback'] or 'none'} |" for j in BC_IDS]
+    lines += [
+        "",
         "Original expert preparation and qualification, local review, and report and "
         "plot work are outside this cost scope.",
         "",
         "## Interpretation and limits",
         "",
-        "- **Datasets.** Fixed BC cold-fits each prefix of a chronological pool "
-        f"({data_sh['fixed_bc_pool']['episodes']} complete expert episodes, kept in "
-        "order). BC-iid replays an independently reset stream, one uniformly selected "
+        f"- **Datasets.** Offline BC is one fit on all {n_bc:,} labels of a "
+        f"chronological pool ({data_sh['fixed_bc_pool']['episodes']} complete expert "
+        "episodes, kept in order). BC-iid replays an independently reset stream, one "
+        "uniformly selected "
         f"state from each of {num(data_sh['bc_iid_stream']['episodes'])} expert "
         "episodes, one state per round. The two datasets have different content "
         "hashes.",
         "- **Inherited optimizer mismatch.** As in the previous pipeline, FTL and "
         f"BC-iid train with minibatch 1 (`min({s['bc_batch_size']}, "
         "samples_per_round)`) and refit after every label, up to "
-        f"{num(s['n_rounds'])} fits, while fixed BC uses minibatches of up to "
-        f"{s['bc_batch_size']} and fits only the {s['n_eval_budgets']} evaluated "
-        "prefixes. All six configs record `bc_batch_size` "
-        f"{s['bc_batch_size']}; the effective sizes follow from source and were not "
-        "separately instrumented. This changes optimization, not only speed, so fixed "
-        "BC versus BC-iid does not isolate data acquisition.",
+        f"{num(s['n_rounds'])} fits, while the offline BC reference is a single fit "
+        f"with minibatches of up to {s['bc_batch_size']}. All six configs record "
+        f"`bc_batch_size` {s['bc_batch_size']}; the effective sizes follow from source "
+        "and were not separately instrumented. This changes optimization, not only "
+        "speed, so offline BC versus BC-iid does not isolate data acquisition.",
         "- **Return ceiling.** Reaching the cap after one label (normalized return 1, "
         f"raw {exp_ret:g}) is a pilot finding for "
         "this learner, the CartPole reset distribution and the 500 step limit. It does "
@@ -793,12 +950,12 @@ def report(s, analysis_sha):
         "for one trained policy, not confidence about other training seeds. Per-episode "
         "cross-entropy and disagreement were not stored, so no uncertainty bands are "
         "drawn.",
-        "- **Pairing.** Pairing across observation conditions is limited. Fixed BC "
+        "- **Pairing.** Pairing across observation conditions is limited. Offline BC "
         "uses the same stored pool and BC-iid the same stored stream in both "
         "conditions. FTL data are not shared: each FTL run collects labels on its own "
         "visited states, which differ between conditions. Each method's full and "
-        "masked runs share the seed setup and the initial head, and fixed BC reseeds "
-        "torch to the same seed before every prefix fit. "
+        "masked runs share the seed setup and the initial head, and the offline BC "
+        "reference fit starts from torch reseeded to the run seed in both conditions. "
         + ("The round 0 evaluation records of FTL and BC-iid are identical within each "
            "observation condition, consistent with this. "
            if s["pairing"]["round0_ftl_bc_iid_identical_within_condition"] else
@@ -823,7 +980,7 @@ def report(s, analysis_sha):
         f"`{fp['preparation_record_sha256']}`; policy state "
         f"`{fp['preparation_policy_state_sha256']}`. Recorded and identical in all "
         "eight results.",
-        f"- Fixed-BC pool: file `{fp['pool_file_sha256']}`, pairs "
+        f"- Offline BC pool: file `{fp['pool_file_sha256']}`, pairs "
         f"`{fp['pool_pairs_sha256']}`. BC-iid stream: file "
         f"`{fp['stream_file_sha256']}`, pairs `{fp['stream_pairs_sha256']}`. Recorded "
         "by the data job; every run cites the same pairs digests and the data result "
@@ -843,21 +1000,19 @@ def report(s, analysis_sha):
         lines.append(f"| `{rel}` | `{h['sha256']}` | {h['controller_check']} |")
     lines += [
         "",
-        "## Proposed next step (not executed; for consultation)",
+        "## Current status",
         "",
-        "1. Reconcile batch sizes first: apply the same intended batch-size setting to "
-        "FTL, fixed BC and BC-iid, and independently verify the effective loader batch "
-        "sizes before any rerun.",
-        "2. Retain the existing outcome records unchanged as the record of this pilot.",
-        "3. Diagnose the return ceiling from already stored artifacts (records, "
-        "checkpoints and the shared datasets) before proposing a stronger observation "
-        "mask, altered feature training, a different episode limit, another evaluation "
-        "metric or a larger budget.",
-        "",
-        "Read-only diagnosis of already stored artifacts (step 3) is already "
-        "authorized. Batch-size reconciliation, any rerun, and any scientific, training "
-        "or evaluation change listed above are not approved and need a decision with "
-        "the user before anything runs.",
+        "- This report remains the historical record of the x-only pilot (cart "
+        "position hidden). Its records stay unchanged.",
+        "- The user has approved a separate six-run follow-up: FTL, BC-iid and "
+        "single-fit offline BC, with minibatches that grow with the data up to 32, "
+        "each under the identity observation and with both cart position and pole "
+        "angular velocity hidden; other settings unchanged. See "
+        "[`CARTPOLE_STRONGER_MASK_PROTOCOL.md`](CARTPOLE_STRONGER_MASK_PROTOCOL.md).",
+        "- Its implementation and independent reviews come before any execution. No "
+        "follow-up results are included here.",
+        "- Larger studies, tuning and other masks remain unapproved. Read-only "
+        "diagnosis of already stored artifacts remains authorized.",
         "",
     ]
     return "\n".join(lines)
@@ -929,20 +1084,21 @@ def main():
         require(runs[job_id]["deadline"]["job_limit_seconds"] == job_limit,
                 f"{job_id}: job limit differs")
 
-    points = {j: curve(j, runs[j], n_episodes, cap) for j in RUN_IDS}
-    rows = {j: run_row(j, runs[j], sha[j], *rows_ctl[j], points[j], n_rounds)
-            for j in RUN_IDS}
     for j in RUN_IDS:
-        extra = {p["labels"] for p in points[j]} - set(eval_budgets) - {0}
+        evaluated = {r["n_observations"] for r in runs[j]["records"]
+                     if r.get("episode_returns") is not None}
+        extra = evaluated - set(eval_budgets) - {0}
         require(not extra, f"{j}: evaluations outside the configured budgets")
-        require(j.split("-")[1] != "bc" or points[j][0]["labels"] > 0,
-                f"{j}: fixed BC has a round 0 evaluation")
+    points = {j: curve(j, runs[j], n_episodes, cap) for j in ONLINE_IDS}
+    pool_pairs = data["datasets"]["pool"]["pairs_sha256"]
+    refs = {j: bc_reference(j, runs[j], n_episodes, cap, n_rounds, pool_pairs)
+            for j in BC_IDS}
+    rows = {j: run_row(j, runs[j], sha[j], *rows_ctl[j], n_rounds) for j in RUN_IDS}
 
-    shared_set = set.intersection(*({p["labels"] for p in points[j]} for j in RUN_IDS))
-    require(shared_set, "no evaluation budget is shared by all six runs")
-    B = max(shared_set)
-    trained = [p for j in RUN_IDS for p in points[j] if p["labels"] > 0]
+    B = online_matched_budget(points)
+    trained = [p for j in ONLINE_IDS for p in points[j] if p["labels"] > 0]
     at_cap = [p for p in trained if p["episodes_at_cap"] == p["episodes"]]
+    refs_at_cap = [p for p in refs.values() if p["episodes_at_cap"] == p["episodes"]]
     round0 = {}
     for r in RESTRICTIONS:
         a, b = (next((p for p in points[f"run-{m}-{r}"] if p["labels"] == 0), None)
@@ -965,8 +1121,31 @@ def main():
             else "none recorded (timed out); saved snapshot hash shown",
         }
     pool, stream = data["datasets"]["pool"], data["datasets"]["stream"]
+    erratum = {
+        "issue": "the executed pilot fitted BC separately at every evaluated pool "
+        "prefix, and the previous report drew those fits as a learning curve and used "
+        "a prefix fit in the matched comparison; the intended baseline is the original "
+        "_run_bc, one fit on the whole offline dataset drawn flat",
+        "correction": "only the stored fit on the whole pool and its saved evaluation "
+        "are used, per condition; prefix fits are not a baseline and are neither "
+        "plotted nor summarized; their values stay in the private raw records",
+        "historical_fits": [rows[j]["training"]["fits"] for j in BC_IDS],
+        "historical_fit_budgets": {"count": len(eval_budgets),
+                                   "first": eval_budgets[0], "last": eval_budgets[-1]},
+        "independence": "by reading the source: before every fit torch was reseeded, "
+        "a fresh policy built, the trainer given a fresh generator with the run seed, "
+        "and the validation split seeded by the seed and round 0, on CPU; the "
+        "full-pool fit does not depend on earlier fits; not verified by a rerun",
+        "evaluation_rng": "the reference evaluation reused the run's environment after "
+        "the earlier evaluations, so it is the saved estimate for the final policy, "
+        "not an exact standalone rerun",
+        "earlier_evaluation_episodes": [
+            rows[j]["evaluation"]["episodes"] - refs[j]["episodes"] for j in BC_IDS],
+        "cost": "historical BC job costs are unchanged and charged in full; the "
+        "reference fit and evaluation timers are part of them, not additional",
+    }
     summary = {
-        "schema": "cartpole-restriction-pilot-analysis/1",
+        "schema": "cartpole-restriction-pilot-analysis/2",
         "scope": "derived summary of the six-run CartPole restriction pilot; raw "
         "records, checkpoints and logs remain private",
         "provenance": {
@@ -993,11 +1172,16 @@ def main():
                     "config_sha256 of the data job and six runs, with the producer's "
                     "canonical JSON (sorted keys, compact separators)",
                     "data result hash cited by every run",
-                    "normalized_return of every saved evaluation checked against "
+                    "normalized_return of every saved FTL and BC-iid evaluation and of "
+                    "each offline BC reference evaluation checked against "
                     "(mean episode return - random_return) / (expert_return - "
                     "random_return) on its raw episode returns and stored references, "
                     "within the producer's six-decimal rounding; the stored value is "
-                    "reported, never replaced",
+                    "reported, never replaced; inactive BC prefix evaluations are not "
+                    "read for metrics",
+                    "offline BC reference: exactly one record at the full budget, "
+                    "with a saved evaluation and checkpoint, whose prefix digest "
+                    "equals the whole pool's pairs digest",
                 ],
                 "compared_for_equality_only": [
                     "campaign source hash across the three inventories",
@@ -1030,16 +1214,26 @@ def main():
         "runs": rows,
         "matched_budget": {
             "labels": B,
-            "rule": "maximum of the intersection of the six sets of evaluated label "
-            "counts",
-            "points": {j: next(p for p in points[j] if p["labels"] == B) for j in RUN_IDS},
+            "rule": "maximum of the intersection of the four online (FTL and BC-iid) "
+            "sets of evaluated label counts; offline BC is not part of it",
+            "points": {j: next(p for p in points[j] if p["labels"] == B)
+                       for j in ONLINE_IDS},
         },
-        "own_endpoints": {j: points[j][-1] for j in RUN_IDS},
+        "bc_reference": {
+            "definition": "original _run_bc: one policy per observation condition "
+            "trained once on the whole offline pool and drawn as a flat reference",
+            "labels": n_rounds,
+            "label_matched_to_online": False,
+            "points": refs,
+        },
+        "own_endpoints": {j: points[j][-1] for j in ONLINE_IDS},
         "return_ceiling": {
-            "trained_evaluations": len(trained),
-            "trained_evaluations_at_cap": len(at_cap),
-            "all_trained_evaluations_at_cap": len(at_cap) == len(trained),
+            "online_trained_evaluations": len(trained),
+            "online_trained_evaluations_at_cap": len(at_cap),
+            "bc_reference_evaluations_at_cap": len(refs_at_cap),
+            "all_at_cap": len(at_cap) == len(trained) and len(refs_at_cap) == len(refs),
         },
+        "erratum": erratum,
         "pairing": {"round0_ftl_bc_iid_identical_within_condition":
                     all(round0.values()), "per_condition": round0},
         "shared_preparation": shared,
@@ -1056,19 +1250,31 @@ def main():
             "Null values are unknown, never zero.",
             "Controller wall time is worker wall time, not CPU or GPU hours or money.",
             "Original expert preparation, local review and plotting are out of scope.",
-            "Round-loop fits are timed within collection_and_training; fixed BC has "
-            "no in-run collection, so those recorded 0.0 phase timers are structural.",
+            "Round-loop fits are timed within collection_and_training; the historical "
+            "offline BC job has no in-run collection, so those recorded 0.0 phase "
+            "timers are structural.",
+            "runs holds the physical record of all six jobs as recorded, including "
+            "every historical BC prefix fit and evaluation in its counts and wall "
+            "time; only bc_reference is the offline BC result.",
+            "Offline BC is trained on the whole pool and is never label matched to "
+            "the online curves.",
         ],
     }
     curve_points = {
-        "schema": "cartpole-restriction-pilot-curve-points/1",
-        "note": "every saved evaluation; x is labels used for training; metrics are "
-        "on each learner's own evaluation states; timed-out runs end at their last "
-        "saved evaluation",
+        "schema": "cartpole-restriction-pilot-curve-points/2",
+        "note": "every saved FTL and BC-iid evaluation; x is labels used for "
+        "training; metrics are on each learner's own evaluation states; timed-out "
+        "runs end at their last saved evaluation",
         "runs": {j: {"method": rows[j]["method"],
                      "restriction_id": rows[j]["restriction_id"],
                      "controller_state": rows[j]["controller_state"],
-                     "points": points[j]} for j in RUN_IDS},
+                     "points": points[j]} for j in ONLINE_IDS},
+        "offline_bc_reference": {
+            "note": "one fixed policy per condition trained on the whole pool and "
+            "evaluated once; a flat reference, not a curve",
+            "runs": {j: {"restriction_id": rows[j]["restriction_id"],
+                         "point": refs[j]} for j in BC_IDS},
+        },
     }
 
     md = report(summary, analysis_sha)
@@ -1080,10 +1286,9 @@ def main():
         hits = sorted(t for t in banned if t and t in text)
         require(not hits, f"{name}: refusing to write private or banned text {hits}")
     images = {
-        FIG_CURVES: png(curves_figure(points, rows, data["baselines"], cap,
-                                      summary["return_ceiling"][
-                                          "all_trained_evaluations_at_cap"],
-                                      n_episodes)),
+        FIG_CURVES: png(curves_figure(points, refs, rows, data["baselines"], cap,
+                                      summary["return_ceiling"]["all_at_cap"],
+                                      n_episodes, n_rounds)),
         FIG_COSTS: png(costs_figure(rows, shared, job_limit)),
     }
 

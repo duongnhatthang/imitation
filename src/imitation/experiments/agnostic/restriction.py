@@ -8,13 +8,15 @@ here ``M`` is applied before the frozen features, so the learner computes
 evaluation and cross-entropy). The expert is a separate object and keeps
 reading the full observation.
 
-Only two restrictions exist: ``identity`` and ``cart_position_zero`` (CartPole
-``x := 0``; ``x_dot``, ``theta`` and ``theta_dot`` unchanged).
+Three restrictions exist: ``identity``, ``cart_position_zero`` (CartPole
+``x := 0``; the historical x-only pilot, kept so its checkpoints still load)
+and ``cart_position_angular_velocity_zero`` (``x := 0`` and
+``theta_dot := 0``; ``x_dot`` and ``theta`` unchanged).
 
-`audit_cartpole_position` checks, on simulator-valid paired states, whether the
-expert gives different labels to states that the mask makes identical. That
-proves only that conflicting expert labels exist under the mask, never a
-positive on-policy error floor.
+`audit_cartpole_position` checks, on simulator-valid paired states that differ
+only in cart position, whether the expert gives different labels to states
+that the mask makes identical. That proves only that conflicting expert labels
+exist under the mask, never a positive on-policy error floor.
 """
 
 import dataclasses
@@ -60,6 +62,15 @@ RESTRICTIONS: Dict[str, Restriction] = {
         obs_shape=(4,),
         description=(
             "CartPole cart position x := 0; x_dot, theta and theta_dot are kept."
+        ),
+    ),
+    "cart_position_angular_velocity_zero": Restriction(
+        restriction_id="cart_position_angular_velocity_zero",
+        zeroed_indices=(0, 3),
+        obs_shape=(4,),
+        description=(
+            "CartPole cart position x := 0 and pole angular velocity "
+            "theta_dot := 0; x_dot and theta are kept."
         ),
     ),
 }
@@ -245,7 +256,12 @@ def load_policy_checkpoint(path, device: str = "cpu") -> RestrictedActorCriticPo
 # ---------------------------------------------------------------------------
 
 AUDIT_ENV = "CartPole-v1"
-AUDIT_RESTRICTION = "cart_position_zero"
+# Masks the fixed x-grid audit applies to: both hide cart position, so every
+# pair of grid states on one base collides under them.
+AUDIT_RESTRICTIONS: Tuple[str, ...] = (
+    "cart_position_zero",
+    "cart_position_angular_velocity_zero",
+)
 # Predeclared nonterminal cart positions, well inside |x| < 2.4.
 AUDIT_X_GRID: Tuple[float, ...] = (-1.8, -0.6, 0.6, 1.8)
 # Base states: the diagnostic expert trajectory at these time steps.
@@ -258,6 +274,13 @@ AUDIT_CLAIM = (
     "a positive error under the expert's or the learner's on-policy state "
     "distribution, and no classifier-based Bayes error is claimed."
 )
+AUDIT_WITNESS_SCOPE = (
+    "Every checked pair differs only in cart position x and shares x_dot, "
+    "theta and theta_dot, so it collides under any mask that zeroes x. Under "
+    "a mask that also zeroes theta_dot these are the same pairs; no pair that "
+    "differs in angular velocity is checked, so the audit says nothing about "
+    "conflicts that hiding angular velocity adds."
+)
 
 
 def _expert_action(expert, obs: np.ndarray) -> int:
@@ -268,11 +291,13 @@ def _expert_action(expert, obs: np.ndarray) -> int:
 def audit_cartpole_position(
     expert,
     reset_seed: int,
+    *,
+    restriction_id: str,
     grid: Sequence[float] = AUDIT_X_GRID,
     base_steps: Sequence[int] = AUDIT_BASE_STEPS,
     check: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """Paired-state audit of ``cart_position_zero`` on the CartPole simulator.
+    """Paired-state x-grid audit of a cart-position mask on the CartPole simulator.
 
     Base states come from one deterministic expert trajectory started with
     ``env.reset(seed=reset_seed)``; a base is used only if the trajectory
@@ -284,11 +309,14 @@ def audit_cartpole_position(
     check holds. A pair of positions on one base is simulator consistent if
     one physics step under each action moves both states identically except
     for the position offset. The expert labels full observations only; the
-    labels are diagnostic and never used for training.
+    labels are diagnostic and never used for training. States, physics checks
+    and labels do not depend on the mask; only the masked observations and
+    the collision test do.
 
     Args:
         expert: Object with ``predict(obs, deterministic=True)``.
         reset_seed: Diagnostic reset seed, disjoint from the pilot seed.
+        restriction_id: One of `AUDIT_RESTRICTIONS`.
         grid: Cart positions substituted into every base.
         base_steps: Trajectory steps used as base states.
         check: Optional callable run before every simulator or expert call
@@ -297,10 +325,18 @@ def audit_cartpole_position(
     Returns:
         A JSON-serializable record with every checked state and pair, and
         ``status`` ``"conflict_found"`` or ``"restriction_uncertified"``.
+
+    Raises:
+        ValueError: If the restriction does not hide cart position.
     """
     check = check or (lambda what: None)
-    restriction = get_restriction(AUDIT_RESTRICTION)
-    mask = ObservationMask(AUDIT_RESTRICTION)
+    restriction = get_restriction(restriction_id)
+    if restriction.restriction_id not in AUDIT_RESTRICTIONS:
+        raise ValueError(
+            f"The x-grid audit needs a mask that hides cart position, one of "
+            f"{AUDIT_RESTRICTIONS}; got {restriction_id!r}",
+        )
+    mask = ObservationMask(restriction.restriction_id)
     grid = [float(x) for x in grid]
     wanted = sorted({int(s) for s in base_steps})
     expert_calls = 0
@@ -419,8 +455,10 @@ def audit_cartpole_position(
     return {
         "status": "conflict_found" if n_conflicts else "restriction_uncertified",
         "claim": AUDIT_CLAIM,
+        "witness_scope": AUDIT_WITNESS_SCOPE,
         "env_name": AUDIT_ENV,
-        "restriction_id": AUDIT_RESTRICTION,
+        "restriction_id": restriction.restriction_id,
+        "zeroed_indices": list(restriction.zeroed_indices),
         "reset_seed": int(reset_seed),
         "grid": grid,
         "requested_base_steps": wanted,

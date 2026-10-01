@@ -194,6 +194,11 @@ class ExperimentConfig:
         1  # minimum complete rollouts, independent of training batches
     )
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
+    # Round-loop algorithms only. False keeps the original rule, a batch of
+    # min(bc_batch_size, samples_per_round) for every round. True rebinds the
+    # batch to min(bc_batch_size, accumulated labels) before each round's
+    # data are loaded, the rule fixed BC applies to its dataset.
+    grow_batch_with_data: bool = False
 
     def __post_init__(self) -> None:
         if self.beta_rampdown < 0:
@@ -321,6 +326,31 @@ def _split_transitions_for_val(
     return train_idx, val_idx
 
 
+def _bound_loader_sizes(bc_trainer) -> Dict[str, Any]:
+    """Describe the data loader ``bc_trainer`` trains on right now.
+
+    Reads the torch ``DataLoader`` actually bound (unwrapping imitation's
+    batch-size checking wrapper, which rejects any batch of another size), so
+    with ``drop_last`` every training minibatch has exactly this batch size.
+    Any other loader type is reported as unknown (None) rather than guessed.
+    """
+    loader = bc_trainer._demo_data_loader
+    loader = getattr(loader, "data_loader", loader)
+    if not isinstance(loader, th.utils.data.DataLoader):
+        return {
+            "train_batch_size": None,
+            "train_examples": None,
+            "train_batches_per_epoch": None,
+            "train_drop_last": None,
+        }
+    return {
+        "train_batch_size": int(loader.batch_size),
+        "train_examples": len(loader.dataset),
+        "train_batches_per_epoch": len(loader),
+        "train_drop_last": bool(loader.drop_last),
+    }
+
+
 def _inner_train(
     trainer_or_bc,
     config: "ExperimentConfig",
@@ -350,20 +380,23 @@ def _inner_train(
         Dict with keys ``inner_es_stop_epoch`` (int, equals ``bc_n_epochs`` when
         early-stop didn't fire), ``inner_es_val_nll_best`` (float or None),
         ``inner_es_val_nll_trajectory`` (list[float]), ``inner_es_fallback``
-        (str | None).
+        (str | None), and the `_bound_loader_sizes` of the loader trained on.
     """
     max_epochs = int(config.bc_n_epochs)
 
     if not config.inner_early_stop:
         if is_dagger:
             trainer_or_bc.extend_and_update({"n_epochs": max_epochs})
+            sizes = _bound_loader_sizes(trainer_or_bc.bc_trainer)
         else:
             trainer_or_bc.train(n_epochs=max_epochs, progress_bar=False)
+            sizes = _bound_loader_sizes(trainer_or_bc)
         return {
             "inner_es_stop_epoch": max_epochs,
             "inner_es_val_nll_best": None,
             "inner_es_val_nll_trajectory": [],
             "inner_es_fallback": None,
+            **sizes,
         }
 
     # --- inner_early_stop=True: held-out-val early stopping ---
@@ -395,6 +428,7 @@ def _inner_train(
 
     if train_idx is None:
         # Dataset too small for a meaningful val split → fixed budget on full set.
+        sizes = _bound_loader_sizes(bc_trainer)
         bc_trainer.train(n_epochs=max_epochs, progress_bar=False)
         if is_dagger and dagger_current_round is not None:
             trainer_or_bc.track_round_loss(dagger_current_round)
@@ -403,6 +437,7 @@ def _inner_train(
             "inner_es_val_nll_best": None,
             "inner_es_val_nll_trajectory": [],
             "inner_es_fallback": "dataset_too_small",
+            **sizes,
         }
 
     # 4. Carve the train and val slices.
@@ -439,6 +474,7 @@ def _inner_train(
     if len(train_subset) < original_minibatch_size:
         bc_trainer.batch_size = bc_trainer.minibatch_size = len(train_subset)
     bc_trainer.set_demonstrations(train_subset)
+    sizes = _bound_loader_sizes(bc_trainer)
 
     # 6. Loop epochs with val-NLL early stop.
     patience = int(config.inner_early_stop_patience)
@@ -498,6 +534,7 @@ def _inner_train(
         "inner_es_val_nll_best": val_nll_best,
         "inner_es_val_nll_trajectory": val_nll_trajectory,
         "inner_es_fallback": None,
+        **sizes,
     }
 
 
@@ -1121,6 +1158,13 @@ def _run_dagger_variant(
                 _truncate_round_demos(round_dir, config.samples_per_round, rng)
 
         # --- Train on all accumulated demos ---
+        if config.grow_batch_with_data:
+            # Rebind before the trainer loads this round's data; the held-out
+            # split may still shrink it to the actual training split.
+            accumulated = cum_obs + config.samples_per_round
+            bc_trainer.batch_size = bc_trainer.minibatch_size = max(
+                1, min(config.bc_batch_size, accumulated)
+            )
         inner_log = _inner_train(trainer, config, round_num=round_num, is_dagger=True)
         cum_obs += config.samples_per_round
 
