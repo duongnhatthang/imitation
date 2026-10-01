@@ -1,0 +1,735 @@
+{
+  "schema": "cartpole-restriction-pilot-analysis/1",
+  "scope": "derived summary of the six-run CartPole restriction pilot; raw records, checkpoints and logs remain private",
+  "provenance": {
+    "source_commit": "2896ffe",
+    "campaign_source_sha256": "df5a7c5b0d9527cb998886ff1bc05aeaaf9dbd91a981b179143370be0b2a9ebd",
+    "result_source_combined_sha256": "b2e88cd818d8bb4727a367af52f7298976195bd38414b8b21c7ad41827a3df1e",
+    "result_source_files": {
+      "algorithms/bc.py": "6fd968d4db3142147717805662f42beaf70a2236d062ea0a2b36e174323742a9",
+      "algorithms/dagger.py": "dc7fcf31735220573d2f7c772af0d233b925d19972d26613e50b035e339b9cc1",
+      "algorithms/ftrl.py": "1d5c7d5368d4d4a3c15cc9212edc39f27edd002f5ec1f68c1e4d3baf5514b747",
+      "data/rollout.py": "776e6c994fd96eb0d3023dd1fd1b39e61244e62bf3ea50ceb822d3212eb2369b",
+      "experiments/agnostic/classical.py": "b503bad34a36b0cd0fe1488b0abee0eb4e2fc7b6bdcfb90f8c2709df36712a37",
+      "experiments/agnostic/pilot.py": "20be5c598bfa26bcf4143c38324465890716827499c7bc2520dd5c6f9fafe820",
+      "experiments/agnostic/restriction.py": "8f50ac3e45aff4a19764de049b4b2b7d162144263b4d648619fc1faa154463bd",
+      "experiments/agnostic/restriction_pilot.py": "e7d98ed3fc7b95830dbee5d414f0a0132c39b99b5c43db696098e60913f98e5a",
+      "experiments/agnostic/rollouts.py": "3117e517b75c7e85c7daf03f9abb638d912530d705800786dfc44437346b48ea",
+      "experiments/ftrl/env_baselines.py": "3480ed8c9d53ba023afb51eeb6e74e7c7c7ff648feeca4f2a93881a0a5898639",
+      "experiments/ftrl/env_utils.py": "f9af716a2cbcf4b6914f2d4e9e39d4f7bd3ab8145c23da58bb64fd489d8ef0c5",
+      "experiments/ftrl/eval_utils.py": "7d17f746b22be62985e9e1fa4d8533873cd5545f61fbc8dcb1895d74e632e0e2",
+      "experiments/ftrl/policy_utils.py": "37577759449e2316c26ac436ae3a2be6f1eeb484457dc30b5bd3fcc38f23c433",
+      "experiments/ftrl/run_experiment.py": "38c867d480184e5d71bd3576d71d96a1b1dc1e96c8d2e541bf038237098b4c61",
+      "util/util.py": "90d53f2ebdc2e2ab61da0ac88dd0604921c49901483ed7b18b26e4576c0303f9"
+    },
+    "expert_sha256": "05d52f5512c68fb151d2d87877e54de592bd73a1afa4fa2261419e07462d646b",
+    "preparation_record_sha256": "c8a87c6817baeeb873ee39be4504789c06a7b4033c9fab26f70d696b16023ebe",
+    "preparation_policy_state_sha256": "a01e49ac3e1160896dd63916b836906b0b6946fb787fd9e89b6a27ac42d3dce9",
+    "preparation_config_sha256": "1e8841b553ed3c328efecc8e1bcb6f8deda8078325ceb94e16b232e63572e76e",
+    "data_result_sha256": "2588f231c5d98b9c22f321231dc6f61d36326c1843330aa5a552fa502c4abc8c",
+    "pool_file_sha256": "b6d4f2174e445ddd0553c507646b84a8071bae0f22a3f18032875a6a0c8fd808",
+    "pool_pairs_sha256": "f20eda3b8204dac388f4d2aca280b8935a9c2153cdb9744c9b991b8d6b7f2128",
+    "stream_file_sha256": "34f9d6fa5ab9c7020262c7e502632f8a842e5e2321109f7c4f3e57e80b796531",
+    "stream_pairs_sha256": "451320030207973c84a7bace480dcb04cb97be0695f2505f2531aef6760ff669",
+    "analysis_script": "experiments/agnostic/analyze_cartpole_pilot.py",
+    "analysis_script_sha256": "d780b3126f3b3f4a75740685def8f141554512d30b07836d41fdb249d2cb542b",
+    "config_sha256_recomputed_and_matched": {
+      "data": "6a65e5beb32280d7d3ebeb1720e746183c07dcf643f7027789c9a3d777036722",
+      "run-ftl-identity": "8ba113196907e747a345065514bc145bc668b9ef8d760420bd2a5afc60430829",
+      "run-ftl-cart_position_zero": "ddbbcf0bd17d4762f7d5d1a6e3d24cd18d052cda18d902f41bbb6e8b55bd0097",
+      "run-bc-identity": "958ecf53a25b4c0cd11df1bee6435c5a8af5b16ccb3b4e5c80262a2c70f02ba3",
+      "run-bc-cart_position_zero": "a5436f0b7b18e8dc11070aad3dfe9f1f927b26194e18db90d034021b49897bbf",
+      "run-bc_iid-identity": "979525e8ef8b52f9d6b8110ffc2c98d024953f8cc7ccd13349cef3567a03998a",
+      "run-bc_iid-cart_position_zero": "b81534a528a217d823afdbf3aed04169d1a146fc91f8ed75e6d0fe2adb268670"
+    },
+    "checks": {
+      "recomputed_here": [
+        "SHA-256 of every analyzed result and inventory file; complete jobs matched against the controller result hash",
+        "config_sha256 of the data job and six runs, with the producer's canonical JSON (sorted keys, compact separators)",
+        "data result hash cited by every run"
+      ],
+      "compared_for_equality_only": [
+        "campaign source hash across the three inventories",
+        "source fingerprint, expert, preparation, environment and step cap across all eight results",
+        "pool and stream pairs digests cited by runs against the data job"
+      ],
+      "recorded_only": [
+        "source file digests and combined source fingerprint (source files are not in the input)",
+        "expert, preparation record, policy state and preparation config hashes (preparation files are not in the input)",
+        "pool and stream file and pairs digests (dataset files are not in the input)"
+      ]
+    }
+  },
+  "input_hashes": {
+    "control/audit-inventory/inventory.json": {
+      "sha256": "20eeeb895c281a1654e914b347fbbf0b96e62142ce9ff80eed2920f1c6613e23",
+      "controller_check": "inventory file"
+    },
+    "control/data-inventory/inventory.json": {
+      "sha256": "7abd89b2c3d9409c91b88a72dcd2b46b8eb4f23426165d83e41bbecdf944caa8",
+      "controller_check": "inventory file"
+    },
+    "control/runs-inventory/inventory.json": {
+      "sha256": "f7f2c3115336de99673b8eaef845149ae32dbc87a042bcea7cadc86ab920c535",
+      "controller_check": "inventory file"
+    },
+    "audit/result.json": {
+      "sha256": "f803629e71dc7e87b0bff4c81f30ea05f38c0c3946fa4240da327f7c2cd58b91",
+      "controller_check": "matched"
+    },
+    "data/result.json": {
+      "sha256": "2588f231c5d98b9c22f321231dc6f61d36326c1843330aa5a552fa502c4abc8c",
+      "controller_check": "matched"
+    },
+    "run-ftl-identity/result.json": {
+      "sha256": "e9034ffdf59e8b06367492a5c33451490fba58a1278ea02fd209fa789bba1200",
+      "controller_check": "none recorded (timed out); saved snapshot hash shown"
+    },
+    "run-ftl-cart_position_zero/result.json": {
+      "sha256": "a47fbd19f4177ba61d320c3ca71767139a24dd090db5f5c8e04460a6702a510a",
+      "controller_check": "none recorded (timed out); saved snapshot hash shown"
+    },
+    "run-bc-identity/result.json": {
+      "sha256": "ae006d5f42a2a198f6b27e1eaa6361265ec4246790b1b0894cbeb0c561c59317",
+      "controller_check": "matched"
+    },
+    "run-bc-cart_position_zero/result.json": {
+      "sha256": "3396af121cb18c22c8ddb3aab4c8a84ab1d7c0bf43ddf84211c628c0f120b78c",
+      "controller_check": "matched"
+    },
+    "run-bc_iid-identity/result.json": {
+      "sha256": "cb2e0fd2b95f4e7cfc50f4f9d92c1c26858d2c4fd75e5f767bbd4cf09960e4bc",
+      "controller_check": "none recorded (timed out); saved snapshot hash shown"
+    },
+    "run-bc_iid-cart_position_zero/result.json": {
+      "sha256": "564236baa890361bcf793ab276bdc720355467e6a4e9dda66881032e9ae5601c",
+      "controller_check": "none recorded (timed out); saved snapshot hash shown"
+    }
+  },
+  "protocol": "agnostic-cartpole-restriction-pilot/1",
+  "env_name": "CartPole-v1",
+  "seed": 300,
+  "episode_cap": 500,
+  "expert_return": 500.0,
+  "random_return": 22.95,
+  "eval_episodes": 100,
+  "n_rounds": 1000,
+  "n_eval_budgets": 101,
+  "bc_batch_size": 32,
+  "job_limit_seconds": 7200.0,
+  "runs": {
+    "run-ftl-identity": {
+      "run": "run-ftl-identity",
+      "method": "ftl",
+      "restriction_id": "identity",
+      "controller_state": "timed_out",
+      "saved_record_status": "running",
+      "saved_snapshot_final": false,
+      "attempts": 1,
+      "exit_code": -15,
+      "controller_elapsed_seconds": 7200.136337339005,
+      "controller_started_at_utc": "2026-09-30T22:20:46.031765Z",
+      "controller_ended_at_utc": "2026-10-01T00:20:46.168052Z",
+      "snapshot_written_at_utc": "2026-10-01T00:20:20.366527+00:00",
+      "seconds_from_last_snapshot_to_controller_end": 25.801525,
+      "last_saved_training_round": 646,
+      "last_evaluated_labels": 640,
+      "evaluations_saved": 66,
+      "result_sha256": "e9034ffdf59e8b06367492a5c33451490fba58a1278ea02fd209fa789bba1200",
+      "controller_result_sha256": null,
+      "controller_hash_check": "not available for a timed-out run; saved snapshot hash calculated",
+      "counts_are": "saved counts as of the last snapshot; lower bounds on the work done",
+      "observed": {
+        "env_steps": 3575418,
+        "env_resets": 712,
+        "finished_episodes": 7246
+      },
+      "in_run_collection": {
+        "env_steps": 322167,
+        "episodes": 646
+      },
+      "evaluation": {
+        "evaluations": 66,
+        "episodes": 6600,
+        "env_steps": 3253251
+      },
+      "training": {
+        "early_stopped_fits": 0,
+        "epochs": 12920,
+        "fits": 646,
+        "fixed_budget_fallback_fits": 319
+      },
+      "retained_labels": 646,
+      "totals": {
+        "env_steps": 3575418,
+        "exact": false,
+        "expert_action_entries": null,
+        "expert_predict_calls": null,
+        "learner_predict_calls": null
+      },
+      "reconciled": true,
+      "wall_seconds_recorded": {
+        "collection_and_training": 5045.291370037332,
+        "evaluation": 2040.4245181492588,
+        "fits": 0.0,
+        "setup": 0.7557734900037758,
+        "total": null
+      }
+    },
+    "run-ftl-cart_position_zero": {
+      "run": "run-ftl-cart_position_zero",
+      "method": "ftl",
+      "restriction_id": "cart_position_zero",
+      "controller_state": "timed_out",
+      "saved_record_status": "running",
+      "saved_snapshot_final": false,
+      "attempts": 1,
+      "exit_code": -15,
+      "controller_elapsed_seconds": 7200.210474591993,
+      "controller_started_at_utc": "2026-09-30T22:20:46.140119Z",
+      "controller_ended_at_utc": "2026-10-01T00:20:46.350541Z",
+      "snapshot_written_at_utc": "2026-10-01T00:20:04.406827+00:00",
+      "seconds_from_last_snapshot_to_controller_end": 41.943714,
+      "last_saved_training_round": 717,
+      "last_evaluated_labels": 710,
+      "evaluations_saved": 73,
+      "result_sha256": "a47fbd19f4177ba61d320c3ca71767139a24dd090db5f5c8e04460a6702a510a",
+      "controller_result_sha256": null,
+      "controller_hash_check": "not available for a timed-out run; saved snapshot hash calculated",
+      "counts_are": "saved counts as of the last snapshot; lower bounds on the work done",
+      "observed": {
+        "env_steps": 3969148,
+        "env_resets": 790,
+        "finished_episodes": 8017
+      },
+      "in_run_collection": {
+        "env_steps": 357655,
+        "episodes": 717
+      },
+      "evaluation": {
+        "evaluations": 73,
+        "episodes": 7300,
+        "env_steps": 3611493
+      },
+      "training": {
+        "early_stopped_fits": 300,
+        "epochs": 11740,
+        "fits": 717,
+        "fixed_budget_fallback_fits": 319
+      },
+      "retained_labels": 717,
+      "totals": {
+        "env_steps": 3969148,
+        "exact": false,
+        "expert_action_entries": null,
+        "expert_predict_calls": null,
+        "learner_predict_calls": null
+      },
+      "reconciled": true,
+      "wall_seconds_recorded": {
+        "collection_and_training": 4710.519750929845,
+        "evaluation": 2351.5162939281145,
+        "fits": 0.0,
+        "setup": 0.6599063980102073,
+        "total": null
+      }
+    },
+    "run-bc-identity": {
+      "run": "run-bc-identity",
+      "method": "bc",
+      "restriction_id": "identity",
+      "controller_state": "complete",
+      "saved_record_status": "complete",
+      "saved_snapshot_final": true,
+      "attempts": 1,
+      "exit_code": 0,
+      "controller_elapsed_seconds": 3249.9877957869903,
+      "controller_started_at_utc": "2026-09-30T22:20:46.258482Z",
+      "controller_ended_at_utc": "2026-09-30T23:14:56.246243Z",
+      "snapshot_written_at_utc": "2026-09-30T23:14:55.496564+00:00",
+      "seconds_from_last_snapshot_to_controller_end": 0.749679,
+      "last_saved_training_round": 1000,
+      "last_evaluated_labels": 1000,
+      "evaluations_saved": 101,
+      "result_sha256": "ae006d5f42a2a198f6b27e1eaa6361265ec4246790b1b0894cbeb0c561c59317",
+      "controller_result_sha256": "ae006d5f42a2a198f6b27e1eaa6361265ec4246790b1b0894cbeb0c561c59317",
+      "controller_hash_check": "matched",
+      "counts_are": "exact final totals",
+      "observed": {
+        "env_steps": 5050000,
+        "env_resets": 101,
+        "finished_episodes": 10100
+      },
+      "in_run_collection": {
+        "env_steps": 0,
+        "episodes": 0
+      },
+      "evaluation": {
+        "evaluations": 101,
+        "episodes": 10100,
+        "env_steps": 5050000
+      },
+      "training": {
+        "early_stopped_fits": 0,
+        "epochs": 2020,
+        "fits": 101,
+        "fixed_budget_fallback_fits": 32
+      },
+      "retained_labels": 1000,
+      "totals": {
+        "env_steps": 5050000,
+        "exact": true,
+        "expert_action_entries": 5050000,
+        "expert_predict_calls": 5050000,
+        "learner_predict_calls": 5050000
+      },
+      "reconciled": true,
+      "wall_seconds_recorded": {
+        "collection_and_training": 0.0,
+        "evaluation": 3188.11708191692,
+        "fits": 52.13988631093525,
+        "setup": 0.6113482410146389,
+        "total": 3246.437949728017
+      }
+    },
+    "run-bc-cart_position_zero": {
+      "run": "run-bc-cart_position_zero",
+      "method": "bc",
+      "restriction_id": "cart_position_zero",
+      "controller_state": "complete",
+      "saved_record_status": "complete",
+      "saved_snapshot_final": true,
+      "attempts": 1,
+      "exit_code": 0,
+      "controller_elapsed_seconds": 3393.7296480599907,
+      "controller_started_at_utc": "2026-09-30T22:20:46.384530Z",
+      "controller_ended_at_utc": "2026-09-30T23:17:20.114124Z",
+      "snapshot_written_at_utc": "2026-09-30T23:17:19.356787+00:00",
+      "seconds_from_last_snapshot_to_controller_end": 0.757337,
+      "last_saved_training_round": 1000,
+      "last_evaluated_labels": 1000,
+      "evaluations_saved": 101,
+      "result_sha256": "3396af121cb18c22c8ddb3aab4c8a84ab1d7c0bf43ddf84211c628c0f120b78c",
+      "controller_result_sha256": "3396af121cb18c22c8ddb3aab4c8a84ab1d7c0bf43ddf84211c628c0f120b78c",
+      "controller_hash_check": "matched",
+      "counts_are": "exact final totals",
+      "observed": {
+        "env_steps": 5050000,
+        "env_resets": 101,
+        "finished_episodes": 10100
+      },
+      "in_run_collection": {
+        "env_steps": 0,
+        "episodes": 0
+      },
+      "evaluation": {
+        "evaluations": 101,
+        "episodes": 10100,
+        "env_steps": 5050000
+      },
+      "training": {
+        "early_stopped_fits": 0,
+        "epochs": 2020,
+        "fits": 101,
+        "fixed_budget_fallback_fits": 32
+      },
+      "retained_labels": 1000,
+      "totals": {
+        "env_steps": 5050000,
+        "exact": true,
+        "expert_action_entries": 5050000,
+        "expert_predict_calls": 5050000,
+        "learner_predict_calls": 5050000
+      },
+      "reconciled": true,
+      "wall_seconds_recorded": {
+        "collection_and_training": 0.0,
+        "evaluation": 3331.42677845704,
+        "fits": 52.70861416502157,
+        "setup": 0.484649942984106,
+        "total": 3390.1894814019906
+      }
+    },
+    "run-bc_iid-identity": {
+      "run": "run-bc_iid-identity",
+      "method": "bc_iid",
+      "restriction_id": "identity",
+      "controller_state": "timed_out",
+      "saved_record_status": "running",
+      "saved_snapshot_final": false,
+      "attempts": 1,
+      "exit_code": -15,
+      "controller_elapsed_seconds": 7200.160091761005,
+      "controller_started_at_utc": "2026-09-30T23:14:56.340588Z",
+      "controller_ended_at_utc": "2026-10-01T01:14:56.500628Z",
+      "snapshot_written_at_utc": "2026-10-01T01:14:52.757185+00:00",
+      "seconds_from_last_snapshot_to_controller_end": 3.743443,
+      "last_saved_training_round": 670,
+      "last_evaluated_labels": 670,
+      "evaluations_saved": 69,
+      "result_sha256": "cb2e0fd2b95f4e7cfc50f4f9d92c1c26858d2c4fd75e5f767bbd4cf09960e4bc",
+      "controller_result_sha256": null,
+      "controller_hash_check": "not available for a timed-out run; saved snapshot hash calculated",
+      "counts_are": "saved counts as of the last snapshot; lower bounds on the work done",
+      "observed": {
+        "env_steps": 3403251,
+        "env_resets": 69,
+        "finished_episodes": 6900
+      },
+      "in_run_collection": {
+        "env_steps": 0,
+        "episodes": 0
+      },
+      "evaluation": {
+        "evaluations": 69,
+        "episodes": 6900,
+        "env_steps": 3403251
+      },
+      "training": {
+        "early_stopped_fits": 0,
+        "epochs": 13400,
+        "fits": 670,
+        "fixed_budget_fallback_fits": 319
+      },
+      "retained_labels": 670,
+      "totals": {
+        "env_steps": 3403251,
+        "exact": false,
+        "expert_action_entries": null,
+        "expert_predict_calls": null,
+        "learner_predict_calls": null
+      },
+      "reconciled": true,
+      "wall_seconds_recorded": {
+        "collection_and_training": 4998.9153234025,
+        "evaluation": 2106.8457063531387,
+        "fits": 0.0,
+        "setup": 0.1383675599936396,
+        "total": null
+      }
+    },
+    "run-bc_iid-cart_position_zero": {
+      "run": "run-bc_iid-cart_position_zero",
+      "method": "bc_iid",
+      "restriction_id": "cart_position_zero",
+      "controller_state": "timed_out",
+      "saved_record_status": "running",
+      "saved_snapshot_final": false,
+      "attempts": 1,
+      "exit_code": -15,
+      "controller_elapsed_seconds": 7200.3490152769955,
+      "controller_started_at_utc": "2026-09-30T23:17:20.218895Z",
+      "controller_ended_at_utc": "2026-10-01T01:17:20.567852Z",
+      "snapshot_written_at_utc": "2026-10-01T01:16:46.352647+00:00",
+      "seconds_from_last_snapshot_to_controller_end": 34.215205,
+      "last_saved_training_round": 690,
+      "last_evaluated_labels": 690,
+      "evaluations_saved": 71,
+      "result_sha256": "564236baa890361bcf793ab276bdc720355467e6a4e9dda66881032e9ae5601c",
+      "controller_result_sha256": null,
+      "controller_hash_check": "not available for a timed-out run; saved snapshot hash calculated",
+      "counts_are": "saved counts as of the last snapshot; lower bounds on the work done",
+      "observed": {
+        "env_steps": 3511493,
+        "env_resets": 71,
+        "finished_episodes": 7100
+      },
+      "in_run_collection": {
+        "env_steps": 0,
+        "episodes": 0
+      },
+      "evaluation": {
+        "evaluations": 71,
+        "episodes": 7100,
+        "env_steps": 3511493
+      },
+      "training": {
+        "early_stopped_fits": 119,
+        "epochs": 12618,
+        "fits": 690,
+        "fixed_budget_fallback_fits": 319
+      },
+      "retained_labels": 690,
+      "totals": {
+        "env_steps": 3511493,
+        "exact": false,
+        "expert_action_entries": null,
+        "expert_predict_calls": null,
+        "learner_predict_calls": null
+      },
+      "reconciled": true,
+      "wall_seconds_recorded": {
+        "collection_and_training": 4792.137268318358,
+        "evaluation": 2281.7379978622484,
+        "fits": 0.0,
+        "setup": 0.13669023299007677,
+        "total": null
+      }
+    }
+  },
+  "matched_budget": {
+    "labels": 640,
+    "rule": "maximum of the intersection of the six sets of evaluated label counts",
+    "points": {
+      "run-ftl-identity": {
+        "labels": 640,
+        "round": 640,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.049221,
+        "disagreement_rate": 0.00932,
+        "expert_rollout_cross_entropy": 0.224745,
+        "eval_env_steps": 50000
+      },
+      "run-ftl-cart_position_zero": {
+        "labels": 640,
+        "round": 640,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.464458,
+        "disagreement_rate": 0.2839,
+        "expert_rollout_cross_entropy": 0.091888,
+        "eval_env_steps": 50000
+      },
+      "run-bc-identity": {
+        "labels": 640,
+        "round": 640,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.263521,
+        "disagreement_rate": 0.00646,
+        "expert_rollout_cross_entropy": 0.223668,
+        "eval_env_steps": 50000
+      },
+      "run-bc-cart_position_zero": {
+        "labels": 640,
+        "round": 640,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.544523,
+        "disagreement_rate": 0.28618,
+        "expert_rollout_cross_entropy": 0.094161,
+        "eval_env_steps": 50000
+      },
+      "run-bc_iid-identity": {
+        "labels": 640,
+        "round": 640,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.047757,
+        "disagreement_rate": 0.00984,
+        "expert_rollout_cross_entropy": 0.225182,
+        "eval_env_steps": 50000
+      },
+      "run-bc_iid-cart_position_zero": {
+        "labels": 640,
+        "round": 640,
+        "mean_return": 500.0,
+        "min_return": 500.0,
+        "max_return": 500.0,
+        "episodes": 100,
+        "episodes_at_cap": 100,
+        "normalized_return": 1.0,
+        "rollout_cross_entropy": 0.601982,
+        "disagreement_rate": 0.26078,
+        "expert_rollout_cross_entropy": 0.103239,
+        "eval_env_steps": 50000
+      }
+    }
+  },
+  "own_endpoints": {
+    "run-ftl-identity": {
+      "labels": 640,
+      "round": 640,
+      "mean_return": 500.0,
+      "min_return": 500.0,
+      "max_return": 500.0,
+      "episodes": 100,
+      "episodes_at_cap": 100,
+      "normalized_return": 1.0,
+      "rollout_cross_entropy": 0.049221,
+      "disagreement_rate": 0.00932,
+      "expert_rollout_cross_entropy": 0.224745,
+      "eval_env_steps": 50000
+    },
+    "run-ftl-cart_position_zero": {
+      "labels": 710,
+      "round": 710,
+      "mean_return": 500.0,
+      "min_return": 500.0,
+      "max_return": 500.0,
+      "episodes": 100,
+      "episodes_at_cap": 100,
+      "normalized_return": 1.0,
+      "rollout_cross_entropy": 0.437751,
+      "disagreement_rate": 0.26492,
+      "expert_rollout_cross_entropy": 0.101091,
+      "eval_env_steps": 50000
+    },
+    "run-bc-identity": {
+      "labels": 1000,
+      "round": 1000,
+      "mean_return": 500.0,
+      "min_return": 500.0,
+      "max_return": 500.0,
+      "episodes": 100,
+      "episodes_at_cap": 100,
+      "normalized_return": 1.0,
+      "rollout_cross_entropy": 0.238094,
+      "disagreement_rate": 0.03684,
+      "expert_rollout_cross_entropy": 0.221909,
+      "eval_env_steps": 50000
+    },
+    "run-bc-cart_position_zero": {
+      "labels": 1000,
+      "round": 1000,
+      "mean_return": 500.0,
+      "min_return": 500.0,
+      "max_return": 500.0,
+      "episodes": 100,
+      "episodes_at_cap": 100,
+      "normalized_return": 1.0,
+      "rollout_cross_entropy": 0.561774,
+      "disagreement_rate": 0.28526,
+      "expert_rollout_cross_entropy": 0.091906,
+      "eval_env_steps": 50000
+    },
+    "run-bc_iid-identity": {
+      "labels": 670,
+      "round": 670,
+      "mean_return": 500.0,
+      "min_return": 500.0,
+      "max_return": 500.0,
+      "episodes": 100,
+      "episodes_at_cap": 100,
+      "normalized_return": 1.0,
+      "rollout_cross_entropy": 0.04794,
+      "disagreement_rate": 0.01066,
+      "expert_rollout_cross_entropy": 0.224246,
+      "eval_env_steps": 50000
+    },
+    "run-bc_iid-cart_position_zero": {
+      "labels": 690,
+      "round": 690,
+      "mean_return": 500.0,
+      "min_return": 500.0,
+      "max_return": 500.0,
+      "episodes": 100,
+      "episodes_at_cap": 100,
+      "normalized_return": 1.0,
+      "rollout_cross_entropy": 0.582212,
+      "disagreement_rate": 0.26618,
+      "expert_rollout_cross_entropy": 0.104557,
+      "eval_env_steps": 50000
+    }
+  },
+  "return_ceiling": {
+    "trained_evaluations": 477,
+    "trained_evaluations_at_cap": 477,
+    "all_trained_evaluations_at_cap": true
+  },
+  "pairing": {
+    "round0_ftl_bc_iid_identical_within_condition": true,
+    "per_condition": {
+      "identity": true,
+      "cart_position_zero": true
+    }
+  },
+  "shared_preparation": {
+    "audit": {
+      "controller_elapsed_seconds": 3.506865631992696,
+      "expert_predict_calls": 555,
+      "checked_pairs": 120,
+      "conflicting_pairs": 80,
+      "invalid_pairs": 0,
+      "audit_status": "conflict_found"
+    },
+    "data": {
+      "controller_elapsed_seconds": 312.47201650601346,
+      "fixed_bc_pool": {
+        "elapsed_seconds": 0.359965851996094,
+        "env_steps": 1000,
+        "episodes": 2,
+        "env_resets": 2,
+        "expert_predict_calls": 1000,
+        "retained_labels": 1000,
+        "overshoot_transitions": 0
+      },
+      "bc_iid_stream": {
+        "elapsed_seconds": 162.16890763901756,
+        "env_steps": 500000,
+        "episodes": 1000,
+        "env_resets": 1000,
+        "expert_predict_calls": 500000,
+        "retained_labels": 1000
+      },
+      "normalization_baselines": {
+        "elapsed_seconds": 146.48289389401907,
+        "env_steps_counted": 261475,
+        "expert_episodes": 500,
+        "random_episodes": 500,
+        "expert_predict_calls": 500000
+      },
+      "note": "internal phase timers; they need not sum to the controller time"
+    },
+    "charged": "once for the whole pilot, not per run or per paired condition"
+  },
+  "campaign": {
+    "stages": {
+      "audit": {
+        "campaign_id": "cartpole-restriction-20260930-audit",
+        "controller_started_at_utc": "2026-09-30T22:10:36.765969Z",
+        "controller_ended_at_utc": "2026-09-30T22:10:40.435090Z",
+        "controller_span_seconds": 3.669121,
+        "source_sha256": "df5a7c5b0d9527cb998886ff1bc05aeaaf9dbd91a981b179143370be0b2a9ebd"
+      },
+      "data": {
+        "campaign_id": "cartpole-restriction-20260930-data",
+        "controller_started_at_utc": "2026-09-30T22:12:22.538075Z",
+        "controller_ended_at_utc": "2026-09-30T22:17:35.146602Z",
+        "controller_span_seconds": 312.608527,
+        "source_sha256": "df5a7c5b0d9527cb998886ff1bc05aeaaf9dbd91a981b179143370be0b2a9ebd"
+      },
+      "runs": {
+        "campaign_id": "cartpole-restriction-20260930-runs",
+        "controller_started_at_utc": "2026-09-30T22:20:45.961981Z",
+        "controller_ended_at_utc": "2026-10-01T01:17:20.624254Z",
+        "controller_span_seconds": 10594.662273,
+        "source_sha256": "df5a7c5b0d9527cb998886ff1bc05aeaaf9dbd91a981b179143370be0b2a9ebd"
+      }
+    },
+    "first_attempt_start_utc": "2026-09-30T22:10:36.835165Z",
+    "last_attempt_end_utc": "2026-10-01T01:17:20.567852Z",
+    "elapsed_seconds": 11203.732687,
+    "elapsed_note": "first attempt start to last attempt end; includes review gates and idle time between stages",
+    "sum_attempt_worker_seconds": 35760.552244953986
+  },
+  "notes": [
+    "Cross-entropy and disagreement are on each learner's own visited states.",
+    "Timed-out counts are saved counts or observed lower bounds, not totals.",
+    "Null values are unknown, never zero.",
+    "Controller wall time is worker wall time, not CPU or GPU hours or money.",
+    "Original expert preparation, local review and plotting are out of scope.",
+    "Round-loop fits are timed within collection_and_training; fixed BC has no in-run collection, so those recorded 0.0 phase timers are structural."
+  ]
+}
