@@ -5,7 +5,7 @@ Records as of the last controller attempt end, September 30, 2026, 6:17 pm Phoen
 ## Outcome
 
 - 2 of 6 runs completed; 4 were stopped by the external 7,200 second job limit (`timed_out`). Timed-out runs are reported up to their last saved evaluation only.
-- Every saved evaluation of a trained policy, in all six runs and both observation conditions, scored 500 in all 100 episodes, starting with the first one-label evaluation. Return is at its ceiling and cannot separate methods or observation conditions here.
+- Every saved evaluation of a trained policy, in all six runs and both observation conditions, scored 500 in all 100 episodes, starting with the first one-label evaluation (stored normalized return 1, which corresponds to raw 500). Return is at its ceiling and cannot separate methods or observation conditions here.
 - Cross-entropy and disagreement are reported as recorded; each is measured on that learner's own visited states.
 - Fixed BC and BC-iid also differ in optimization (below), so their comparison does not isolate data acquisition.
 
@@ -28,12 +28,15 @@ The controller inventory is authoritative for terminal state. A timed-out run's 
 
 - Every saved evaluation is drawn. FTL and BC-iid include round 0 (the untrained initial head); fixed BC has no round 0 evaluation and starts at one label. Lines are not smoothed.
 - An X marks a timed-out run's last saved evaluation. It is a saved evaluation, not the exact training state at termination, and the line is not extended toward 1,000.
-- The dotted line is the expert reference return (500), which equals the 500 step cap. Return curves that reach it coincide and overlap; no jitter is added.
+- The return panel draws the stored `normalized_return`, the inherited (mean return - random return) / (expert return - random return), with the random reference 22.95 at 0 (dash-dot line) and the expert reference 500 at 1 (dotted line). Normalized 1 here corresponds to raw 500 and remains a ceiling: the expert reference equals the 500 step cap. Return curves that reach 1 coincide and overlap; no jitter is added.
+- Each stored `normalized_return` was checked against its raw episode mean and the stored references, within the producer's six-decimal rounding. The stored values are plotted as recorded: none was recomputed, replaced or clipped. Tables below and both JSON files keep raw returns.
+- The previous version of this figure plotted raw mean return. That was a presentation departure from the stored metric, not a different evaluation; this figure restores the stored normalized return.
+- Cross-entropy (natural log) is the average negative natural log probability of the expert's deterministic action, per learner-visited state; lower is better. The earlier axis label "nats per state" named the same quantity. This is a unit clarification, not a changed metric.
 - Learner cross-entropy, disagreement and expert cross-entropy are computed on the states each learner visited during its own evaluation episodes. They are not errors on a common state distribution, so a lower value does not mean lower error on the same states.
 
 ## Matched-label comparison
 
-The largest evaluation budget shared by all six curves is **640 labels**: the maximum of the intersection of the six sets of evaluated label counts, taken mechanically and not by effect size. Values are descriptive for one training seed. No winner is selected and no test is run. Return is shown as the mean with the episode minimum to maximum.
+The largest evaluation budget shared by all six curves is **640 labels**: the maximum of the intersection of the six sets of evaluated label counts, taken mechanically and not by effect size. Values are descriptive for one training seed. No winner is selected and no test is run. Return is shown as the raw mean with the episode minimum to maximum. Cross-entropy columns use the natural log, as defined above.
 
 | Method | Observation | Labels | Return mean (min to max) | Learner CE | Disagreement | Expert CE |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -104,7 +107,7 @@ Original expert preparation and qualification, local review, and report and plot
 
 - **Datasets.** Fixed BC cold-fits each prefix of a chronological pool (2 complete expert episodes, kept in order). BC-iid replays an independently reset stream, one uniformly selected state from each of 1,000 expert episodes, one state per round. The two datasets have different content hashes.
 - **Inherited optimizer mismatch.** As in the previous pipeline, FTL and BC-iid train with minibatch 1 (`min(32, samples_per_round)`) and refit after every label, up to 1,000 fits, while fixed BC uses minibatches of up to 32 and fits only the 101 evaluated prefixes. All six configs record `bc_batch_size` 32; the effective sizes follow from source and were not separately instrumented. This changes optimization, not only speed, so fixed BC versus BC-iid does not isolate data acquisition.
-- **Return ceiling.** Reaching the cap after one label is a pilot finding for this learner, the CartPole reset distribution and the 500 step limit. It does not show that hiding cart position is harmless in general or that FTL cannot help.
+- **Return ceiling.** Reaching the cap after one label (normalized return 1, raw 500) is a pilot finding for this learner, the CartPole reset distribution and the 500 step limit. It does not show that hiding cart position is harmless in general or that FTL cannot help.
 - **Audit scope.** The audit found 80 conflicting of 120 checked pairs: expert labels conflict under the mask. It does not establish a positive error floor on natural state distributions or a return gap.
 - **Frozen expert features** are a plausible explanation for the rapid control success, not a verified causal attribution.
 - **One training seed.** Training-seed uncertainty cannot be estimated from one training seed, and no general superiority claim is made. The episode minimum and maximum describe evaluation spread for one trained policy, not confidence about other training seeds. Per-episode cross-entropy and disagreement were not stored, so no uncertainty bands are drawn.
@@ -120,7 +123,7 @@ Original expert preparation and qualification, local review, and report and plot
 - Expert `05d52f5512c68fb151d2d87877e54de592bd73a1afa4fa2261419e07462d646b`; preparation record `c8a87c6817baeeb873ee39be4504789c06a7b4033c9fab26f70d696b16023ebe`; policy state `a01e49ac3e1160896dd63916b836906b0b6946fb787fd9e89b6a27ac42d3dce9`. Recorded and identical in all eight results.
 - Fixed-BC pool: file `b6d4f2174e445ddd0553c507646b84a8071bae0f22a3f18032875a6a0c8fd808`, pairs `f20eda3b8204dac388f4d2aca280b8935a9c2153cdb9744c9b991b8d6b7f2128`. BC-iid stream: file `34f9d6fa5ab9c7020262c7e502632f8a842e5e2321109f7c4f3e57e80b796531`, pairs `451320030207973c84a7bace480dcb04cb97be0695f2505f2531aef6760ff669`. Recorded by the data job; every run cites the same pairs digests and the data result hash below.
 - The config digests of the data job and all six runs were recomputed with the producer's canonical JSON and match. The source, expert, preparation and dataset digests above are reported as recorded: this analysis compares them across records but does not rehash the source, preparation or dataset files, which are not part of its input.
-- Analysis script `experiments/agnostic/analyze_cartpole_pilot.py`, SHA-256 `d780b3126f3b3f4a75740685def8f141554512d30b07836d41fdb249d2cb542b`.
+- Analysis script `experiments/agnostic/analyze_cartpole_pilot.py`, SHA-256 `8770b54026ade84390170480b766d11a0b00259895c0f3cb97e53b980fab7a9d`.
 
 | Record | SHA-256 of the analyzed file | Controller hash |
 | --- | --- | --- |

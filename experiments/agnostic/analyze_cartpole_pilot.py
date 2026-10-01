@@ -43,6 +43,9 @@ SHARED_DATASET = {"ftl": None, "bc": "pool", "bc_iid": "stream"}
 RUN_STATES = {"complete", "timed_out"}
 LIVE_STATES = {"pending", "running"}
 METRICS = ("rollout_cross_entropy", "disagreement_rate", "expert_rollout_cross_entropy")
+# The producer (run_experiment._compute_round_eval) rounds normalized_return to six
+# decimals, so a faithful stored value is within half a unit of the sixth place.
+NORM_TOL = 0.5e-6 + 1e-12
 # Keys that legitimately differ between methods in config.experiment.
 METHOD_KEYS = {"algo", "subsample_strategy"}
 
@@ -239,6 +242,22 @@ def check_configs(runs):
 # ---------------------------------------------------------------- extraction
 
 
+def check_normalized(job_id, r, ret, baselines):
+    """The stored normalized_return must follow the inherited formula on raw returns.
+
+    Only a check: the stored value is what gets reported and plotted.
+    """
+    expert_ret, random_ret = baselines["expert_return"], baselines["random_return"]
+    require(abs(expert_ret - random_ret) >= 1e-8,
+            f"{job_id}: degenerate normalization references")
+    stored = r["normalized_return"]
+    require(stored is not None, f"{job_id}: round {r['round']} has no normalized_return")
+    expected = (ret.mean() - random_ret) / (expert_ret - random_ret)
+    require(abs(stored - expected) <= NORM_TOL,
+            f"{job_id}: round {r['round']} normalized_return {stored} differs from "
+            f"(mean return - random) / (expert - random) = {expected}")
+
+
 def curve(job_id, rec, n_episodes, cap):
     points = []
     for r in rec["records"]:
@@ -248,6 +267,7 @@ def curve(job_id, rec, n_episodes, cap):
             continue
         ret = np.asarray(r["episode_returns"], dtype=float)
         require(ret.size == n_episodes, f"{job_id}: evaluation with {ret.size} episodes")
+        check_normalized(job_id, r, ret, rec["data"]["baselines"])
         points.append({
             "labels": int(r["n_observations"]),
             "round": int(r["round"]),
@@ -372,10 +392,13 @@ def label(job_id):
     return f"{METHOD_LABEL[m]}, {OBS_LABEL[r]}"
 
 
-def curves_figure(points, rows, expert_return, cap, ceiling, n_episodes):
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.2), sharex=True)
+def curves_figure(points, rows, baselines, cap, ceiling, n_episodes):
+    expert_return = baselines["expert_return"]
+    random_return = baselines["random_return"]
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.8), sharex=True)
     panels = [
-        ("mean_return", f"Mean episode return ({n_episodes} deterministic episodes)"),
+        ("normalized_return",
+         f"Normalized return (mean of {n_episodes} deterministic episodes)"),
         ("rollout_cross_entropy", "Learner rollout cross-entropy"),
         ("disagreement_rate", "Disagreement rate with the expert"),
         ("expert_rollout_cross_entropy",
@@ -394,20 +417,24 @@ def curves_figure(points, rows, expert_return, cap, ceiling, n_episodes):
         ax.set_xlim(-15, 1015)
         ax.grid(alpha=0.3)
     ax = axes[0, 0]
-    ax.axhline(expert_return, color="#555555", ls=":", lw=1.2, zorder=0)
-    ax.set_ylim(0, cap * 1.08)
+    ax.axhline(1.0, color="#555555", ls=":", lw=1.2, zorder=0)
+    ax.axhline(0.0, color="#999999", ls="-.", lw=1.0, zorder=0)
+    # Limits follow the stored values so nothing is clipped.
+    norm = [p["normalized_return"] for j in RUN_IDS for p in points[j]]
+    ax.set_ylim(min(0.0, min(norm)) - 0.08, max(1.0, max(norm)) + 0.08)
     same = "equals" if expert_return == cap else "differs from"
     ceiling_text = (
-        f"Ceiling: expert reference {expert_return:g} {same} the {cap} step cap.\n"
-        + ("All trained curves sit on it and overlap; no jitter is added."
-           if ceiling else "Curves that reach it overlap; no jitter is added.")
+        f"Ceiling: normalized 1 is raw {expert_return:g}, the expert reference;\n"
+        f"it {same} the {cap} step cap. "
+        + ("All trained curves sit on it\nand overlap; no jitter is added."
+           if ceiling else "Curves that reach it\noverlap; no jitter is added.")
     )
-    ax.text(990, cap * 0.93, ceiling_text, ha="right", va="top", fontsize=8.5,
+    ax.text(990, 0.93, ceiling_text, ha="right", va="top", fontsize=8.5,
             color="#333333")
-    ax.set_ylabel("return")
-    axes[0, 1].set_ylabel("nats per state")
+    ax.set_ylabel("normalized return (random 0, expert 1)")
+    axes[0, 1].set_ylabel("Cross-entropy (natural log)")
     axes[1, 0].set_ylabel("fraction of visited states")
-    axes[1, 1].set_ylabel("nats per state")
+    axes[1, 1].set_ylabel("Cross-entropy (natural log)")
     for ax in axes[1]:
         ax.set_xlabel("expert labels used for training (training round or prefix size)")
     handles = [Line2D([], [], color=COLOR[m], lw=2.5, label=METHOD_LABEL[m])
@@ -418,14 +445,23 @@ def curves_figure(points, rows, expert_return, cap, ceiling, n_episodes):
         Line2D([], [], ls="none", marker="X", ms=9, color="#999999", mec="black",
                label="Last saved evaluation of a timed-out run\n"
                      "(a saved evaluation, not the exact terminal training state)"),
-        Line2D([], [], color="#555555", ls=":", label=f"Expert reference {expert_return:g}"),
+        Line2D([], [], color="#555555", ls=":",
+               label=f"Expert reference, normalized 1 (raw {expert_return:g})"),
+        Line2D([], [], color="#999999", ls="-.",
+               label=f"Random reference, normalized 0 (raw {random_return:g})"),
     ]
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=9, frameon=False,
-               bbox_to_anchor=(0.5, 0.045))
+               bbox_to_anchor=(0.5, 0.075))
     fig.suptitle("CartPole restriction pilot, training seed 300: every saved evaluation",
                  fontsize=13, fontweight="bold")
     fig.text(
         0.5, 0.008,
+        "Return: stored normalized_return, "
+        f"(mean return - random {random_return:g}) / "
+        f"(expert {expert_return:g} - random {random_return:g}), so raw "
+        f"{random_return:g} is 0 and raw {expert_return:g} is 1.\n"
+        "Cross-entropy: average negative natural log probability of the expert's "
+        "deterministic action, per learner-visited state; lower is better.\n"
         "Cross-entropy and disagreement are measured on each learner's own visited "
         "states, not on a common distribution. Round 0 is the untrained initial head "
         "(FTL, BC-iid only).\nTimed-out lines stop at their last saved evaluation and "
@@ -433,7 +469,7 @@ def curves_figure(points, rows, expert_return, cap, ceiling, n_episodes):
         "disagreement were not stored, so no bands are drawn.",
         ha="center", va="bottom", fontsize=8.5, color="#444444",
     )
-    fig.tight_layout(rect=(0, 0.12, 1, 0.96))
+    fig.tight_layout(rect=(0, 0.135, 1, 0.96))
     return fig
 
 
@@ -512,10 +548,12 @@ def report(s, analysis_sha):
     B = s["matched_budget"]["labels"]
     ceil = s["return_ceiling"]
     fp = s["provenance"]
-    exp_ret, cap = s["expert_return"], s["episode_cap"]
-    reference = (f"the expert reference return ({exp_ret:g}), which equals the {cap} "
-                 "step cap" if exp_ret == cap else
-                 f"the expert reference return ({exp_ret:g}); the step cap is {cap}")
+    exp_ret, rnd_ret, cap = s["expert_return"], s["random_return"], s["episode_cap"]
+    reference = (f"Normalized 1 here corresponds to raw {exp_ret:g} and remains a "
+                 f"ceiling: the expert reference equals the {cap} step cap"
+                 if exp_ret == cap else
+                 f"Normalized 1 here corresponds to raw {exp_ret:g}; the step cap is "
+                 f"{cap}")
     data_sh = shared["data"]
     lines = [
         "# CartPole restriction pilot: results",
@@ -540,7 +578,8 @@ def report(s, analysis_sha):
         lines.append(
             f"- Every saved evaluation of a trained policy, in all six runs and both "
             f"observation conditions, scored {cap} in all {s['eval_episodes']} episodes, "
-            "starting with the first one-label evaluation. Return is at its ceiling and "
+            "starting with the first one-label evaluation (stored normalized return 1, "
+            f"which corresponds to raw {exp_ret:g}). Return is at its ceiling and "
             "cannot separate methods or observation conditions here.")
     else:
         lines.append(
@@ -586,8 +625,22 @@ def report(s, analysis_sha):
         "- An X marks a timed-out run's last saved evaluation. It is a saved "
         "evaluation, not the exact training state at termination, and the line is not "
         "extended toward 1,000.",
-        f"- The dotted line is {reference}. Return curves that reach it coincide and "
-        "overlap; no jitter is added.",
+        "- The return panel draws the stored `normalized_return`, the inherited "
+        "(mean return - random return) / (expert return - random return), with the "
+        f"random reference {rnd_ret:g} at 0 (dash-dot line) and the expert reference "
+        f"{exp_ret:g} at 1 (dotted line). {reference}. Return curves that reach 1 "
+        "coincide and overlap; no jitter is added.",
+        "- Each stored `normalized_return` was checked against its raw episode mean "
+        "and the stored references, within the producer's six-decimal rounding. The "
+        "stored values are plotted as recorded: none was recomputed, replaced or "
+        "clipped. Tables below and both JSON files keep raw returns.",
+        "- The previous version of this figure plotted raw mean return. That was a "
+        "presentation departure from the stored metric, not a different evaluation; "
+        "this figure restores the stored normalized return.",
+        "- Cross-entropy (natural log) is the average negative natural log probability "
+        "of the expert's deterministic action, per learner-visited state; lower is "
+        "better. The earlier axis label \"nats per state\" named the same quantity. "
+        "This is a unit clarification, not a changed metric.",
         "- Learner cross-entropy, disagreement and expert cross-entropy are computed "
         "on the states each learner visited during its own evaluation episodes. They "
         "are not errors on a common state distribution, so a lower value does not mean "
@@ -599,7 +652,8 @@ def report(s, analysis_sha):
         "the maximum of the intersection of the six sets of evaluated label counts, "
         "taken mechanically and not by effect size. Values are descriptive for one "
         "training seed. No winner is selected and no test is run. Return is shown as "
-        "the mean with the episode minimum to maximum.",
+        "the raw mean with the episode minimum to maximum. Cross-entropy columns use "
+        "the natural log, as defined above.",
         "",
         "| Method | Observation | Labels | Return mean (min to max) | Learner CE | "
         "Disagreement | Expert CE |",
@@ -722,7 +776,8 @@ def report(s, analysis_sha):
         f"{s['bc_batch_size']}; the effective sizes follow from source and were not "
         "separately instrumented. This changes optimization, not only speed, so fixed "
         "BC versus BC-iid does not isolate data acquisition.",
-        "- **Return ceiling.** Reaching the cap after one label is a pilot finding for "
+        "- **Return ceiling.** Reaching the cap after one label (normalized return 1, "
+        f"raw {exp_ret:g}) is a pilot finding for "
         "this learner, the CartPole reset distribution and the 500 step limit. It does "
         "not show that hiding cart position is harmless in general or that FTL cannot "
         "help.",
@@ -938,6 +993,11 @@ def main():
                     "config_sha256 of the data job and six runs, with the producer's "
                     "canonical JSON (sorted keys, compact separators)",
                     "data result hash cited by every run",
+                    "normalized_return of every saved evaluation checked against "
+                    "(mean episode return - random_return) / (expert_return - "
+                    "random_return) on its raw episode returns and stored references, "
+                    "within the producer's six-decimal rounding; the stored value is "
+                    "reported, never replaced",
                 ],
                 "compared_for_equality_only": [
                     "campaign source hash across the three inventories",
@@ -986,6 +1046,12 @@ def main():
         "campaign": campaign,
         "notes": [
             "Cross-entropy and disagreement are on each learner's own visited states.",
+            "Cross-entropy is the average negative natural log probability of the "
+            "expert's deterministic action per learner-visited state; lower is better.",
+            "The learning-curve figure plots the stored normalized_return (random 0, "
+            "expert 1); normalized 1 here corresponds to raw expert_return and, with "
+            "expert_return equal to the episode cap, remains a ceiling. Raw returns "
+            "are kept in these files.",
             "Timed-out counts are saved counts or observed lower bounds, not totals.",
             "Null values are unknown, never zero.",
             "Controller wall time is worker wall time, not CPU or GPU hours or money.",
@@ -1014,7 +1080,7 @@ def main():
         hits = sorted(t for t in banned if t and t in text)
         require(not hits, f"{name}: refusing to write private or banned text {hits}")
     images = {
-        FIG_CURVES: png(curves_figure(points, rows, expert_return, cap,
+        FIG_CURVES: png(curves_figure(points, rows, data["baselines"], cap,
                                       summary["return_ceiling"][
                                           "all_trained_evaluations_at_cap"],
                                       n_episodes)),

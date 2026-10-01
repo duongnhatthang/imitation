@@ -32,7 +32,7 @@
     "stream_file_sha256": "34f9d6fa5ab9c7020262c7e502632f8a842e5e2321109f7c4f3e57e80b796531",
     "stream_pairs_sha256": "451320030207973c84a7bace480dcb04cb97be0695f2505f2531aef6760ff669",
     "analysis_script": "experiments/agnostic/analyze_cartpole_pilot.py",
-    "analysis_script_sha256": "d780b3126f3b3f4a75740685def8f141554512d30b07836d41fdb249d2cb542b",
+    "analysis_script_sha256": "8770b54026ade84390170480b766d11a0b00259895c0f3cb97e53b980fab7a9d",
     "config_sha256_recomputed_and_matched": {
       "data": "6a65e5beb32280d7d3ebeb1720e746183c07dcf643f7027789c9a3d777036722",
       "run-ftl-identity": "8ba113196907e747a345065514bc145bc668b9ef8d760420bd2a5afc60430829",
@@ -46,7 +46,8 @@
       "recomputed_here": [
         "SHA-256 of every analyzed result and inventory file; complete jobs matched against the controller result hash",
         "config_sha256 of the data job and six runs, with the producer's canonical JSON (sorted keys, compact separators)",
-        "data result hash cited by every run"
+        "data result hash cited by every run",
+        "normalized_return of every saved evaluation checked against (mean episode return - random_return) / (expert_return - random_return) on its raw episode returns and stored references, within the producer's six-decimal rounding; the stored value is reported, never replaced"
       ],
       "compared_for_equality_only": [
         "campaign source hash across the three inventories",
@@ -726,6 +727,8 @@
   },
   "notes": [
     "Cross-entropy and disagreement are on each learner's own visited states.",
+    "Cross-entropy is the average negative natural log probability of the expert's deterministic action per learner-visited state; lower is better.",
+    "The learning-curve figure plots the stored normalized_return (random 0, expert 1); normalized 1 here corresponds to raw expert_return and, with expert_return equal to the episode cap, remains a ceiling. Raw returns are kept in these files.",
     "Timed-out counts are saved counts or observed lower bounds, not totals.",
     "Null values are unknown, never zero.",
     "Controller wall time is worker wall time, not CPU or GPU hours or money.",
