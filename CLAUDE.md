@@ -66,9 +66,9 @@ cd docs/ && make doctest               # Check doctests
 - **Test markers**: `@pytest.mark.expensive` for slow tests
 - **Environments**: Uses `gymnasium` (not old `gym`) and `seals` for test environments
 
-## CC-server Sync
+## Remote Sync
 
-Use the existing sync script for all code/results transfers — do NOT write raw rsync commands:
+Use the existing sync script for all code/results transfers. Do NOT write raw rsync commands:
 ```bash
 ./experiments/sync_results.sh push   # push code to server
 ./experiments/sync_results.sh pull   # pull JSON results (skips bloat)

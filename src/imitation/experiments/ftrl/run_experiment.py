@@ -22,7 +22,7 @@ import pathlib
 import random
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch as th
@@ -194,6 +194,11 @@ class ExperimentConfig:
         1  # minimum complete rollouts, independent of training batches
     )
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
+    # Round-loop algorithms only. False keeps the original rule, a batch of
+    # min(bc_batch_size, samples_per_round) for every round. True rebinds the
+    # batch to min(bc_batch_size, accumulated labels) before each round's
+    # data are loaded, the rule fixed BC applies to its dataset.
+    grow_batch_with_data: bool = False
 
     def __post_init__(self) -> None:
         if self.beta_rampdown < 0:
@@ -321,6 +326,31 @@ def _split_transitions_for_val(
     return train_idx, val_idx
 
 
+def _bound_loader_sizes(bc_trainer) -> Dict[str, Any]:
+    """Describe the data loader ``bc_trainer`` trains on right now.
+
+    Reads the torch ``DataLoader`` actually bound (unwrapping imitation's
+    batch-size checking wrapper, which rejects any batch of another size), so
+    with ``drop_last`` every training minibatch has exactly this batch size.
+    Any other loader type is reported as unknown (None) rather than guessed.
+    """
+    loader = bc_trainer._demo_data_loader
+    loader = getattr(loader, "data_loader", loader)
+    if not isinstance(loader, th.utils.data.DataLoader):
+        return {
+            "train_batch_size": None,
+            "train_examples": None,
+            "train_batches_per_epoch": None,
+            "train_drop_last": None,
+        }
+    return {
+        "train_batch_size": int(loader.batch_size),
+        "train_examples": len(loader.dataset),
+        "train_batches_per_epoch": len(loader),
+        "train_drop_last": bool(loader.drop_last),
+    }
+
+
 def _inner_train(
     trainer_or_bc,
     config: "ExperimentConfig",
@@ -350,20 +380,23 @@ def _inner_train(
         Dict with keys ``inner_es_stop_epoch`` (int, equals ``bc_n_epochs`` when
         early-stop didn't fire), ``inner_es_val_nll_best`` (float or None),
         ``inner_es_val_nll_trajectory`` (list[float]), ``inner_es_fallback``
-        (str | None).
+        (str | None), and the `_bound_loader_sizes` of the loader trained on.
     """
     max_epochs = int(config.bc_n_epochs)
 
     if not config.inner_early_stop:
         if is_dagger:
             trainer_or_bc.extend_and_update({"n_epochs": max_epochs})
+            sizes = _bound_loader_sizes(trainer_or_bc.bc_trainer)
         else:
             trainer_or_bc.train(n_epochs=max_epochs, progress_bar=False)
+            sizes = _bound_loader_sizes(trainer_or_bc)
         return {
             "inner_es_stop_epoch": max_epochs,
             "inner_es_val_nll_best": None,
             "inner_es_val_nll_trajectory": [],
             "inner_es_fallback": None,
+            **sizes,
         }
 
     # --- inner_early_stop=True: held-out-val early stopping ---
@@ -395,6 +428,7 @@ def _inner_train(
 
     if train_idx is None:
         # Dataset too small for a meaningful val split → fixed budget on full set.
+        sizes = _bound_loader_sizes(bc_trainer)
         bc_trainer.train(n_epochs=max_epochs, progress_bar=False)
         if is_dagger and dagger_current_round is not None:
             trainer_or_bc.track_round_loss(dagger_current_round)
@@ -403,6 +437,7 @@ def _inner_train(
             "inner_es_val_nll_best": None,
             "inner_es_val_nll_trajectory": [],
             "inner_es_fallback": "dataset_too_small",
+            **sizes,
         }
 
     # 4. Carve the train and val slices.
@@ -439,6 +474,7 @@ def _inner_train(
     if len(train_subset) < original_minibatch_size:
         bc_trainer.batch_size = bc_trainer.minibatch_size = len(train_subset)
     bc_trainer.set_demonstrations(train_subset)
+    sizes = _bound_loader_sizes(bc_trainer)
 
     # 6. Loop epochs with val-NLL early stop.
     patience = int(config.inner_early_stop_patience)
@@ -498,6 +534,7 @@ def _inner_train(
         "inner_es_val_nll_best": val_nll_best,
         "inner_es_val_nll_trajectory": val_nll_trajectory,
         "inner_es_fallback": None,
+        **sizes,
     }
 
 
@@ -918,6 +955,11 @@ def _run_dagger_variant(
     rng: np.random.Generator,
     baselines: Dict[str, float],
     device: str = "cpu",
+    *,
+    policy_factory: Optional[Callable[[Any], Any]] = None,
+    offline_data=None,
+    offline_source: Optional[Dict[str, Any]] = None,
+    round_callback: Optional[Callable[[Dict[str, Any], Dict[str, float]], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Run FTL, FTRL, BC-iid, BC-prefix or BC-pool on shared mechanics.
 
@@ -931,14 +973,25 @@ def _run_dagger_variant(
       retains one uniformly random state from each.
     * ``bc_prefix`` / ``bc_pool`` collect nothing at all: they replay a fixed
       offline expert dataset, in chronological order or in uniform draws.
+
+    The keyword-only hooks default to the behavior above. ``policy_factory``
+    replaces ``policy_utils.create_linear_policy`` (linear mode only).
+    ``offline_data`` replays the given transitions in order instead of
+    collecting, for any algorithm, with ``offline_source`` describing their
+    acquisition. ``round_callback(record, timing)`` is called after every
+    appended record (round 0 included) with wall-clock seconds spent on
+    collection plus training and on evaluation; an exception it raises stops
+    the run.
     """
     from imitation.algorithms.dagger import ExponentialBetaSchedule, LinearBetaSchedule
 
     # Create policy
     if config.policy_mode == "linear":
-        policy = policy_utils.create_linear_policy(expert_policy)
+        policy = (policy_factory or policy_utils.create_linear_policy)(expert_policy)
         use_trainable_params_loss = True
     else:
+        if policy_factory is not None:
+            raise ValueError("policy_factory requires policy_mode='linear'")
         policy = policy_utils.create_end_to_end_policy(
             venv.observation_space,
             venv.action_space,
@@ -1018,6 +1071,7 @@ def _run_dagger_variant(
     per_round: List[Dict[str, Any]] = []
 
     # Round 0: evaluate the fresh (untrained) policy.
+    eval_start = time.monotonic()
     round0_eval = _compute_round_eval(
         bc_trainer.policy,
         expert_policy,
@@ -1036,28 +1090,38 @@ def _run_dagger_variant(
             **round0_eval,
         }
     )
+    if round_callback is not None:
+        round_callback(
+            per_round[-1],
+            {
+                "collect_train_seconds": 0.0,
+                "eval_seconds": time.monotonic() - eval_start,
+            },
+        )
 
     # The offline BC baselines replay a fixed dataset instead of collecting.
     # With ``subsample_strategy='prefix'`` this is byte-for-byte the artifact
     # fixed BC uses, so bc_prefix at round t trains on exactly fixed BC's first
     # t transitions.
-    offline_data = None
     offline_collection_steps = 0
-    if config.algo in OFFLINE_BC_ALGOS:
+    if offline_data is None and config.algo in OFFLINE_BC_ALGOS:
         offline_data = _shared_expert_data(config, venv, expert_policy)
+        offline_source = getattr(config, "_expert_dataset_source", None)
+    if offline_data is not None:
         budget = config.n_rounds * config.samples_per_round
         if len(offline_data) < budget:
             raise RuntimeError(
                 f"{config.algo}: offline dataset has {len(offline_data)} "
                 f"transitions but the run needs {budget}"
             )
-        source = getattr(config, "_expert_dataset_source", None) or {}
+        source = offline_source or {}
         offline_collection_steps = int(source.get("collection_steps", 0) or 0)
 
     cum_obs = 0
     collection_steps = 0
     stopped_early = False
     for round_num in range(1, config.n_rounds + 1):
+        round_start = time.monotonic()
         if offline_data is not None:
             # --- Replay this round's slice of the fixed offline dataset ---
             lo = (round_num - 1) * config.samples_per_round
@@ -1094,6 +1158,13 @@ def _run_dagger_variant(
                 _truncate_round_demos(round_dir, config.samples_per_round, rng)
 
         # --- Train on all accumulated demos ---
+        if config.grow_batch_with_data:
+            # Rebind before the trainer loads this round's data; the held-out
+            # split may still shrink it to the actual training split.
+            accumulated = cum_obs + config.samples_per_round
+            bc_trainer.batch_size = bc_trainer.minibatch_size = max(
+                1, min(config.bc_batch_size, accumulated)
+            )
         inner_log = _inner_train(trainer, config, round_num=round_num, is_dagger=True)
         cum_obs += config.samples_per_round
 
@@ -1104,6 +1175,7 @@ def _run_dagger_variant(
         should_eval = is_first or is_interval or is_final
 
         eval_data: Optional[Dict[str, Any]] = None
+        eval_start = time.monotonic()
         if should_eval:
             eval_data = _compute_round_eval(
                 bc_trainer.policy,
@@ -1153,6 +1225,14 @@ def _run_dagger_variant(
             )
 
         per_round.append(round_data)
+        if round_callback is not None:
+            round_callback(
+                round_data,
+                {
+                    "collect_train_seconds": eval_start - round_start,
+                    "eval_seconds": time.monotonic() - eval_start,
+                },
+            )
         if stopped_early:
             break
 
@@ -1289,6 +1369,43 @@ def _shared_expert_data(config, venv, expert_policy):
     return data
 
 
+def _fit_fixed_bc(
+    config: ExperimentConfig,
+    venv,
+    policy,
+    transitions,
+    rng: np.random.Generator,
+    device: str,
+    tb_tag: str,
+):
+    """Fit ``policy`` once on ``transitions`` with the fixed-BC routine.
+
+    One ``bc.BC`` trainer over the whole dataset (batch size capped at the
+    dataset size) and one ``_inner_train`` call at round 0, so held-out
+    early stopping splits exactly as in ``_run_bc``.
+
+    Returns:
+        The trainer (holding the fitted policy) and the inner-training log.
+    """
+    custom_logger = imit_logger.configure(
+        str(config.output_dir / "tb" / tb_tag),
+        format_strs=[],
+    )
+    bc_trainer = bc.BC(
+        observation_space=venv.observation_space,
+        action_space=venv.action_space,
+        rng=rng,
+        policy=policy,
+        demonstrations=transitions,
+        batch_size=min(config.bc_batch_size, len(transitions)),
+        optimizer_kwargs={"lr": config.learning_rate},
+        custom_logger=custom_logger,
+        device=device,
+    )
+    inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
+    return bc_trainer, inner_log
+
+
 def _run_bc(
     config: ExperimentConfig,
     venv,
@@ -1320,22 +1437,15 @@ def _run_bc(
         shutil.rmtree(bc_scratch)
     _save_transitions_as_demos(all_transitions, bc_scratch, 0, rng)
 
-    custom_logger = imit_logger.configure(
-        str(config.output_dir / "tb" / f"bc_{config.env_name}_{config.seed}"),
-        format_strs=[],
-    )
-    bc_trainer = bc.BC(
-        observation_space=venv.observation_space,
-        action_space=venv.action_space,
-        rng=rng,
-        policy=policy,
-        demonstrations=all_transitions,
-        batch_size=min(config.bc_batch_size, len(all_transitions)),
-        optimizer_kwargs={"lr": config.learning_rate},
-        custom_logger=custom_logger,
+    bc_trainer, inner_log = _fit_fixed_bc(
+        config,
+        venv,
+        policy,
+        all_transitions,
+        rng,
         device=device,
+        tb_tag=f"bc_{config.env_name}_{config.seed}",
     )
-    inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
 
     eval_data = _compute_round_eval(
         bc_trainer.policy,
