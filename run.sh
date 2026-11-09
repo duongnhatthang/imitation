@@ -33,7 +33,7 @@ case "${1:-status}" in
     fi
     ;;
 esac
-RUN_ID="${RUN_ID:-20260916-bc-baselines-v1}"
+RUN_ID="${RUN_ID:-20261109-bc-baselines-eval50-v1}"
 REMOTE_REPO="${REMOTE_REPO:-imitation}"          # relative to remote $HOME
 ATARI_ROUNDS="${ATARI_ROUNDS:-200}"
 CLASSICAL_ROUNDS="${CLASSICAL_ROUNDS:-1000}"

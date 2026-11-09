@@ -54,6 +54,44 @@ ROUND_LOOP_ALGOS = INTERACTIVE_ALGOS + OFFLINE_BC_ALGOS
 # keeps a fresh expert_cache reproducible; an existing cache is unaffected.
 EXPERT_TRAINING_SEED = 0
 
+# Learning-curve evaluation for classical and Atari runs: a round-loop run
+# evaluates its policy at round 0, at every multiple of
+# `EVAL_INTERVAL` rounds and at its final round (`eval_rounds`), each time
+# with `EVAL_EPISODES` deterministic episodes. A run may request more
+# episodes at its final budget only (``final_eval_episodes``), which gates
+# that read only final rows (mask calibration) still need. Expert
+# qualification and normalization baselines are separate procedures with
+# their own episode counts and are not affected.
+EVAL_PROTOCOL = "eval-every-50-rounds-1-episode/1"
+EVAL_INTERVAL = 50
+EVAL_EPISODES = 1
+
+# BC fit rule shared by fixed BC and each round of FTL/FTRL/BC-iid/DAgger. `FIT_RULE_PLATEAU` trains on all retained labels (no
+# held-out split) until the exact training NLL stops improving: after at
+# least `FIT_MIN_EPOCHS` epochs, stop when it fell by at most
+# `FIT_PLATEAU_REL_TOL_RULE` (relative) over the last
+# `FIT_PLATEAU_WINDOW_EPOCHS` epochs, or reached `FIT_NLL_FLOOR_RULE`;
+# `FIT_MAX_EPOCHS` and `FIT_MAX_STEPS` (gradient
+# steps) are safety caps whose use is flagged in the record. `FIT_RULE_EPOCHS`
+# is the earlier rule (``bc_n_epochs`` cap with the held-out early stop).
+# Adam learning rate of every BC fit under `FIT_RULE_PLATEAU` (raised from
+# 1e-3 so fits reach the plateau within the caps; user decision 2026-10-16).
+BC_LEARNING_RATE = 1e-2
+FIT_RULE_PLATEAU = "train-loss-plateau/1"
+FIT_RULE_EPOCHS = "epoch-cap/1"
+FIT_MIN_EPOCHS = 10
+FIT_PLATEAU_WINDOW_EPOCHS = 10
+# The plateau window also spans at least this many gradient steps, so small
+# datasets (one step per epoch) are not judged on a handful of steps.
+FIT_PLATEAU_MIN_WINDOW_STEPS = 100
+FIT_PLATEAU_REL_TOL_RULE = 0.01
+# Early exit once the mean expert-label NLL is small (geometric mean
+# expert-action probability about 0.95).
+FIT_NLL_FLOOR_RULE = 0.05
+# Safety caps; for small datasets (one step per epoch) the step cap binds.
+FIT_MAX_EPOCHS = 20000
+FIT_MAX_STEPS = 20000
+
 
 def _seed_everything(seed: int) -> None:
     """Seed every global RNG a cell can reach.
@@ -71,11 +109,11 @@ def _seed_everything(seed: int) -> None:
 
 
 def _config_metadata(config):
-    """Record every experiment setting and the actual uncommitted source version."""
+    """Record experiment settings and the actual runner source version."""
     settings = dataclasses.asdict(config)
     for key in ("output_dir", "expert_cache_dir"):
         settings[key] = str(settings[key])
-    settings["protocol_version"] = 4
+    settings["protocol_version"] = 5
     digest = hashlib.sha256()
     for name in (
         "run_experiment.py",
@@ -159,7 +197,7 @@ class ExperimentConfig:
     eval_interval: int
     output_dir: pathlib.Path
     expert_cache_dir: pathlib.Path
-    learning_rate: float = 1e-3
+    learning_rate: float = BC_LEARNING_RATE
     result_name_override: Optional[str] = None
     # --- Outer-loop early stop: cross-round disagreement_rate plateau ---
     outer_early_stop: bool = True
@@ -185,8 +223,32 @@ class ExperimentConfig:
         1  # minimum complete rollouts, independent of training batches
     )
     bc_batch_size: int = 32  # cap; effective per-call is min(this, dataset_size)
+    # `EVAL_PROTOCOL`: episodes of every evaluation, and optionally of the
+    # final-budget evaluation only.
+    eval_episodes: int = EVAL_EPISODES
+    final_eval_episodes: Optional[int] = None
+    # BC fit rule (`FIT_RULE_PLATEAU` by default) and its parameters.
+    fit_rule: str = FIT_RULE_PLATEAU
+    fit_min_epochs: int = FIT_MIN_EPOCHS
+    fit_plateau_window: int = FIT_PLATEAU_WINDOW_EPOCHS
+    fit_plateau_min_window_steps: int = FIT_PLATEAU_MIN_WINDOW_STEPS
+    fit_plateau_rel_tol: float = FIT_PLATEAU_REL_TOL_RULE
+    fit_nll_floor: float = FIT_NLL_FLOOR_RULE
+    fit_max_epochs: int = FIT_MAX_EPOCHS
+    fit_max_steps: int = FIT_MAX_STEPS
 
     def __post_init__(self) -> None:
+        if int(self.eval_episodes) < 1:
+            raise ValueError("eval_episodes must be positive")
+        if self.final_eval_episodes is not None and int(self.final_eval_episodes) < 1:
+            raise ValueError("final_eval_episodes must be positive")
+        if int(self.eval_interval) < 1:
+            raise ValueError("eval_interval must be positive")
+        if self.fit_rule not in (FIT_RULE_PLATEAU, FIT_RULE_EPOCHS):
+            raise ValueError(f"unknown fit_rule {self.fit_rule!r}")
+        if min(int(self.fit_min_epochs), int(self.fit_plateau_window),
+               int(self.fit_max_epochs), int(self.fit_max_steps)) < 1:
+            raise ValueError("fit epochs, window and caps must be positive")
         if self.subsample_strategy is None:
             self.subsample_strategy = (
                 "prefix" if self.algo in ("bc", "bc_prefix") else "uniform"
@@ -215,8 +277,12 @@ def _compute_round_eval(
     expert_policy,
     venv,
     baselines: Dict[str, float],
+    *,
+    n_episodes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Roll out the current policy, evaluate all metrics on that rollout only.
+
+    ``n_episodes`` deterministic episodes (default `EVAL_EPISODES`).
 
     Returns a dict with ``rollout_cross_entropy``,
     ``expert_rollout_cross_entropy``, ``normalized_return``,
@@ -230,7 +296,7 @@ def _compute_round_eval(
     eval_res = eval_policy_rollout(
         policy,
         venv,
-        n_episodes=100,
+        n_episodes=EVAL_EPISODES if n_episodes is None else int(n_episodes),
         deterministic=True,
         expert_policy=expert_policy,
     )
@@ -255,7 +321,336 @@ def _compute_round_eval(
         "disagreement_rate": round(float(eval_res.current_round_disagreement), 6),
         "d_eval_size": int(obs.shape[0]),
         "episode_returns": [float(value) for value in eval_res.episode_returns],
+        "evaluation_episodes": len(eval_res.episode_returns),
     }
+
+
+def eval_rounds(n_rounds: int, eval_interval: int = EVAL_INTERVAL) -> List[int]:
+    """Rounds a round-loop run evaluates under `EVAL_PROTOCOL`.
+
+    Round 0 (the untrained policy), every multiple of ``eval_interval`` and the
+    final round.
+    """
+    n_rounds, eval_interval = int(n_rounds), int(eval_interval)
+    if n_rounds < 0 or eval_interval <= 0:
+        raise ValueError("n_rounds must be >= 0 and eval_interval positive")
+    points = {0, n_rounds}
+    points.update(range(eval_interval, n_rounds + 1, eval_interval))
+    return sorted(points)
+
+
+def _eval_episodes(config, *, final: bool) -> int:
+    """Episodes of one evaluation of ``config``'s run.
+
+    ``final_eval_episodes``, when set, applies to the final budget only.
+    """
+    final_episodes = getattr(config, "final_eval_episodes", None)
+    if final and final_episodes is not None:
+        return int(final_episodes)
+    return int(getattr(config, "eval_episodes", EVAL_EPISODES))
+
+
+# ---------------------------------------------------------------------------
+# Fit monitoring (`FIT_MONITOR_PROTOCOL`)
+# ---------------------------------------------------------------------------
+#
+# Under the training-loss rule, record expert-label NLL on the retained
+# dataset before training, after every epoch, and for the returned policy.
+# These forward passes use eval mode and no_grad, without sampling actions.
+# fit_cap_without_plateau distinguishes a cap from reaching a stopping target.
+FIT_MONITOR_PROTOCOL = "fit-monitor/1"
+FIT_PLATEAU_WINDOW = 3
+FIT_PLATEAU_REL_TOL = 0.02
+FIT_NLL_FLOOR = 0.01
+
+
+def _transitions_arrays(transitions) -> Tuple[np.ndarray, np.ndarray]:
+    """Observations and actions of a Transitions object or a list of dicts."""
+    if isinstance(transitions, list):
+        if not transitions:
+            return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+        obs = np.stack([np.asarray(t["obs"]) for t in transitions])
+        acts = np.stack([np.asarray(t["acts"]) for t in transitions])
+        return obs, acts
+    return np.asarray(transitions.obs), np.asarray(transitions.acts)
+
+
+def _fit_nll_and_accuracy(
+    policy,
+    obs: np.ndarray,
+    acts: np.ndarray,
+    batch_size: int = 4096,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Mean NLL of ``acts`` and argmax accuracy of ``policy``; no RNG draws."""
+    from imitation.util import util as imit_util
+
+    n = int(len(acts))
+    if n == 0:
+        return None, None
+    was_training = policy.training
+    policy.eval()
+    device = policy.device
+    log_prob_sum = 0.0
+    correct = 0
+    try:
+        with th.no_grad():
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                tensor_obs = types.map_maybe_dict(
+                    lambda x: imit_util.safe_to_tensor(x).to(device),
+                    types.maybe_unwrap_dictobs(obs[start:end]),
+                )
+                tensor_acts = imit_util.safe_to_tensor(acts[start:end]).to(device)
+                _, log_prob, _ = policy.evaluate_actions(tensor_obs, tensor_acts)
+                log_prob_sum += float(log_prob.sum().item())
+                dist = policy.get_distribution(tensor_obs)
+                predicted = dist.get_actions(deterministic=True)
+                correct += int(
+                    (predicted.reshape(-1) == tensor_acts.reshape(-1)).sum().item()
+                )
+    finally:
+        policy.train(was_training)
+    return -log_prob_sum / n, correct / n
+
+
+class _FitMonitor:
+    """Exact training-set loss of one fit, per epoch (`FIT_MONITOR_PROTOCOL`).
+
+    ``data`` is the training data (Transitions or a list of dicts) or a
+    zero-argument callable returning it, resolved at the first measurement
+    (a DAgger round loads its data inside ``extend_and_update``).
+    """
+
+    def __init__(self, policy, data) -> None:
+        self.policy = policy
+        self._data = data
+        self._arrays: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.initial: Optional[float] = None
+        self.epochs: List[float] = []
+
+    def _resolve(self) -> Tuple[np.ndarray, np.ndarray]:
+        if self._arrays is None:
+            data = self._data() if callable(self._data) else self._data
+            self._arrays = _transitions_arrays(data)
+        return self._arrays
+
+    def _measure(self) -> Tuple[Optional[float], Optional[float]]:
+        obs, acts = self._resolve()
+        return _fit_nll_and_accuracy(self.policy, obs, acts)
+
+    def start(self) -> None:
+        """Measure the loss before the first epoch."""
+        self.initial = self._measure()[0]
+
+    def record(self) -> None:
+        """Measure the loss after one epoch (usable as ``on_epoch_end``)."""
+        nll = self._measure()[0]
+        self.epochs.append(float("nan") if nll is None else float(nll))
+
+    def summary(
+        self,
+        max_epochs: int,
+        *,
+        early_stopped: bool,
+        batches_per_epoch: Optional[int],
+        val_trajectory: Optional[List[float]] = None,
+        stop_reason: Optional[str] = None,
+        window: Optional[int] = None,
+        rel_tol: Optional[float] = None,
+        nll_floor: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fields of the fit record; measures the returned policy once more.
+
+        ``stop_reason``, ``window``, ``rel_tol`` and ``nll_floor`` come from
+        the fit rule when it decides the stop itself (`_plateau_fit`).
+        """
+        final_nll, final_acc = self._measure()
+        n_train = int(len(self._resolve()[1]))
+        curve = ([] if self.initial is None else [self.initial]) + list(self.epochs)
+        window = FIT_PLATEAU_WINDOW if window is None else int(window)
+        rel_tol = FIT_PLATEAU_REL_TOL if rel_tol is None else float(rel_tol)
+        nll_floor = FIT_NLL_FLOOR if nll_floor is None else float(nll_floor)
+        rel_drop: Optional[float] = None
+        if len(curve) > window:
+            before, last = curve[-1 - window], curve[-1]
+            if math.isfinite(before) and math.isfinite(last):
+                rel_drop = (before - last) / max(abs(before), 1e-12)
+        at_floor = final_nll is not None and final_nll <= nll_floor
+        plateau = bool(at_floor or (rel_drop is not None and rel_drop <= rel_tol))
+        epochs_run = len(self.epochs)
+        best_val_epoch = None
+        val_improving_at_cap = None
+        finite_val = [
+            (i, v) for i, v in enumerate(val_trajectory or []) if math.isfinite(v)
+        ]
+        if finite_val:
+            best_val_epoch = min(finite_val, key=lambda iv: iv[1])[0] + 1
+            val_improving_at_cap = bool(
+                not early_stopped and best_val_epoch >= int(max_epochs) - 1
+            )
+        fields = {
+            "fit_monitor": FIT_MONITOR_PROTOCOL,
+            "fit_train_examples": n_train,
+            "fit_train_nll_initial": (
+                None if self.initial is None else round(float(self.initial), 6)
+            ),
+            "fit_train_nll_curve": _compact_curve(self.epochs),
+            "fit_train_nll_final": (
+                None if final_nll is None else round(float(final_nll), 6)
+            ),
+            "fit_train_accuracy_final": (
+                None if final_acc is None else round(float(final_acc), 6)
+            ),
+            "fit_epochs_run": epochs_run,
+            "fit_epoch_cap": int(max_epochs),
+            "fit_gradient_steps": (
+                None
+                if batches_per_epoch is None
+                else int(epochs_run) * int(batches_per_epoch)
+            ),
+            "fit_stop_reason": (
+                stop_reason
+                if stop_reason is not None
+                else ("val_early_stop" if early_stopped else "epoch_cap")
+            ),
+            "fit_train_rel_drop_last_window": (
+                None if rel_drop is None else round(float(rel_drop), 6)
+            ),
+            "fit_train_plateau": plateau,
+            "fit_cap_without_plateau": bool(
+                (not early_stopped if stop_reason is None
+                 else stop_reason in ("max_epochs", "max_steps"))
+                and not plateau
+            ),
+            "fit_best_val_epoch": best_val_epoch,
+            "fit_val_improving_at_cap": val_improving_at_cap,
+        }
+        if len(self.epochs) <= 64:
+            fields["fit_train_nll_per_epoch"] = [round(float(v), 6) for v in self.epochs]
+        if fields["fit_cap_without_plateau"]:
+            logger.info(
+                "fit hit its %d-epoch cap without a training-loss plateau: "
+                "%d examples, %s gradient steps, train NLL %s -> %s "
+                "(last-%d-epoch relative drop %s), train accuracy %s",
+                int(max_epochs),
+                n_train,
+                fields["fit_gradient_steps"],
+                fields["fit_train_nll_initial"],
+                fields["fit_train_nll_final"],
+                window,
+                fields["fit_train_rel_drop_last_window"],
+                fields["fit_train_accuracy_final"],
+            )
+        return fields
+
+
+def _compact_curve(values: List[float], max_points: int = 64) -> List[List[float]]:
+    """[[epoch, nll], ...]: every epoch up to ``max_points``, else a geometric
+    subsample of epochs that always keeps the first and the last."""
+    n = len(values)
+    if n == 0:
+        return []
+    if n <= max_points:
+        keep = list(range(n))
+    else:
+        keep = sorted(
+            {int(round(x)) - 1 for x in np.geomspace(1, n, max_points)} | {0, n - 1}
+        )
+    return [[i + 1, round(float(values[i]), 6)] for i in keep]
+
+
+class _StopFit(Exception):
+    """Ends a `FIT_RULE_PLATEAU` fit at an epoch boundary."""
+
+
+def _plateau_fit(bc_trainer, config, transitions) -> Dict[str, Any]:
+    """Fit ``bc_trainer.policy`` on all of ``transitions`` under `FIT_RULE_PLATEAU`.
+
+    Leaves the trainer bound to ``transitions`` with its batch sizes restored.
+    The stop is decided on the exact training NLL measured after every epoch
+    by `_FitMonitor` (forward passes only, no random draws).
+    """
+    original = (bc_trainer.batch_size, bc_trainer.minibatch_size)
+    n = len(transitions)
+    if n < bc_trainer.minibatch_size:
+        bc_trainer.batch_size = bc_trainer.minibatch_size = max(1, n)
+    bc_trainer.set_demonstrations(transitions)
+    sizes = _bound_loader_sizes(bc_trainer)
+    per_epoch = sizes.get("train_batches_per_epoch") or 1
+    window = max(
+        int(config.fit_plateau_window),
+        -(-int(getattr(config, "fit_plateau_min_window_steps", 0)) // per_epoch),
+    )
+    tol = float(config.fit_plateau_rel_tol)
+    floor = float(config.fit_nll_floor)
+    monitor = _FitMonitor(bc_trainer.policy, transitions)
+    monitor.start()
+    state = {"reason": "max_epochs"}
+    min_epochs = max(int(config.fit_min_epochs), window + 1)
+
+    def on_epoch_end() -> None:
+        # Called by BC.train after the last optimizer step of each epoch;
+        # raising here ends training exactly at that epoch boundary.
+        monitor.record()
+        epoch, last = len(monitor.epochs), monitor.epochs[-1]
+        if math.isfinite(last) and last <= floor:
+            state["reason"] = "nll_floor"
+            raise _StopFit
+        if epoch >= min_epochs:
+            before = monitor.epochs[-1 - window]
+            if math.isfinite(before) and (before - last) <= tol * max(abs(before), 1e-12):
+                state["reason"] = "train_plateau"
+                raise _StopFit
+        if epoch * per_epoch >= int(config.fit_max_steps):
+            state["reason"] = "max_steps"
+            raise _StopFit
+
+    try:
+        bc_trainer.train(
+            n_epochs=int(config.fit_max_epochs),
+            progress_bar=False,
+            on_epoch_end=on_epoch_end,
+            log_interval=10**12,
+        )
+    except _StopFit:
+        pass
+    stop_reason = state["reason"]
+    summary = monitor.summary(
+        int(config.fit_max_epochs),
+        early_stopped=stop_reason in ("train_plateau", "nll_floor"),
+        batches_per_epoch=per_epoch,
+        stop_reason=stop_reason,
+        window=window,
+        rel_tol=tol,
+        nll_floor=floor,
+    )
+    bc_trainer.batch_size, bc_trainer.minibatch_size = original
+    bc_trainer.set_demonstrations(transitions)
+    return {
+        "inner_es_stop_epoch": len(monitor.epochs),
+        "inner_es_val_nll_best": None,
+        "inner_es_val_nll_trajectory": [],
+        "inner_es_fallback": None,
+        "fit_rule": FIT_RULE_PLATEAU,
+        **sizes,
+        **summary,
+    }
+
+
+def _plateau_inner_train(trainer_or_bc, config, is_dagger: bool) -> Dict[str, Any]:
+    """One `FIT_RULE_PLATEAU` round fit (non-paired runs)."""
+    if is_dagger:
+        current_round = trainer_or_bc.extend_only()
+        bc_trainer = trainer_or_bc.bc_trainer
+        transitions = rollout.flatten_trajectories(trainer_or_bc._all_demos)
+    else:
+        current_round = None
+        bc_trainer = trainer_or_bc
+        transitions = bc_trainer._demo_data_loader.dataset
+    log = _plateau_fit(bc_trainer, config, transitions)
+    if current_round is not None:
+        trainer_or_bc.track_round_loss(current_round)
+    return log
 
 
 def _compute_val_nll(
@@ -310,6 +705,31 @@ def _split_transitions_for_val(
     return train_idx, val_idx
 
 
+def _bound_loader_sizes(bc_trainer) -> Dict[str, Any]:
+    """Describe the data loader ``bc_trainer`` trains on right now.
+
+    Reads the torch ``DataLoader`` actually bound (unwrapping imitation's
+    batch-size checking wrapper, which rejects any batch of another size), so
+    with ``drop_last`` every training minibatch has exactly this batch size.
+    Any other loader type is reported as unknown (None) rather than guessed.
+    """
+    loader = bc_trainer._demo_data_loader
+    loader = getattr(loader, "data_loader", loader)
+    if not isinstance(loader, th.utils.data.DataLoader):
+        return {
+            "train_batch_size": None,
+            "train_examples": None,
+            "train_batches_per_epoch": None,
+            "train_drop_last": None,
+        }
+    return {
+        "train_batch_size": int(loader.batch_size),
+        "train_examples": len(loader.dataset),
+        "train_batches_per_epoch": len(loader),
+        "train_drop_last": bool(loader.drop_last),
+    }
+
+
 def _inner_train(
     trainer_or_bc,
     config: "ExperimentConfig",
@@ -341,6 +761,8 @@ def _inner_train(
         ``inner_es_val_nll_trajectory`` (list[float]), ``inner_es_fallback``
         (str | None).
     """
+    if config.fit_rule == FIT_RULE_PLATEAU:
+        return _plateau_inner_train(trainer_or_bc, config, is_dagger)
     max_epochs = int(config.bc_n_epochs)
 
     if not config.inner_early_stop:
@@ -1003,6 +1425,7 @@ def _run_dagger_variant(
         expert_policy,
         venv,
         baselines,
+        n_episodes=_eval_episodes(config, final=config.n_rounds == 0),
     )
     round0_eval["checkpoint"] = _save_policy(config, policy, 0)
     disagreement_history.append(round0_eval["disagreement_rate"])
@@ -1037,6 +1460,7 @@ def _run_dagger_variant(
     cum_obs = 0
     collection_steps = 0
     stopped_early = False
+    evaluated_rounds = set(eval_rounds(config.n_rounds, config.eval_interval))
     for round_num in range(1, config.n_rounds + 1):
         if offline_data is not None:
             # --- Replay this round's slice of the fixed offline dataset ---
@@ -1078,10 +1502,10 @@ def _run_dagger_variant(
         cum_obs += config.samples_per_round
 
         # --- Evaluate the policy at the reported training budget ---
-        is_first = round_num == 1
-        is_interval = round_num % config.eval_interval == 0
+        # `EVAL_PROTOCOL`: every `eval_interval` rounds and the final round
+        # (round 0 was evaluated above), as `eval_rounds` lists them.
         is_final = round_num == config.n_rounds
-        should_eval = is_first or is_interval or is_final
+        should_eval = round_num in evaluated_rounds
 
         eval_data: Optional[Dict[str, Any]] = None
         if should_eval:
@@ -1090,8 +1514,21 @@ def _run_dagger_variant(
                 expert_policy,
                 venv,
                 baselines,
+                n_episodes=_eval_episodes(config, final=is_final),
             )
             disagreement_history.append(eval_data["disagreement_rate"])
+            logger.info(
+                "%s/%s/seed%s round %d: %d labels, %d-episode eval, "
+                "normalized return %s; fit: %s epochs (%s), train NLL %s, "
+                "train accuracy %s, plateau %s",
+                config.algo, config.env_name, config.seed, round_num,
+                cum_obs, len(eval_data.get("episode_returns") or []),
+                eval_data.get("normalized_return"),
+                inner_log.get("fit_epochs_run"), inner_log.get("fit_stop_reason"),
+                inner_log.get("fit_train_nll_final"),
+                inner_log.get("fit_train_accuracy_final"),
+                inner_log.get("fit_train_plateau"),
+            )
 
             if config.outer_early_stop and _should_outer_early_stop(
                 disagreement_history,
@@ -1304,6 +1741,7 @@ def _run_bc(
         expert_policy,
         venv,
         baselines,
+        n_episodes=_eval_episodes(config, final=True),
     )
 
     eval_data["checkpoint"] = _save_policy(config, bc_trainer.policy, config.n_rounds)
@@ -1443,6 +1881,9 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         beta_rampdown=args.beta_rampdown,
                         bc_n_epochs=args.bc_n_epochs,
                         eval_interval=args.eval_interval,
+                        eval_episodes=getattr(args, "eval_episodes", EVAL_EPISODES),
+                        final_eval_episodes=getattr(args, "final_eval_episodes", None),
+                        fit_rule=getattr(args, "fit_rule", FIT_RULE_PLATEAU),
                         output_dir=pathlib.Path(args.output_dir),
                         expert_cache_dir=pathlib.Path(args.expert_cache_dir),
                         learning_rate=args.learning_rate,
@@ -1541,13 +1982,13 @@ def main():
         dest="inner_early_stop",
         action="store_true",
         default=True,
-        help="Enable val-split early stopping inside BC train (default: True).",
+        help="Enable validation-based stopping under the legacy epoch-cap fit rule.",
     )
     parser.add_argument(
         "--no-inner-early-stop",
         dest="inner_early_stop",
         action="store_false",
-        help="Disable inner-loop early stopping (use full bc_n_epochs).",
+        help="Disable validation-based stopping under the legacy epoch-cap fit rule.",
     )
     parser.add_argument(
         "--inner-early-stop-patience",
@@ -1618,14 +2059,32 @@ def main():
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-3,
-        help="Learning rate for BC optimizer (default: 1e-3)",
+        default=BC_LEARNING_RATE,
+        help=f"Learning rate for BC optimizer (default: {BC_LEARNING_RATE})",
     )
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=2,
-        help="Evaluate learner every N rounds (also first and last)",
+        default=EVAL_INTERVAL,
+        help=f"Evaluate every N rounds, plus round 0 and the last (default {EVAL_INTERVAL})",
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=EVAL_EPISODES,
+        help=f"Deterministic episodes per evaluation (default {EVAL_EPISODES})",
+    )
+    parser.add_argument(
+        "--fit-rule",
+        choices=[FIT_RULE_PLATEAU, FIT_RULE_EPOCHS],
+        default=FIT_RULE_PLATEAU,
+        help="BC fit rule (default: train until the training loss plateaus)",
+    )
+    parser.add_argument(
+        "--final-eval-episodes",
+        type=int,
+        default=None,
+        help="Episodes of the final-budget evaluation only (default: --eval-episodes)",
     )
     parser.add_argument(
         "--output-dir",

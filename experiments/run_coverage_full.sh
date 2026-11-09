@@ -67,9 +67,9 @@ python -m imitation.experiments.ftrl.run_experiment \
     --seeds "$SEEDS" \
     --samples-per-round 1 \
     --n-rounds "$N_ROUNDS" \
-    --eval-interval 10 \
+    --eval-interval 50 \
     --output-dir "$RESULTS_DIR" \
-    --inner-early-stop \
+    --fit-rule train-loss-plateau/1 \
     --no-outer-early-stop \
     --n-workers "$WORKERS" \
     --n-gpus "$N_GPUS" \

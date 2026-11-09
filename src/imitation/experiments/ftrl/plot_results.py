@@ -106,7 +106,7 @@ LOSS_SUBTITLE_LINES = [
         r"$a^*(s)=\arg\max_a \pi^*(a|s).$"
     ),
     (
-        r"$D_{\mathrm{eval}}^t$: 100-episode rollout of the current "
+        r"$D_{\mathrm{eval}}^t$: deterministic rollout (per run config) of the current "
         r"learner $\pi^t$ (labeled with expert argmax). Not aggregated."
     ),
     (

@@ -151,10 +151,10 @@ python -m imitation.experiments.ftrl.run_experiment \
     --seeds 5 \
     --samples-per-round 1 \
     --n-rounds "$N_ROUNDS" \
-    --eval-interval 5 \
+    --eval-interval 50 \
     --output-dir "$RESULTS_DIR" \
     --expert-cache-dir "$EXP_EXPERT_CACHE" \
-    --inner-early-stop \
+    --fit-rule train-loss-plateau/1 \
     --no-outer-early-stop \
     --n-workers "$WORKERS" \
     --n-gpus "$N_GPUS" \

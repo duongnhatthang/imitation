@@ -133,6 +133,8 @@ def _make_config(algo, tmp_path, **overrides):
         expert_cache_dir=tmp_path / "experts",
         inner_early_stop=False,
         outer_early_stop=False,
+        # Most tests here pin the earlier epoch-cap fit rule's mechanics.
+        fit_rule="epoch-cap/1",
     )
     defaults.update(overrides)
     return ExperimentConfig(**defaults)

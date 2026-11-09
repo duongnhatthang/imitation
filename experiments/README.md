@@ -169,6 +169,23 @@ Analyze imitation learning experiments using `python -m imitation.scripts.analyz
 
 View Stable Baselines training stats on TensorBoard (available for regular RL, imitation learning, and transfer learning) using `tensorboard --log_dir ~/ray_results`. To view only a subset of TensorBoard training progress use `imitation.scripts.analyze gather_tb_directories with source_dir=~/ray_results run_name=RUN_NAME`.
 
+## Learner evaluation and fitting
+
+The classical and Atari campaign launchers evaluate the learner at round 0,
+every 50 rounds, and the final round, using one deterministic-policy episode
+per point. Fixed offline BC is fitted and evaluated once. Use
+`--eval-episodes` to change the learner evaluation sample count, or
+`--final-eval-episodes` to increase only the final count. A single episode is
+noisy in stochastic environments such as Blackjack. These settings do not
+change expert qualification or normalization baselines.
+
+The default `--fit-rule train-loss-plateau/1` uses all retained training
+labels with no validation split. A fit ends when training loss plateaus,
+reaches its loss target, or hits a cap. The campaign disables stopping the
+whole run on an evaluation plateau. Under the legacy `--fit-rule epoch-cap/1`,
+`--no-inner-early-stop` selects fixed epochs on the full dataset. Use a fresh
+run ID when comparing protocols so older outputs remain intact.
+
 ## Required publication for new studies
 
 Follow the experiment storage and result publication rules in `../AGENTS.md`. Raw experiment artifacts and numerical analysis stay on the execution server. Only figures are mirrored into the main checkout at `experiments/plots/<run-id>/{classical,atari}/{learning_curves,coverage,runtime}`. This applies equally to worktree launches, new baselines, pilots, and diagnostics. A run is not delivered until its expected labeled figures appear there. Preserve per-seed t-SNE arrival heatmaps and separate overlap maps.

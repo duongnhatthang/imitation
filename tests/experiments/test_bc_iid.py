@@ -86,6 +86,8 @@ def tiny_experiment(tmp_path, monkeypatch):
         learning_rate=0.0,
         outer_early_stop=False,
         inner_early_stop=False,
+        # These tests pin the per-round fit mechanics of the earlier rule.
+        fit_rule="epoch-cap/1",
     )
 
 
@@ -128,7 +130,7 @@ def test_bc_iid_uses_only_expert_rollouts_and_accumulates(
         4 * m,
     ]
     evaluated = [row["round"] for row in result["per_round"] if "checkpoint" in row]
-    assert evaluated == [0, 1, 2, 4]
+    assert evaluated == [0, 2, 4]
     for row in result["per_round"][1:]:
         assert row["trajectories_collected_this_round"] == expected_trajectories
         assert row["collection_steps"] == row["round"] * expected_trajectories * 7

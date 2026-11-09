@@ -118,6 +118,7 @@ def _config(tmp_path, **overrides):
         learning_rate=0.0,
         outer_early_stop=False,
         inner_early_stop=False,
+        fit_rule="epoch-cap/1",
     )
     base.update(overrides)
     return run_experiment.ExperimentConfig(**base)

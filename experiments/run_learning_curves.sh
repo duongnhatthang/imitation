@@ -66,10 +66,10 @@ python -m imitation.experiments.ftrl.run_experiment \
     --samples-per-round 1 \
     --n-rounds 1000 \
     --bc-n-epochs 20 \
-    --eval-interval 10 \
+    --eval-interval 50 \
     --output-dir "$RESULTS_DIR" \
     --expert-cache-dir "$EXP_EXPERT_CACHE" \
-    --inner-early-stop \
+    --fit-rule train-loss-plateau/1 \
     --no-outer-early-stop \
     --n-workers "$WORKERS" \
     --n-gpus 0 \

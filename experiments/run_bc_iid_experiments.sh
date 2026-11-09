@@ -45,6 +45,9 @@ manifest = {
     'bc_prefix_sampling': 'prefix',
     'bc_pool_sampling': 'uniform',
     'outer_early_stop': False,
+    'fit_rule': 'train-loss-plateau/1',
+    'eval_interval': 50,
+    'eval_episodes': 1,
 }
 (root / 'manifest.json').write_text(json.dumps(manifest, indent=2))
 PY
@@ -59,7 +62,7 @@ status smoke
 python -m imitation.experiments.ftrl.run_experiment \
     --envs CartPole-v1 --algos $ALGOS --seeds 1 \
     --samples-per-round 1 --traj-per-round 1 --n-rounds 3 \
-    --bc-n-epochs 1 --eval-interval 1 --policy-mode linear \
+    --fit-rule epoch-cap/1 --bc-n-epochs 1 --eval-interval 1 --policy-mode linear \
     --no-inner-early-stop --no-outer-early-stop --n-workers 2 --n-gpus 0 \
     --expert-cache-dir "$EXP_EXPERT_CACHE" --output-dir "$EXP_SMOKE_DIR" \
     > "$EXP_LOG_DIR/smoke.log" 2>&1

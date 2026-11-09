@@ -16,7 +16,7 @@ Set `HOST` to your SSH alias in the environment or in the ignored
 `experiments/.local/run-host.conf` shell file. That file may also set `GPUS`;
 command-line environment values override both settings.
 
-Defaults: `RUN_ID=20260916-bc-baselines-v1`,
+Defaults: `RUN_ID=20261109-bc-baselines-eval50-v1`,
 `CONDA_ENV=imitation`, atari 200 rounds, classical 1000 rounds, and
 `ALGOS="ftl ftrl bc bc_iid bc_prefix bc_pool"`. Override on the command line,
 e.g. `RUN_ID=20260920-bc-iid-v3 ./run.sh start`.
