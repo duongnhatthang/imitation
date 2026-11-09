@@ -23,15 +23,17 @@ TSNE_SEEDS="${TSNE_SEEDS:-0 1 2}"
 EXPERT_CACHE="${EXPERT_CACHE:-${EXP_EXPERT_CACHE:-experiments/expert_cache}}"
 mkdir -p "$COV_DIR" "$CACHE_DIR" "$RUNTIME_DIR"
 for env in "$@"; do
+  ENV_COV_DIR="$COV_DIR/${env//\//_}"
+  mkdir -p "$ENV_COV_DIR"
   for seed in $DATASET_SEEDS; do
     echo "[gen_coverage_viz] $env dataset seed $seed"
     python -m imitation.experiments.ftrl.plot_tsne_coverage \
-        --results-dir "$RESULTS_DIR" --env "$env" --seed "$seed" --output-dir "$COV_DIR" \
+        --results-dir "$RESULTS_DIR" --env "$env" --seed "$seed" --output-dir "$ENV_COV_DIR" \
         --tsne-seed $TSNE_SEEDS --expert-cache "$EXPERT_CACHE"
     if [ "${RUN_RECOVERABILITY:-0}" = "1" ]; then
       python -m imitation.experiments.ftrl.plot_recoverability \
           --results-dir "$RESULTS_DIR" --env "$env" --seed "$seed" \
-          --cache-dir "$CACHE_DIR" --output-dir "$COV_DIR/recoverability_seed$seed" \
+          --cache-dir "$CACHE_DIR" --output-dir "$ENV_COV_DIR/recoverability_seed$seed" \
           --expert-cache "$EXPERT_CACHE"
     fi
   done

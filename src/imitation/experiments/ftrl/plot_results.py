@@ -36,6 +36,8 @@ ALGO_COLORS: Dict[str, str] = {
     "ftl": "#1f77b4",  # blue
     "ftrl": "#d62728",  # red
     "bc_iid": "#2ca02c",  # green
+    "bc_pool": "#9467bd",  # purple (fixed pool, uniform draws)
+    "bc_prefix": "#8c564b",  # brown (fixed pool, chronological)
     "bc": "#17a663",  # dark green (dashed reference)
     "expert": "#555555",  # gray (dashed reference)
 }
@@ -44,6 +46,8 @@ ALGO_LABELS: Dict[str, str] = {
     "ftl": "FTL+DAgger",
     "ftrl": "FTRL+DAgger",
     "bc_iid": "BC-iid",
+    "bc_pool": "BC-pool",
+    "bc_prefix": "BC-prefix",
     "bc": "BC (fixed)",
     "expert": "Expert",
 }
@@ -52,11 +56,13 @@ ALGO_LINESTYLES: Dict[str, str] = {
     "ftl": "-",
     "ftrl": "-",
     "bc_iid": "-",
+    "bc_pool": "-",
+    "bc_prefix": "-",
     "bc": "--",
     "expert": "--",
 }
 
-LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_iid", "bc"}
+LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_iid", "bc_pool", "bc_prefix", "bc"}
 
 
 def _draw_bc_hlines(
@@ -597,7 +603,7 @@ def plot_env(
         "Disagreement Rate",
         log_scale=True,
         y_clip_floor=1e-3,
-        allowed_algos={"ftl", "ftrl", "bc_iid", "bc"},
+        allowed_algos={"ftl", "ftrl", "bc_iid", "bc_pool", "bc_prefix", "bc"},
         band=band,
     )
 

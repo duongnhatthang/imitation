@@ -83,7 +83,7 @@ class TestEnvGroups:
 
     def test_atari_zoo_group(self):
         assert "PongNoFrameskip-v4" in ENV_GROUPS["atari-zoo"]
-        assert len(ENV_GROUPS["atari-zoo"]) == 8
+        assert len(ENV_GROUPS["atari-zoo"]) == 7
 
     def test_atari_all_is_union(self):
         expected = (

@@ -41,6 +41,27 @@ Its `push` command transfers Git-tracked code instead of recursively sending
 local result trees. Historical plots use run folders named `legacy-*`.
 Raw archives stay on the execution machine.
 
+The review layout has one current `learning_curves/` directory and one
+`coverage/<environment>/` directory per task. Preserve the per-seed arrival
+heatmap and separate overlap map. Put excluded probes in `diagnostics/` and
+superseded renders or older pilots in the run's `archive/`. Names such as
+`concise-*` and `reviewed-*` are internal rendering revisions, not current
+review folders. New scientific protocols use a separate run ID.
+
+`experiments/publish_plot_view.py` exports a stable view after rendering. An
+optional private `experiments/.local/plot-layouts/<run-id>.json` explicitly
+routes approved revision directories to current paths and other revisions to
+`archive/`. With no policy, native output paths are preserved and flat coverage
+images are grouped by environment. `--refresh` stages a complete replacement,
+keeps previous active figure bytes in the archive, refuses changed bytes at
+immutable archive paths, and excludes numerical artifacts. Concurrent refreshes
+of the same view are refused. The sync wrapper exports this view on the execution
+machine, downloads only images/PDFs to temporary staging, then refreshes the
+main checkout's public plot mirror. Repeated pulls preserve local-only archives
+and Markdown review indexes without recreating renderer revision folders.
+Install the helper and any private policy through the existing wrapper's
+`push-selected` before pulling from a newly configured execution tree.
+
 Budget overrides: `CLASSICAL_ROUNDS`, `ATARI_ROUNDS`, `SEEDS`,
 `SAMPLES_PER_ROUND`, and `TRAJECTORIES_PER_ROUND`. Worker overrides:
 `CLASSICAL_WORKERS` and `ATARI_WORKERS`. Coverage follows the training seed
@@ -147,3 +168,7 @@ Run your hyperparameter tuning experiment using `python -m imitation.scripts.par
 Analyze imitation learning experiments using `python -m imitation.scripts.analyze with run_name=RUN_NAME source_dir=~/ray_results`.
 
 View Stable Baselines training stats on TensorBoard (available for regular RL, imitation learning, and transfer learning) using `tensorboard --log_dir ~/ray_results`. To view only a subset of TensorBoard training progress use `imitation.scripts.analyze gather_tb_directories with source_dir=~/ray_results run_name=RUN_NAME`.
+
+## Required publication for new studies
+
+Follow the experiment storage and result publication rules in `../AGENTS.md`. Raw experiment artifacts and numerical analysis stay on the execution server. Only figures are mirrored into the main checkout at `experiments/plots/<run-id>/{classical,atari}/{learning_curves,coverage,runtime}`. This applies equally to worktree launches, new baselines, pilots, and diagnostics. A run is not delivered until its expected labeled figures appear there. Preserve per-seed t-SNE arrival heatmaps and separate overlap maps.

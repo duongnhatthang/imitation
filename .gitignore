@@ -186,3 +186,8 @@ experiments/.local/
 experiments/l2_sweep/
 experiments/env_profile/
 experiments/coverage/
+
+# local run monitoring (run.sh)
+runstate/
+results_*/
+_archive_*/

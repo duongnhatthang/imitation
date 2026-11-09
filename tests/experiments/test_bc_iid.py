@@ -90,7 +90,7 @@ def tiny_experiment(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "trajectories,m,expected_trajectories", [(1, 1, 1), (3, 5, 3), (1, 20, 3)]
+    "trajectories,m,expected_trajectories", [(1, 1, 1), (3, 5, 5), (1, 20, 20)]
 )
 @pytest.mark.parametrize("early_stop", [False, True])
 def test_bc_iid_uses_only_expert_rollouts_and_accumulates(
@@ -239,6 +239,8 @@ def test_cli_defaults_and_trajectory_option(tiny_experiment, monkeypatch):
         "ftrl": "uniform",
         "bc": "prefix",
         "bc_iid": "uniform",
+        "bc_prefix": "prefix",
+        "bc_pool": "uniform",
     }
     assert all(c.trajectories_per_round == 3 for c in seen)
 
