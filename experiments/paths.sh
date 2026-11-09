@@ -20,4 +20,4 @@ export EXP_CALIBRATION="${EXP_CALIBRATION:-experiments/calibration/lr_calibratio
 export EXP_EXPERT_CACHE="${EXP_EXPERT_CACHE:-experiments/expert_cache}"
 # The algorithm set a campaign runs. Override with ALGOS="ftl ftrl" for a
 # targeted resume; the curve scripts read ALGOS first and fall back to this.
-export EXP_ALGOS="${EXP_ALGOS:-ftl ftrl bc bc_iid bc_prefix bc_pool}"
+export EXP_ALGOS="${EXP_ALGOS:-ftl ftrl bc bc_iid}"

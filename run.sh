@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One script for the BC-iid campaign on a remote execution host.
+# Launch and monitor a BC-iid campaign on a configured remote host.
 #
 #   ./run.sh status          one status check, prints a summary, saves a snapshot
 #   ./run.sh watch [MIN]     status every MIN minutes (default 10) until Ctrl-C
@@ -17,27 +17,23 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The optional local config is trusted shell code and stays out of Git.
+# Private connection settings belong in this ignored file or the environment.
 configured_host="${HOST-}"
 configured_gpus="${GPUS-}"
-if [ -f "$HERE/experiments/.local/run-host.conf" ]; then
+if [ -f "$HERE/experiments/.local/runner.env" ]; then
+  source "$HERE/experiments/.local/runner.env"
+elif [ -f "$HERE/experiments/.local/run-host.conf" ]; then
   source "$HERE/experiments/.local/run-host.conf"
 fi
 HOST="${configured_host:-${HOST:-}}"
-GPUS="${configured_gpus:-${GPUS:-0}}"
-case "${1:-status}" in
-  status|watch|start|stop|runs|cells)
-    if [ -z "$HOST" ] || [[ "$HOST" == -* ]]; then
-      echo "error: set HOST to a valid SSH alias in the environment or experiments/.local/run-host.conf" >&2
-      exit 2
-    fi
-    ;;
-esac
+RUN_ATARI="${RUN_ATARI:-0}"
 RUN_ID="${RUN_ID:-20261109-bc-baselines-eval50-v1}"
 REMOTE_REPO="${REMOTE_REPO:-imitation}"          # relative to remote $HOME
 ATARI_ROUNDS="${ATARI_ROUNDS:-200}"
 CLASSICAL_ROUNDS="${CLASSICAL_ROUNDS:-1000}"
 CONDA_ENV="${CONDA_ENV:-imitation}"
+# Empty selects every available device; set GPUS to restrict visible indices.
+GPUS="${configured_gpus:-${GPUS:-}}"
 
 # What the runner actually produces: one JSON per (env, algo, seed), written as
 # <data dir>/<env>/<algo>_<policy-mode>_seed<N>.json.
@@ -55,16 +51,24 @@ mkdir -p "$STATE_DIR"
 [ -s "$HISTORY" ] || printf 'epoch\tiso\trun_dir\tstage\tclassical\tatari\tatari_round_dirs\tatari_cells_active\tworkers\tlast_result_age_min\tdisk_avail_gb\tclassical_round_dirs\tclassical_cells_active\tleaders\trun_id\n' > "$HISTORY"
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR "$HOST")
-PROBE_KEYS="manifest_algos manifest_algo_names manifest_seeds manifest_loop_algos run_dir stage classical atari atari_round_dirs atari_cells_active classical_round_dirs classical_cells_active workers leaders python_procs driver last_result_age_min runs_on_disk expert_cache_files disk_avail_gb disk_used_pct cpu_total loadavg gpu tmux log_tail_b64"
+PROBE_KEYS="manifest_run_atari manifest_classical_envs_n manifest_atari_envs_n manifest_algos manifest_algo_names manifest_seeds manifest_loop_algos run_dir stage classical atari atari_round_dirs atari_cells_active classical_round_dirs classical_cells_active workers leaders python_procs driver last_result_age_min runs_on_disk expert_cache_files disk_avail_gb disk_used_pct cpu_total loadavg gpu tmux log_tail_b64"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# SSH joins command arguments before the remote shell parses them. Quote each
+# value so empty settings and lists retain their positional argument boundaries.
+ssh_bash() {
+  local remote_command
+  printf -v remote_command '%q ' bash -s -- "$@"
+  "${SSH[@]}" "$remote_command"
+}
 
 # ---------------------------------------------------------------- probe -----
 # Runs on the server, prints key=value lines, changes nothing.
 probe() {
-  "${SSH[@]}" bash -s -- "$RUN_ID" "$REMOTE_REPO" <<'PROBE'
+  ssh_bash "$RUN_ID" "$REMOTE_REPO" "$CONDA_ENV" <<'PROBE'
 set -u
-RID="$1"; REPO="$2"
+RID="$1"; REPO="$2"; ENVNAME="$3"
 EXP="$HOME/$REPO/experiments"
 ROOT="$EXP/runs/$RID"
 cells() { find "$1" -mindepth 2 -maxdepth 2 -name '*.json' 2>/dev/null | wc -l | tr -d ' '; }
@@ -73,13 +77,24 @@ echo "run_id=$RID"
 # The campaign shape comes from the run's own manifest, so a six-algo run, a
 # narrowed ENVS sweep or a different seed count all report correct totals
 # instead of the four-algo numbers this script used to hardcode.
-python3 - "$ROOT/manifest.json" <<'MANIFEST' 2>/dev/null || echo "manifest_algos="
+(
+for h in "$HOME/miniconda3/etc/profile.d/conda.sh" \
+         "$HOME/anaconda3/etc/profile.d/conda.sh" \
+         "/opt/conda/etc/profile.d/conda.sh"; do
+  [ -f "$h" ] && { . "$h" >/dev/null; break; }
+done
+command -v conda >/dev/null || exit 1
+conda activate "$ENVNAME" >/dev/null || exit 1
+python - "$ROOT/manifest.json" <<'MANIFEST'
 import json, sys
 try:
     m = json.load(open(sys.argv[1]))
 except Exception:
     print("manifest_algos=")
     sys.exit(0)
+print("manifest_run_atari=%d" % bool(m.get("run_atari", True)))
+print("manifest_classical_envs_n=%d" % len(m.get("classical_envs") or range(8)))
+print("manifest_atari_envs_n=%d" % len(m.get("atari_envs") or range(7)))
 algos = m.get("algorithms") or []
 print("manifest_algos=%d" % len(algos))
 print("manifest_algo_names=%s" % ",".join(algos))
@@ -89,6 +104,7 @@ print("manifest_seeds=%s" % (m.get("seeds") or ""))
 loop = [a for a in algos if a in ("ftl", "ftrl", "bc_iid", "bc_prefix", "bc_pool")]
 print("manifest_loop_algos=%d" % len(loop))
 MANIFEST
+) 2>/dev/null || echo "manifest_algos="
 [ -d "$ROOT" ] && echo "run_dir=present" || echo "run_dir=MISSING"
 echo "stage=$(tr -d '\n' < "$ROOT/status.txt" 2>/dev/null)"
 echo "classical=$(cells "$ROOT/data/classical")"
@@ -179,12 +195,16 @@ cmd_status() {
   [ -n "$n_algos" ] || n_algos=4
   [ -n "$n_seeds" ] || n_seeds=5
   [ -n "$n_loop" ] || n_loop=3
-  CLASSICAL_TOTAL=$(( n_algos * ${CLASSICAL_ENVS_N:-8} * n_seeds ))
-  ATARI_TOTAL=$(( n_algos * ${ATARI_ENVS_N:-7} * n_seeds ))
-  CLASSICAL_UNITS=$(( n_loop * ${CLASSICAL_ENVS_N:-8} * n_seeds * CLASSICAL_ROUNDS \
-                      + ( n_algos - n_loop ) * ${CLASSICAL_ENVS_N:-8} * n_seeds ))
-  ATARI_UNITS=$(( n_loop * ${ATARI_ENVS_N:-7} * n_seeds * ATARI_ROUNDS \
-                  + ( n_algos - n_loop ) * ${ATARI_ENVS_N:-7} * n_seeds ))
+  local classical_envs_n atari_envs_n
+  classical_envs_n="${manifest_classical_envs_n:-${CLASSICAL_ENVS_N:-8}}"
+  atari_envs_n="${manifest_atari_envs_n:-${ATARI_ENVS_N:-7}}"
+  if [ "${manifest_run_atari:-$RUN_ATARI}" = 0 ]; then atari_envs_n=0; fi
+  CLASSICAL_TOTAL=$(( n_algos * classical_envs_n * n_seeds ))
+  ATARI_TOTAL=$(( n_algos * atari_envs_n * n_seeds ))
+  CLASSICAL_UNITS=$(( n_loop * classical_envs_n * n_seeds * CLASSICAL_ROUNDS \
+                      + ( n_algos - n_loop ) * classical_envs_n * n_seeds ))
+  ATARI_UNITS=$(( n_loop * atari_envs_n * n_seeds * ATARI_ROUNDS \
+                  + ( n_algos - n_loop ) * atari_envs_n * n_seeds ))
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$epoch" "$iso" "$run_dir" "${stage:-unknown}" "$classical" "$atari" \
@@ -232,7 +252,9 @@ verdict() {
     echo "cannot reach $HOST"
   elif [ "$run_dir" = "MISSING" ]; then
     echo "run directory absent on server; nothing is running"
-  elif [ "$atari" -ge "$ATARI_TOTAL" ]; then
+  elif [ "${stage:-}" = complete ]; then
+    echo "campaign complete -- run ./run.sh pull"
+  elif [ "$ATARI_TOTAL" -gt 0 ] && [ "$atari" -ge "$ATARI_TOTAL" ]; then
     echo "atari sweep complete ($atari/$ATARI_TOTAL) -- run ./run.sh pull"
   elif [ "$leaders" -gt 0 ]; then
     if [ "$workers" -gt 1 ]; then
@@ -334,17 +356,16 @@ cmd_watch() {
 
 # ---------------------------------------------------------------- start -----
 cmd_start() {
-  local n_gpus
-  n_gpus="$(printf '%s' "$GPUS" | tr ',' '\n' | grep -c .)"
+  local n_gpus=0
   echo "starting/resuming $RUN_ID on $HOST (conda env: $CONDA_ENV, GPUs $GPUS)"
   [ -n "${ALGOS:-}" ] && echo "  algos: $ALGOS"
   [ -n "${SEEDS:-}" ] && echo "  seeds: $SEEDS"
   [ -n "${ENVS:-}" ] && echo "  envs:  $ENVS   (set CLASSICAL_ENVS_N for correct status totals)"
   [ -n "${CLASSICAL_WORKERS:-}" ] && echo "  classical workers: $CLASSICAL_WORKERS"
-  "${SSH[@]}" bash -s -- "$RUN_ID" "$REMOTE_REPO" "$ATARI_ROUNDS" "$CLASSICAL_ROUNDS" "$CONDA_ENV" "$GPUS" "$n_gpus" "${ALGOS:-}" "${SEEDS:-}" "${ENVS:-}" "${CLASSICAL_WORKERS:-}" <<'REMOTE'
+  ssh_bash "$RUN_ID" "$REMOTE_REPO" "$ATARI_ROUNDS" "$CLASSICAL_ROUNDS" "$CONDA_ENV" "$GPUS" "$n_gpus" "${ALGOS:-}" "${SEEDS:-}" "${ENVS:-}" "${CLASSICAL_WORKERS:-}" "$RUN_ATARI" "${ATARI_ENVS:-}" <<'REMOTE'
 set -u
 RID="$1"; REPO="$2"; AR="$3"; CR="$4"; ENVNAME="$5"; GPUSET="$6"; NGPU="$7"
-ALGOS_IN="${8:-}"; SEEDS_IN="${9:-}"; ENVS_IN="${10:-}"; CW_IN="${11:-}"
+ALGOS_IN="${8:-}"; SEEDS_IN="${9:-}"; ENVS_IN="${10:-}"; CW_IN="${11:-}"; RUN_ATARI_IN="${12:-0}"; ATARI_ENVS_IN="${13:-}"
 cd "$HOME/$REPO/experiments" || { echo "no such directory: $HOME/$REPO/experiments"; exit 1; }
 
 if pgrep -f 'run_bc_iid_experiments|imitation.experiments.ftrl.run_experiment' > /dev/null; then
@@ -369,13 +390,9 @@ done
 command -v conda > /dev/null || { echo "PREFLIGHT FAIL: conda not found on the server"; exit 1; }
 conda activate "$ENVNAME" || { echo "PREFLIGHT FAIL: cannot activate conda env '$ENVNAME'"; exit 1; }
 
-# Hide the excluded cards from CUDA entirely. run_experiment hands worker w the
-# device index w % n_gpus, counting from 0 over the *visible* devices, so the
-# mask and count have to agree because visible devices are renumbered.
-# N_GPUS must be set too because run_atari_curves
-# defaults it to 4, which under a 3-card mask would address a device that does
-# not exist.
-export CUDA_VISIBLE_DEVICES="$GPUSET"
+# Select the requested devices, or expose all devices by default.
+if [ -n "$GPUSET" ]; then export CUDA_VISIBLE_DEVICES="$GPUSET"; else unset CUDA_VISIBLE_DEVICES; fi
+NGPU="$(python -c 'import torch; print(torch.cuda.device_count())')"
 export N_GPUS="$NGPU"
 
 # Fail here, loudly and in one second, rather than in a detached background job.
@@ -393,7 +410,8 @@ CHECK
 # EXP_RUN_ID is what makes this a resume. Without it, paths.sh invents a new
 # timestamped run directory on every launch and no earlier work is reused.
 export EXP_RUN_ID="$RID"
-export ATARI_ROUNDS="$AR" CLASSICAL_ROUNDS="$CR"
+export ATARI_ROUNDS="$AR" CLASSICAL_ROUNDS="$CR" RUN_ATARI="$RUN_ATARI_IN"
+export ATARI_ENVS="$ATARI_ENVS_IN"
 # Only export what was actually asked for: an empty string would override the
 # driver's own defaults with nothing. The manifest records whatever wins, which
 # is what run.sh reads back for the cell totals.
@@ -405,17 +423,33 @@ mkdir -p "runs/$RID/logs"
 LOG="runs/$RID/logs/driver.log"
 echo "=== launch $(date -u +%Y-%m-%dT%H:%M:%SZ) env=$ENVNAME run=$RID gpus=$GPUSET (n=$NGPU) ===" >> "$LOG"
 
-setsid nohup bash run_bc_iid_experiments.sh >> "$LOG" 2>&1 < /dev/null &
-PID=$!
+# Keep long jobs in a named tmux session, including all campaign settings.
+command -v tmux > /dev/null || { echo "PREFLIGHT FAIL: tmux not found"; exit 1; }
+SESSION="imitation-$RID"
+[[ "$RID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { echo "invalid run ID"; exit 1; }
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  echo "REFUSED: tmux session $SESSION already exists"; exit 3
+fi
+LAUNCH=(env -u CUDA_VISIBLE_DEVICES -u ALGOS -u SEEDS -u ENVS -u CLASSICAL_WORKERS)
+for key in EXP_RUN_ID ATARI_ROUNDS CLASSICAL_ROUNDS RUN_ATARI ATARI_ENVS N_GPUS CUDA_VISIBLE_DEVICES ALGOS SEEDS ENVS CLASSICAL_WORKERS PATH CONDA_PREFIX SOURCE_REVISION; do
+  if [ "${!key+x}" = x ]; then LAUNCH+=("$key=${!key}"); fi
+done
+LAUNCH+=(bash "$PWD/run_bc_iid_experiments.sh")
+printf -v COMMAND '%q ' "${LAUNCH[@]}"
+printf -v REDIRECT ' >> %q 2>&1' "$PWD/$LOG"
+tmux new-session -d -s "$SESSION" -c "$PWD" "$COMMAND$REDIRECT"
+PID="$(tmux display-message -p -t "=$SESSION" '#{pane_pid}')"
 echo "$PID" > "runs/$RID/driver.pid"
-sleep 20
-if kill -0 "$PID" 2>/dev/null; then
-  echo "started, pid $PID; log runs/$RID/logs/driver.log"
+sleep 2
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  echo "started in tmux session $SESSION, pid $PID; log runs/$RID/logs/driver.log"
   echo "stage: $(cat "runs/$RID/status.txt" 2>/dev/null)"
 else
-  echo "driver exited within 20 s -- last log lines:"; tail -30 "$LOG"; exit 1
+  echo "driver exited during startup; last log lines:"; tail -30 "$LOG"; exit 1
 fi
 REMOTE
+  local launch_rc=$?
+  [ "$launch_rc" -eq 0 ] || return "$launch_rc"
   echo
   echo "then: bash run.sh status   (and bash run.sh watch to keep an eye on it)"
 }
@@ -424,7 +458,7 @@ REMOTE
 cmd_stop() {
   read -r -p "stop the run on $HOST? completed cells are kept. (yes/no) " a
   [ "$a" = yes ] || { echo "cancelled"; exit 0; }
-  "${SSH[@]}" bash -s <<'STOP'
+  ssh_bash <<'STOP'
 set -u
 # The pool workers are spawned as `python -c "from multiprocessing.spawn import
 # ..."`, so their command lines do NOT mention run_experiment -- the same fact
@@ -475,7 +509,7 @@ cmd_pull() {
 # four are stuck", which is the question whenever throughput looks wrong.
 cmd_cells() {
   echo "$RUN_ID on $HOST -- rounds per active cell (scratch demo dirs)"
-  "${SSH[@]}" bash -s -- "$RUN_ID" "$REMOTE_REPO" <<'CELLS'
+  ssh_bash "$RUN_ID" "$REMOTE_REPO" <<'CELLS'
 set -u
 RID="$1"; REPO="$2"
 for stage in classical atari; do
@@ -491,6 +525,11 @@ for stage in classical atari; do
 done
 CELLS
 }
+
+case "${1:-status}" in
+  -h|--help|help) ;;
+  *) [[ -n "$HOST" && "$HOST" != -* ]] || die "Set HOST or add it to experiments/.local/runner.env" ;;
+esac
 
 case "${1:-status}" in
   status) cmd_status ;;

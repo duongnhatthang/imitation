@@ -84,7 +84,10 @@ def test_launchers_train_and_plot_in_same_run(tmp_path, script, group):
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_driver_runs_classical_before_atari_and_stops_on_failure(tmp_path, fail):
+@pytest.mark.parametrize("run_atari", [False, True])
+def test_driver_runs_classical_before_atari_and_stops_on_failure(
+    tmp_path, fail, run_atari
+):
     project = tmp_path / "project"
     (project / "experiments").mkdir(parents=True)
     for name in ("paths.sh", "run_bc_iid_experiments.sh"):
@@ -96,6 +99,11 @@ def test_driver_runs_classical_before_atari_and_stops_on_failure(tmp_path, fail)
     ]:
         (project / "experiments" / name).write_text(
             f'#!/bin/bash\necho {stage} >> "$TEST_EVENTS"\n'
+            + (
+                'test "$ENVS" = PongNoFrameskip-v4 || exit 9\n'
+                if stage == "atari"
+                else ""
+            )
             + (
                 'if [ "${FAIL_CLASSICAL:-0}" = 1 ]; then exit 7; fi\n'
                 if stage == "classical"
@@ -117,6 +125,9 @@ def test_driver_runs_classical_before_atari_and_stops_on_failure(tmp_path, fail)
         EXP_RUNS_DIR=str(tmp_path / "runs"),
         TEST_EVENTS=str(events),
         FAIL_CLASSICAL=str(int(fail)),
+        RUN_ATARI=str(int(run_atari)),
+        ENVS="CartPole-v1",
+        ATARI_ENVS="PongNoFrameskip-v4",
     )
     result = subprocess.run(
         ["bash", str(project / "experiments/run_bc_iid_experiments.sh")],
@@ -125,11 +136,18 @@ def test_driver_runs_classical_before_atari_and_stops_on_failure(tmp_path, fail)
         capture_output=True,
         text=True,
     )
-    expected = ["classical"] if fail else ["classical", "coverage", "atari", "coverage"]
+    expected = ["classical"] if fail else ["classical", "coverage"]
+    if run_atari and not fail:
+        expected += ["atari", "coverage"]
     assert events.read_text().splitlines() == expected, result.stdout + result.stderr
     assert result.returncode == (7 if fail else 0), result.stdout + result.stderr
     status = (tmp_path / "runs/trial/status.txt").read_text()
     assert ("failed" in status) if fail else status.strip() == "complete"
+    manifest = json.loads((tmp_path / "runs/trial/manifest.json").read_text())
+    assert manifest["run_atari"] is run_atari
+    assert manifest["warm_start"] is False
+    assert manifest["dagger_beta"] == 0
+    assert manifest["algorithms"] == ["ftl", "ftrl", "bc", "bc_iid"]
 
 
 def test_coverage_uses_run_plots_seed_count_and_shared_cache(tmp_path):

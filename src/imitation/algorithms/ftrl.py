@@ -163,7 +163,7 @@ class FTRLTrainer(dagger.SimpleDAggerTrainer):
         expert_policy: policies.BasePolicy,
         rng: np.random.Generator,
         l2_schedule: Optional[L2Schedule] = None,
-        warm_start: bool = True,
+        warm_start: bool = False,
         track_per_round_loss: bool = True,
         use_trainable_params_loss: bool = False,
         expert_trajs: Optional[Sequence[types.Trajectory]] = None,
@@ -178,8 +178,9 @@ class FTRLTrainer(dagger.SimpleDAggerTrainer):
             rng: Random state for random number generation.
             l2_schedule: Schedule returning L2 weight per round. If None,
                 uses ConstantL2Schedule(0.0) (equivalent to FTL/plain DAgger).
-            warm_start: If True (default), keep policy weights between rounds.
-                If False, reinitialize trainable parameters each round.
+            warm_start: If True, keep policy weights and optimizer state between
+                rounds. If False (default), reinitialize trainable parameters
+                and clear optimizer state before each subsequent round.
             track_per_round_loss: If True (default), evaluate cross-entropy on
                 the current round's data after each training step.
             use_trainable_params_loss: If True, use TrainableParamsLossCalculator
@@ -221,12 +222,14 @@ class FTRLTrainer(dagger.SimpleDAggerTrainer):
             )
 
     def _reinitialize_trainable_params(self) -> None:
-        """Reinitialize all trainable parameters with Xavier uniform."""
+        """Reinitialize trainable parameters and discard optimizer history."""
         for p in self.policy.parameters():
             if p.requires_grad and p.dim() >= 2:
                 th.nn.init.xavier_uniform_(p)
             elif p.requires_grad and p.dim() == 1:
                 th.nn.init.zeros_(p)
+        self.bc_trainer.optimizer.state.clear()
+        self.bc_trainer.optimizer.zero_grad(set_to_none=True)
 
     def _compute_round_loss(
         self,

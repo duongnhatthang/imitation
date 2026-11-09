@@ -6,6 +6,42 @@ import numpy as np
 import pytest
 
 
+def test_lr_sweep_dispatches_cold_start_and_zero_beta(tmp_path, monkeypatch):
+    import sys
+    from imitation.experiments.ftrl import run_experiment, run_lr_sweep
+
+    configs = []
+
+    def already_done(config):
+        configs.append(config)
+        return True
+
+    monkeypatch.setattr(run_experiment, "_is_already_done", already_done)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_lr_sweep",
+            "--envs",
+            "CartPole-v1",
+            "--seeds",
+            "1",
+            "--total-obs",
+            "4",
+            "--samples-per-round-values",
+            "1",
+            "--lr-values",
+            "0.001",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+    run_lr_sweep.main()
+    assert len(configs) == 1
+    assert configs[0].warm_start is False
+    assert configs[0].beta_rampdown == 0
+
+
 def test_uniform_expert_order_is_random_and_repeatable():
     from imitation.experiments.ftrl.run_experiment import (
         _collect_and_subsample_transitions,
@@ -109,12 +145,37 @@ from imitation.experiments.ftrl.run_experiment import (
 )
 
 
+@pytest.fixture
+def untrained_expert(monkeypatch):
+    """Skip PPO expert training, which test_expert_pipeline.py covers.
+
+    Also caps evaluation at a few real episodes instead of the production 100:
+    these are plumbing checks, and test_eval_utils.py covers the estimator.
+    """
+    from stable_baselines3 import PPO
+    from imitation.experiments.ftrl import eval_utils, run_experiment
+
+    expert = PPO("MlpPolicy", "CartPole-v1", seed=10, device="cpu")
+    monkeypatch.setattr(
+        run_experiment.experts, "get_or_train_expert", lambda *a, **kw: expert.policy
+    )
+    evaluate = eval_utils.eval_policy_rollout
+
+    def few_episodes(*args, n_episodes, **kwargs):
+        return evaluate(*args, n_episodes=min(n_episodes, 3), **kwargs)
+
+    monkeypatch.setattr(eval_utils, "eval_policy_rollout", few_episodes)
+    yield expert.policy
+    expert.get_env().close()
+
+
 def _make_config(algo, tmp_path, **overrides):
     """Helper to create an ExperimentConfig for testing.
 
     Inner / outer early-stop default to OFF in the fixture so the existing
     smoke tests exercise deterministic fixed-budget behavior. Tests targeting
-    early-stop semantics opt in explicitly.
+    early-stop semantics opt in explicitly. Interactive algorithms collect at
+    least ``samples_per_round`` episodes per round, so keep it small.
     """
     defaults = dict(
         algo=algo,
@@ -122,7 +183,7 @@ def _make_config(algo, tmp_path, **overrides):
         seed=0,
         policy_mode="end_to_end",
         n_rounds=3,
-        samples_per_round=300,
+        samples_per_round=5,
         l2_lambda=1e-4,
         l2_decay=False,
         warm_start=True,
@@ -140,7 +201,7 @@ def _make_config(algo, tmp_path, **overrides):
     return ExperimentConfig(**defaults)
 
 
-def test_run_ftl_cartpole(tmp_path):
+def test_run_ftl_cartpole(tmp_path, untrained_expert):
     """FTL (l2=0) smoke test on CartPole, 3 rounds."""
     config = _make_config("ftl", tmp_path)
     result = run_single(config)
@@ -159,7 +220,7 @@ def test_run_ftl_cartpole(tmp_path):
     assert saved["algo"] == "ftl"
 
 
-def test_run_ftrl_cartpole(tmp_path):
+def test_run_ftrl_cartpole(tmp_path, untrained_expert):
     """FTRL smoke test on CartPole, 3 rounds."""
     config = _make_config("ftrl", tmp_path)
     result = run_single(config)
@@ -170,28 +231,29 @@ def test_run_ftrl_cartpole(tmp_path):
         assert "train_cross_entropy" in m
         assert "l2_norm" in m
         assert "round" in m
-        assert "d_eval_size" in m
-        assert isinstance(m["d_eval_size"], int)
+        # Only evaluation rounds (eval_interval, final) roll out the learner.
+        evaluated = "checkpoint" in m
+        assert isinstance(m["d_eval_size"], int) == evaluated
 
 
-def test_run_bc_cartpole(tmp_path):
+def test_run_bc_cartpole(tmp_path, untrained_expert):
     """BC baseline smoke test on CartPole."""
     config = _make_config("bc", tmp_path)
     result = run_single(config)
 
     assert result["algo"] == "bc"
-    assert len(result["per_round"]) >= 2
+    # Fixed BC trains once and reports a single row.
+    assert len(result["per_round"]) == 1
     for m in result["per_round"]:
-        # Fixed BC does not track per-round train cross-entropy or rollout CE;
-        # these fields are present but None (static reference line in plots).
-        assert "train_cross_entropy" in m
+        # Fixed BC has no per-round training loss, but its one row is an
+        # evaluated, checkpointed policy (a static reference line in plots).
         assert m["train_cross_entropy"] is None
-        assert "rollout_cross_entropy" in m
-        assert m["rollout_cross_entropy"] is None
+        assert isinstance(m["rollout_cross_entropy"], float)
+        assert "checkpoint" in m
         assert "l2_norm" in m
 
 
-def test_run_ftrl_linear_mode(tmp_path):
+def test_run_ftrl_linear_mode(tmp_path, untrained_expert):
     """FTRL with linear policy mode on CartPole."""
     config = _make_config("ftrl", tmp_path, policy_mode="linear")
     result = run_single(config)
@@ -200,7 +262,7 @@ def test_run_ftrl_linear_mode(tmp_path):
     assert len(result["per_round"]) >= 2
 
 
-def test_run_ftrl_decaying_l2(tmp_path):
+def test_run_ftrl_decaying_l2(tmp_path, untrained_expert):
     """FTRL with decaying L2 schedule."""
     config = _make_config("ftrl", tmp_path, l2_decay=True)
     result = run_single(config)
@@ -236,7 +298,7 @@ class TestResolveEnvs:
             resolve_envs(env_group="classical", envs=["CartPole-v1"])
 
 
-def test_run_bc_iid_cartpole(tmp_path):
+def test_run_bc_iid_cartpole(tmp_path, untrained_expert):
     """bc_iid smoke test on CartPole."""
     config = _make_config(
         "bc_iid",
@@ -244,7 +306,7 @@ def test_run_bc_iid_cartpole(tmp_path):
         env_name="CartPole-v1",
         policy_mode="end_to_end",
         n_rounds=3,
-        samples_per_round=200,
+        samples_per_round=5,
         eval_interval=1,
     )
     result = run_single(config)
@@ -252,7 +314,7 @@ def test_run_bc_iid_cartpole(tmp_path):
     assert len(result["per_round"]) == 4
     # Data budget invariant: round k has exactly k * samples_per_round obs
     for i, r in enumerate(result["per_round"]):
-        assert r["n_observations"] == i * 200
+        assert r["n_observations"] == i * 5
     # rollout_cross_entropy populated on every eval-point round
     # (with eval_interval=1, every round is an eval point)
     for r in result["per_round"]:
@@ -391,13 +453,8 @@ def test_collect_and_subsample_preserves_transitions_type():
     np.testing.assert_array_equal(prefix.acts, np.arange(10))
 
 
-def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
-    """With strategy='uniform', FTL's round demos should not be the prefix.
-
-    Run FTL on CartPole with samples_per_round=50 and n_rounds=2. Inspect
-    the demo dir for round 1 and confirm the selected transitions span a
-    wider range of source timesteps than a sequential prefix would.
-    """
+def test_ftl_round_demos_retain_samples_per_round(tmp_path, untrained_expert):
+    """FTL's uniform round demos retain exactly samples_per_round transitions."""
     from imitation.data import serialize
     from imitation.experiments.ftrl.run_experiment import (
         ExperimentConfig,
@@ -410,7 +467,7 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
         seed=0,
         policy_mode="linear",
         n_rounds=2,
-        samples_per_round=50,
+        samples_per_round=5,
         l2_lambda=0.0,
         l2_decay=False,
         warm_start=True,
@@ -438,10 +495,10 @@ def test_ftl_uniform_round_demos_are_subsampled(tmp_path):
     total = 0
     for p in demo_paths:
         total += sum(len(t) for t in serialize.load(p))
-    assert total == 50
+    assert total == 5
 
 
-def test_ftl_with_small_bc_batch_size(tmp_path):
+def test_ftl_with_small_bc_batch_size(tmp_path, untrained_expert):
     """FTL works with samples_per_round < default BC batch_size when bc_batch_size is set.
 
     With samples_per_round=15 and bc_batch_size=15, BC's batch fits and FTL
@@ -756,7 +813,7 @@ def test_should_outer_early_stop_fires_at_exact_ceiling():
     )
 
 
-def test_inner_train_fixed_budget_records_stop_epoch(tmp_path):
+def test_inner_train_fixed_budget_records_stop_epoch(tmp_path, untrained_expert):
     """With inner_early_stop=False, each per-round dict records stop_epoch == bc_n_epochs."""
     config = _make_config(
         "bc",
@@ -775,7 +832,7 @@ def test_inner_train_fixed_budget_records_stop_epoch(tmp_path):
         assert m.get("inner_es_fallback") in (None, "")
 
 
-def test_inner_train_early_stop_records_stop_epoch(tmp_path):
+def test_inner_train_early_stop_records_stop_epoch(tmp_path, untrained_expert):
     """With inner_early_stop=True and a large enough dataset, BC fixed records
     inner_es_stop_epoch <= bc_n_epochs and a non-empty val NLL trajectory.
     """
@@ -784,6 +841,7 @@ def test_inner_train_early_stop_records_stop_epoch(tmp_path):
         tmp_path,
         bc_n_epochs=20,
         n_rounds=2,
+        samples_per_round=300,  # fixed BC: 600 transitions, a 60-row val split
         inner_early_stop=True,
         inner_early_stop_patience=3,
         inner_early_stop_min_epochs=2,
@@ -803,7 +861,7 @@ def test_inner_train_early_stop_records_stop_epoch(tmp_path):
         assert len(traj) == stop_ep
 
 
-def test_inner_train_fallback_on_small_dataset(tmp_path):
+def test_inner_train_fallback_on_small_dataset(tmp_path, untrained_expert):
     """With val_frac × |D| < min_val_size, falls back to fixed budget and
     logs inner_es_fallback="dataset_too_small".
     """

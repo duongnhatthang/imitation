@@ -71,6 +71,7 @@ python -m imitation.experiments.ftrl.run_experiment \
     --expert-cache-dir "$EXP_EXPERT_CACHE" \
     --fit-rule train-loss-plateau/1 \
     --no-outer-early-stop \
+    --no-warm-start --beta-rampdown 0 \
     --n-workers "$WORKERS" \
     --n-gpus 0 \
     "$@" \

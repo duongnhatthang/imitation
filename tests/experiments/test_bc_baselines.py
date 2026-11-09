@@ -1,6 +1,6 @@
 """Contracts for the offline BC baselines and per-trajectory round sampling.
 
-The three BC variants routed through the shared warm-started trainer differ
+The three BC variants routed through the shared round-loop trainer differ
 only in which transitions arrive at round t:
 
 * ``bc_iid``    - one uniform state from each of t freshly collected expert
@@ -75,9 +75,7 @@ def _install_tiny_env(monkeypatch, env_cls):
     """Point the runner at ``env_cls`` and stub out expert training/baselines."""
     from imitation.experiments.ftrl import env_baselines
 
-    expert = constant_policy(
-        env_cls.observation_space, env_cls.action_space, 1
-    )
+    expert = constant_policy(env_cls.observation_space, env_cls.action_space, 1)
     monkeypatch.setattr(
         run_experiment.env_utils,
         "make_env",
@@ -166,14 +164,18 @@ def test_round_samples_come_from_distinct_trajectories(tiny_ordered, m):
 
 
 def test_trajectories_per_round_is_raised_to_samples_per_round(tmp_path):
-    config = _config(tmp_path, algo="ftl", samples_per_round=5, trajectories_per_round=2)
+    config = _config(
+        tmp_path, algo="ftl", samples_per_round=5, trajectories_per_round=2
+    )
     assert config.trajectories_per_round == 5
     # An explicit larger request is honored: more episodes, still one state each.
-    config = _config(tmp_path, algo="ftl", samples_per_round=2, trajectories_per_round=9)
+    config = _config(
+        tmp_path, algo="ftl", samples_per_round=2, trajectories_per_round=9
+    )
     assert config.trajectories_per_round == 9
 
 
-def test_per_trajectory_is_a_no_op_at_one_sample_per_round(tmp_path, monkeypatch):
+def test_per_trajectory_is_a_no_op_at_one_sample_per_round(tmp_path):
     """The campaign setting m = 1 must be bit-identical to the old pooled draw.
 
     This is the claim that lets us say the sampling change cannot account for
@@ -181,7 +183,6 @@ def test_per_trajectory_is_a_no_op_at_one_sample_per_round(tmp_path, monkeypatch
     round there is nothing to choose between trajectories, so the new path takes
     no extra draw and lands on the same transition from the same RNG stream.
     """
-    _install_tiny_env(monkeypatch, EpisodeOrderEnv)
     venv = DummyVecEnv([EpisodeOrderEnv])
     trajs = rollout.generate_trajectories(
         policy=constant_policy(
@@ -261,6 +262,9 @@ def test_bc_prefix_trains_on_fixed_bc_prefix(tiny_ordered):
 def test_bc_pool_draws_from_the_same_fixed_pool(tiny_ordered):
     """bc_pool's rounds are uniform draws from one fixed pool, not fresh episodes."""
     budget = 10
+    bc_result = run_experiment.run_single(
+        _config(tiny_ordered, algo="bc", n_rounds=1, samples_per_round=budget)
+    )
     pool_cfg = _config(
         tiny_ordered, algo="bc_pool", n_rounds=budget, samples_per_round=1
     )
@@ -269,6 +273,12 @@ def test_bc_pool_draws_from_the_same_fixed_pool(tiny_ordered):
 
     with np.load(result["expert_dataset"]["path"]) as saved:
         dataset_obs = saved["obs"]
+    with np.load(bc_result["expert_dataset"]["path"]) as saved:
+        canonical_obs = saved["obs"]
+    # The second episode overshoots the budget by four rows. Pool sampling must
+    # permute the same ten rows as BC, never sample those discarded tail rows.
+    assert sorted(map(tuple, dataset_obs)) == sorted(map(tuple, canonical_obs))
+    assert not np.array_equal(dataset_obs, canonical_obs)
     obs, rounds = _round_states(pool_cfg, "bc_pool")
     order = np.argsort(rounds, kind="stable")
     np.testing.assert_array_equal(obs[order], dataset_obs[:budget])

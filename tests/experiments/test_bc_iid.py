@@ -1,6 +1,7 @@
 """BC-iid collection and training contracts on a small deterministic MDP."""
 
 import dataclasses
+import os
 import sys
 
 import gymnasium as gym
@@ -86,7 +87,6 @@ def tiny_experiment(tmp_path, monkeypatch):
         learning_rate=0.0,
         outer_early_stop=False,
         inner_early_stop=False,
-        # These tests pin the per-round fit mechanics of the earlier rule.
         fit_rule="epoch-cap/1",
     )
 
@@ -215,7 +215,10 @@ def test_bc_prefix_preserves_collection_order_across_episodes(
         )
 
 
-def test_cli_defaults_and_trajectory_option(tiny_experiment, monkeypatch):
+@pytest.mark.parametrize("optional_algos", [False, True])
+def test_cli_defaults_and_trajectory_option(
+    tiny_experiment, monkeypatch, optional_algos
+):
     seen = []
     monkeypatch.setattr(
         run_experiment, "run_single", lambda config: seen.append(config) or {}
@@ -233,51 +236,192 @@ def test_cli_defaults_and_trajectory_option(tiny_experiment, monkeypatch):
             str(tiny_experiment.output_dir),
             "--traj-per-round",
             "3",
-        ],
+        ]
+        + (["--algos", "bc_prefix", "bc_pool"] if optional_algos else []),
     )
     run_experiment.main()
-    assert {c.algo: c.subsample_strategy for c in seen} == {
+    expected = {
         "ftl": "uniform",
         "ftrl": "uniform",
         "bc": "prefix",
         "bc_iid": "uniform",
-        "bc_prefix": "prefix",
-        "bc_pool": "uniform",
     }
+    if optional_algos:
+        expected = {"bc_prefix": "prefix", "bc_pool": "uniform"}
+    assert {c.algo: c.subsample_strategy for c in seen} == expected
     assert all(c.trajectories_per_round == 3 for c in seen)
+    assert all(c.warm_start is False and c.beta_rampdown == 0 for c in seen)
 
 
-def test_bc_iid_rejects_prefix_sampling(tiny_experiment):
-    with pytest.raises(ValueError, match="uniform"):
-        dataclasses.replace(tiny_experiment, subsample_strategy="prefix")
-
-
-@pytest.mark.parametrize("warm_start", [False, True])
-@pytest.mark.parametrize("policy_mode", ["linear", "end_to_end"])
-def test_bc_iid_trains_and_respects_warm_start(
-    tiny_experiment, monkeypatch, warm_start, policy_mode
+@pytest.mark.parametrize("algo", ["ftl", "ftrl", "bc_iid"])
+def test_zero_beta_collects_learner_states_but_bc_iid_keeps_expert_states(
+    tiny_experiment, algo
 ):
-    from imitation.algorithms.ftrl import FTRLTrainer
-    from imitation.experiments.ftrl.policy_utils import load_policy_checkpoint
-
-    resets = []
-    original_reset = FTRLTrainer._reinitialize_trainable_params
-
-    def reset(trainer):
-        original_reset(trainer)
-        resets.append(trainer.round_num)
-
-    monkeypatch.setattr(FTRLTrainer, "_reinitialize_trainable_params", reset)
     config = dataclasses.replace(
         tiny_experiment,
-        warm_start=warm_start,
+        algo=algo,
+        beta_rampdown=0,
+        n_rounds=3,
+        samples_per_round=1,
+        trajectories_per_round=1,
+    )
+    run_experiment.run_single(config)
+    states = coverage_data.load_algo_states(
+        config.output_dir, config.env_name, algo, config.seed
+    )
+    assert len(states.obs) == 3
+    assert np.any(states.obs[:, 0] > 0)
+    expected_mistakes = 0 if algo == "bc_iid" else states.obs[:, 0]
+    np.testing.assert_array_equal(states.obs[:, 1], expected_mistakes)
+    for path in coverage_data.scratch_demo_root(
+        config.output_dir, algo, config.env_name, config.seed
+    ).glob("round-*/*.npz"):
+        for traj in serialize.load(path):
+            np.testing.assert_array_equal(traj.acts, 1)
+
+
+@pytest.mark.parametrize("inherited", [None, "1"])
+def test_cpu_cell_runs_on_cpu_without_touching_cuda_visibility(
+    tiny_experiment, monkeypatch, inherited
+):
+    # CUDA may already be initialized in this process, so the runner must not
+    # rewrite CUDA_VISIBLE_DEVICES. A plain dict stands in for os.environ:
+    # writes never reach the real process environment, so this test cannot
+    # itself leave CUDA inconsistent for later tests.
+    environ = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+    if inherited is not None:
+        environ["CUDA_VISIBLE_DEVICES"] = inherited
+    monkeypatch.setattr(os, "environ", environ)
+    devices = []
+    original_train = run_experiment._inner_train
+
+    def train(trainer, *args, **kwargs):
+        policy = getattr(trainer, "bc_trainer", trainer).policy
+        devices.append(policy.device.type)
+        return original_train(trainer, *args, **kwargs)
+
+    monkeypatch.setattr(run_experiment, "_inner_train", train)
+    for algo in ("ftl", "bc"):
+        config = dataclasses.replace(
+            tiny_experiment,
+            algo=algo,
+            n_rounds=2,
+            samples_per_round=1,
+            subsample_strategy="prefix" if algo == "bc" else "uniform",
+        )
+        assert run_experiment.run_single(config)["device"] == "cpu"
+        assert os.environ.get("CUDA_VISIBLE_DEVICES") == inherited
+    assert devices and set(devices) == {"cpu"}
+
+
+def test_negative_beta_rampdown_is_rejected(tiny_experiment):
+    with pytest.raises(ValueError, match="beta_rampdown"):
+        dataclasses.replace(tiny_experiment, beta_rampdown=-1)
+
+
+@pytest.mark.parametrize(
+    "algo,expected",
+    [
+        ("ftl", [1.0, 0.5, 0.0]),
+        ("ftrl", [1.0, 0.5, 0.0]),
+        ("bc_iid", [1.0, 1.0, 1.0]),
+    ],
+)
+def test_positive_beta_override_preserves_bc_iid_expert_control(
+    tiny_experiment, monkeypatch, algo, expected
+):
+    from imitation.algorithms.ftrl import FTRLTrainer
+
+    beta_values = []
+    original_collector = FTRLTrainer.create_trajectory_collector
+
+    def collect(trainer):
+        collector = original_collector(trainer)
+        beta_values.append(collector.beta)
+        return collector
+
+    monkeypatch.setattr(FTRLTrainer, "create_trajectory_collector", collect)
+    run_experiment.run_single(
+        dataclasses.replace(
+            tiny_experiment,
+            algo=algo,
+            beta_rampdown=2,
+            n_rounds=3,
+            samples_per_round=1,
+        )
+    )
+    assert beta_values == expected
+
+
+@pytest.mark.parametrize("early_stop", [False, True])
+@pytest.mark.parametrize("warm_start", [False, True, None])
+def test_cold_start_resets_adam_before_each_round(
+    tiny_experiment, monkeypatch, early_stop, warm_start
+):
+    from imitation.algorithms import bc, ftrl
+
+    if warm_start is None:
+        original_trainer = ftrl.FTRLTrainer
+
+        def trainer_with_default(**kwargs):
+            kwargs.pop("warm_start")
+            return original_trainer(**kwargs)
+
+        monkeypatch.setattr(ftrl, "FTRLTrainer", trainer_with_default)
+
+    optimizer_steps = []
+    heads = []  # (bias before this round's training, bias after it)
+    original_train = bc.BC.train
+
+    def train(trainer, *args, **kwargs):
+        optimizer_steps.append(
+            [int(state["step"]) for state in trainer.optimizer.state.values()]
+        )
+        before = trainer.policy.action_net.bias.detach().clone()
+        result = original_train(trainer, *args, **kwargs)
+        assert trainer.optimizer.state, "real Adam updates must create moments"
+        heads.append((before, trainer.policy.action_net.bias.detach().clone()))
+        return result
+
+    monkeypatch.setattr(bc.BC, "train", train)
+    config = dataclasses.replace(
+        tiny_experiment,
+        n_rounds=3,
+        samples_per_round=1,
+        learning_rate=0.01,
+        warm_start=bool(warm_start),
+        inner_early_stop=early_stop,
+    )
+    run_experiment.run_single(config)
+    assert len(optimizer_steps) == 3
+    assert optimizer_steps[0] == []
+    # Round 0 starts from the constructed policy (bias +-20) in both modes.
+    assert heads[0][0].abs().min() == 20
+    if warm_start:
+        assert all(steps and min(steps) > 0 for steps in optimizer_steps[1:])
+        for (_, trained), (start, _) in zip(heads, heads[1:]):
+            assert th.equal(start, trained)
+    else:
+        assert optimizer_steps == [[], [], []]
+        # Every later round starts from a freshly initialized head.
+        for (_, trained), (start, _) in zip(heads, heads[1:]):
+            assert not th.equal(start, trained)
+            assert th.equal(start, th.zeros_like(start))
+
+
+@pytest.mark.parametrize("policy_mode", ["linear", "end_to_end"])
+def test_bc_iid_trains_and_checkpoints_the_head(tiny_experiment, policy_mode):
+    from imitation.experiments.ftrl.policy_utils import load_policy_checkpoint
+
+    config = dataclasses.replace(
+        tiny_experiment,
+        warm_start=False,
         policy_mode=policy_mode,
         learning_rate=0.01,
         n_rounds=3,
         eval_interval=1,
     )
     result = run_experiment.run_single(config)
-    assert len(resets) == (0 if warm_start else 2)
     initial = load_policy_checkpoint(result["per_round"][0]["checkpoint"])
     trained = load_policy_checkpoint(result["per_round"][1]["checkpoint"])
     assert not th.equal(initial.action_net.weight, trained.action_net.weight)

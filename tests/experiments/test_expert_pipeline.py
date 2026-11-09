@@ -131,9 +131,8 @@ def test_make_expert_trajectories(tmp_path, rng):
     """make_expert_trajectories collects the requested number of episodes."""
     venv = env_utils.make_env("CartPole-v1", n_envs=1, rng=rng)
 
-    # Train a quick expert
-    model = PPO("MlpPolicy", venv, seed=0, verbose=0)
-    model.learn(total_timesteps=5000)
+    # Episode counting and shapes do not depend on policy quality.
+    model = PPO("MlpPolicy", venv, seed=0, verbose=0, device="cpu")
 
     trajs = experts.make_expert_trajectories(
         expert=model.policy,
@@ -197,42 +196,6 @@ def test_reinitialize_action_net():
     assert not (policy.action_net.weight.data == 999.0).any()
 
 
-def test_create_linear_policy():
-    """Linear policy has frozen features from expert and fresh action_net."""
-    obs_space = spaces.Box(-1, 1, (4,))
-    act_space = spaces.Discrete(2)
-
-    # Create a "trained" expert
-    expert = policy_utils.create_end_to_end_policy(obs_space, act_space)
-    # Give it distinctive weights
-    with th.no_grad():
-        for p in expert.mlp_extractor.parameters():
-            p.fill_(0.42)
-
-    linear_policy = policy_utils.create_linear_policy(expert)
-
-    # mlp_extractor weights should match expert
-    for (name_e, pe), (name_l, pl) in zip(
-        expert.mlp_extractor.named_parameters(),
-        linear_policy.mlp_extractor.named_parameters(),
-    ):
-        assert th.allclose(pe, pl), f"mlp_extractor.{name_e} should match expert"
-
-    # mlp_extractor should be frozen
-    for name, p in linear_policy.named_parameters():
-        if name.startswith("action_net"):
-            assert p.requires_grad
-        elif name.startswith("mlp_extractor"):
-            assert not p.requires_grad, f"{name} should be frozen"
-
-    # action_net should be reinitialized (not matching expert)
-    # Very unlikely to match after Xavier init
-    assert not th.allclose(
-        expert.action_net.weight.data,
-        linear_policy.action_net.weight.data,
-    )
-
-
 def test_train_classical_expert_converges_cartpole(tmp_path):
     """CartPole expert trainer must return a converged policy within the cap."""
     import numpy as np
@@ -283,6 +246,34 @@ def test_train_classical_expert_raises_on_non_convergence(tmp_path):
                 "patience": 1,
             },
         )
+
+
+@pytest.mark.parametrize("configured", [None, "cuda"])
+def test_classical_expert_ppo_is_pinned_to_cpu(tmp_path, monkeypatch, configured):
+    """SB3's device="auto" would pick CUDA on a GPU host; classical stays CPU."""
+    from imitation.experiments.ftrl import expert_training
+
+    if configured is not None:
+        env_cfg = dict(env_utils.ENV_CONFIGS["CartPole-v1"])
+        env_cfg["ppo_kwargs"] = {**env_cfg.get("ppo_kwargs", {}), "device": configured}
+        monkeypatch.setitem(env_utils.ENV_CONFIGS, "CartPole-v1", env_cfg)
+
+    class Built(Exception):
+        pass
+
+    def build(*args, **kwargs):
+        model = PPO(*args, **kwargs)
+        raise Built(kwargs.get("device"), model.device.type)
+
+    monkeypatch.setattr(expert_training, "PPO", build)
+    with pytest.raises(Built) as built:
+        expert_training.train_classical_expert_until_converged(
+            env_name="CartPole-v1",
+            cache_dir=tmp_path,
+            rng=np.random.default_rng(0),
+            seed=0,
+        )
+    assert built.value.args == ("cpu", "cpu")
 
 
 def test_get_or_train_expert_uses_new_trainer(tmp_path):

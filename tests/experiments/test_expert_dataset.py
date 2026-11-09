@@ -24,8 +24,10 @@ def test_shared_data_is_collected_once_and_preserves_order(tmp_path):
     first, source1 = load_or_collect(tmp_path, metadata, collect)
     second, source2 = load_or_collect(tmp_path, metadata, collect)
     assert len(calls) == 1
-    np.testing.assert_array_equal(first.obs, second.obs)
-    np.testing.assert_array_equal(first.acts, second.acts)
+    # Collection order must survive the round trip, not merely match itself.
+    for loaded in (first, second):
+        np.testing.assert_array_equal(loaded.obs, [[3], [1], [2]])
+        np.testing.assert_array_equal(loaded.acts, [0, 1, 0])
     assert source1 == source2
     assert source1["sha256"]
     load_or_collect(tmp_path, dict(metadata, seed=8), collect)
