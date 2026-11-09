@@ -1,5 +1,34 @@
 # Proposed agnostic imitation-learning experiment
 
+> **Historical status (added after execution).** Everything below this note
+> is the original pre-execution proposal, kept unchanged as a design record.
+> Statements such as "not implemented", "proposed", or "no result is claimed"
+> describe the situation before execution. The study has since been run and
+> analyzed, but the intended fixed-BC baseline was not implemented correctly.
+> The study is incomplete. See [`agnostic/STUDY_RESULTS.md`](agnostic/STUDY_RESULTS.md)
+> for diagnostic results and [`agnostic/README.md`](agnostic/README.md) for commands. The
+> executed design differs from or narrows this proposal as follows:
+>
+> - Classical: CartPole-v1 and Acrobot-v1 (MountainCar-v0 expert training
+>   failed at its fixed step cap and was not needed as a backup), each with
+>   mild and severe fixed quantizers, 20 seeds (1000..1019), B = 4096,
+>   batch 16, checkpoints 128..4096, 100 evaluation episodes.
+> - Toy: 100 seeds (1000..1099) over the full initial grid, B = 4096,
+>   batch 16, plus a secondary batch 1 versus 64 check at B = 512.
+> - Learners: exact 0-1 ERM only (a per-bin majority table on the fixed
+>   quantizer for classical tasks, and enumeration of the four class policies
+>   for the toy). The raw linear, MLP, and FTRL options were not run.
+> - FTL-DAgger used deferred annotation (the expert labels only retained
+>   states). The output named fixed BC wrongly refits BC-iid's own data and
+>   aliases its evaluation. It is not the intended chronological-prefix BC
+>   and supplies no comparison against that baseline.
+> - Final study-level cost accounting is reported separately in the results
+>   file.
+> - The next proposal reuses the previous training and evaluation pipeline,
+>   targets all eight classical environments, and compares full versus
+>   restricted learner observations. Exact restrictions and numeric settings
+>   require consultation before implementation or new experiments.
+
 Status: design proposal. The controlled environment, independent learner classes,
 misspecification certificates, deferred annotation path, and analysis described
 below are not implemented by this document. Existing baseline-default changes

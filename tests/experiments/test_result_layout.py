@@ -190,7 +190,7 @@ def test_coverage_uses_run_plots_seed_count_and_shared_cache(tmp_path):
     assert coverage[coverage.index("--seed") + 1] == "0"
     assert coverage[coverage.index("--expert-cache") + 1] == "custom-cache"
     assert coverage[coverage.index("--output-dir") + 1] == str(
-        run / "plots/classical/coverage"
+        run / "plots/classical/coverage/CartPole-v1"
     )
     assert runtime[runtime.index("--output-dir") + 1] == str(
         run / "plots/classical/runtime"
