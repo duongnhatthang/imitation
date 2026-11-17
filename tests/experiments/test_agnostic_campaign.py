@@ -2,10 +2,12 @@
 
 Every job is a tiny local Python subprocess. Nothing here contacts a remote
 machine. The runner module is loaded from its file path so that these tests do
-not depend on sibling agnostic modules or on a package ``__init__``.
+not depend on heavier sibling agnostic modules; its only sibling import is the
+stdlib ``resource_budget`` module, so ``src`` must be importable.
 """
 
 import datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -112,6 +114,12 @@ PRODUCER = textwrap.dedent(
             f.write("# mutated\\n")
         write(ok_payload())
         sys.exit(1 if mode.endswith("exit1") else 0)
+    elif mode == "count_leases":
+        leases = [n for n in os.listdir(extra[0]) if not n.startswith(".")]
+        with open(extra[1], "a") as f:
+            f.write("%s %d\\n" % (os.environ["CAMPAIGN_JOB_ID"], len(leases)))
+        time.sleep(0.2)
+        write(ok_payload())
     else:
         sys.exit(9)
     """,
@@ -731,6 +739,247 @@ def test_lock_prevents_second_controller(env):
     env.inventory.mkdir()
     with campaign._exclusive_lock(str(env.inventory)):
         assert env.run() == 2
+
+
+# ---------------------------------------------------------------------------
+# Shared capacity (opt-in)
+# ---------------------------------------------------------------------------
+
+budget_mod = campaign.resource_budget
+
+
+def _peak_concurrency(log):
+    events = sorted(
+        (float(t), kind)
+        for kind, _, t in (line.split() for line in log.read_text().splitlines())
+    )
+    live = peak = 0
+    for _, kind in events:
+        live += 1 if kind == "start" else -1
+        peak = max(peak, live)
+    return peak
+
+
+def _capacity_config(path, limit, externals=()):
+    path.write_text(
+        json.dumps(
+            {"version": 1, "limit": limit, "external_campaigns": list(externals)},
+        ),
+    )
+    return str(path)
+
+
+def _budget(tmp_path, limit, externals=()):
+    config = budget_mod.load_config(
+        _capacity_config(tmp_path / "capacity.json", limit, externals),
+        campaign.MAX_WORKERS,
+    )
+    return budget_mod.CapacityBudget(
+        config,
+        str(tmp_path / "budget"),
+        campaign.inventory_capacity_charge,
+    )
+
+
+def _external(root, name, workers, states, controller_pid=None, ended=False, pgids=()):
+    """Fabricate another campaign's inventory directory (read-only for budget)."""
+    directory = root / name
+    directory.mkdir()
+    manifest = {
+        "campaign_id": name,
+        "jobs": [{"id": f"j{i}"} for i in range(len(states))],
+    }
+    (directory / "manifest.canonical.json").write_text(json.dumps(manifest))
+    sha = hashlib.sha256(campaign.canonical_json(manifest).encode()).hexdigest()
+    pgids = dict(pgids)
+    jobs = {
+        f"j{i}": {
+            "state": state,
+            "attempts": (
+                []
+                if state == "pending"
+                else [{"state": state, "pgid": pgids.get(f"j{i}")}]
+            ),
+        }
+        for i, state in enumerate(states)
+    }
+    run = {
+        "controller_pid": controller_pid or os.getpid(),
+        "workers": workers,
+        "ended_at": _in(0) if ended else None,
+    }
+    inv = {"version": 1, "manifest_sha256": sha, "controller_runs": [run], "jobs": jobs}
+    (directory / "inventory.json").write_text(json.dumps(inv))
+    return {"inventory_dir": str(directory), "manifest_sha256": sha}
+
+
+def _states(complete, running, pending):
+    return ["complete"] * complete + ["running"] * running + ["pending"] * pending
+
+
+def _dead_pid():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_active_external_campaigns_reserve_min_workers_open_jobs(tmp_path):
+    externals = [
+        _external(tmp_path, "taxi", 2, _states(5, 2, 3)),
+        _external(tmp_path, "lunar", 1, _states(2, 1, 27)),
+        _external(tmp_path, "generic", 1, _states(10, 1, 14)),
+    ]
+    budget = _budget(tmp_path, 8, externals)
+    grants = []
+    while True:
+        lease_id, usage = budget.try_acquire({})
+        if lease_id is None:
+            break
+        grants.append(lease_id)
+    assert len(grants) == 4
+    assert [r["charge"] for r in usage["external"]] == [2, 1, 1]
+    assert usage["used"] == 8
+    # Tail of a two-worker campaign: one running, none pending, charges one.
+    tail = _external(tmp_path, "tail", 2, _states(9, 1, 0))
+    assert campaign.inventory_capacity_charge(tail)["charge"] == 1
+    # A finished campaign whose controller ended releases its reservation.
+    done = _external(tmp_path, "done", 2, _states(10, 0, 0), ended=True)
+    assert campaign.inventory_capacity_charge(done)["charge"] == 0
+
+
+def test_dead_external_controller_orphans_stay_charged(tmp_path):
+    sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        entry = _external(
+            tmp_path,
+            "crashed",
+            2,
+            ["running", "interrupted", "running", "complete", "pending"],
+            controller_pid=_dead_pid(),
+            pgids={"j0": sleeper.pid, "j1": _dead_pid()},
+        )
+        report = campaign.inventory_capacity_charge(entry)
+        assert not report["controller_active"] and report["reserved"] == 0
+        # j0: live orphan group. j2: running with no recorded group, so a
+        # crash between fork and record cannot be ruled out.
+        assert (report["orphan_groups"], report["unverifiable_attempts"]) == (1, 1)
+        assert report["charge"] == 2
+    finally:
+        os.killpg(sleeper.pid, signal.SIGKILL)
+        sleeper.wait()
+    assert campaign.inventory_capacity_charge(entry)["charge"] == 1
+
+
+def test_missing_or_mismatched_external_state_fails_closed(tmp_path):
+    good = _external(tmp_path, "good", 1, _states(0, 1, 1))
+    cases = {
+        "wrong_hash": dict(good, manifest_sha256="0" * 64),
+        "missing": dict(good, inventory_dir=str(tmp_path / "absent")),
+    }
+    malformed = _external(tmp_path, "malformed", 1, _states(0, 1, 1))
+    (pathlib.Path(malformed["inventory_dir"]) / "inventory.json").write_text("{")
+    cases["malformed"] = malformed
+    rebound = _external(tmp_path, "rebound", 1, _states(0, 1, 1))
+    inv_path = pathlib.Path(rebound["inventory_dir"]) / "inventory.json"
+    inv = json.loads(inv_path.read_text())
+    inv["manifest_sha256"] = "f" * 64
+    inv_path.write_text(json.dumps(inv))
+    cases["rebound"] = rebound
+    for name, entry in cases.items():
+        with pytest.raises(budget_mod.CapacityError):
+            campaign.inventory_capacity_charge(entry)
+        root = tmp_path / f"budget-{name}"
+        root.mkdir()
+        lease_id, usage = _budget(root, 8, [entry]).try_acquire({})
+        assert lease_id is None and "refused" in usage, name
+
+
+def test_runner_holds_lease_from_launch_until_reaped(env, monkeypatch):
+    monkeypatch.setattr(campaign, "CAPACITY_RETRY_SECONDS", 0.02)
+    leases, log = env.root / "budget" / "leases", env.root / "leases.log"
+    jobs = [env.job(j, "count_leases", leases, log) for j in ("a", "b")]
+    # A bounded stage turns a leaked lease into a failure instead of a hang.
+    env.write_manifest(jobs, stage=_in(30))
+    config = _capacity_config(env.root / "capacity.json", 1)
+    flags = (
+        "--capacity-config",
+        config,
+        "--capacity-state-dir",
+        str(env.root / "budget"),
+    )
+    assert env.run(*flags, workers=2) == 0
+    # Each job saw exactly its own lease: the limit, not workers, bounded it.
+    assert sorted(log.read_text().split("\n")[:-1]) == ["a 1", "b 1"]
+    assert os.listdir(leases) == []
+    inv = env.inventory_json()
+    assert inv["controller_runs"][-1]["capacity"]["limit"] == 1
+    grants = [inv["jobs"][j]["attempts"][0]["capacity"] for j in ("a", "b")]
+    assert grants[0]["lease_id"] != grants[1]["lease_id"]
+    assert grants[1]["waited_seconds"] > 0
+
+
+def test_capacity_wait_respects_deadline_without_marking_running(env, monkeypatch):
+    monkeypatch.setattr(campaign, "CAPACITY_RETRY_SECONDS", 0.02)
+    budget = _budget(env.root, 1)
+    held, _ = budget.try_acquire({"holder": "test"})
+    seen = []
+    original = campaign.CampaignRunner._save
+
+    def recording_save(self):
+        seen.append(self.inv["jobs"]["a"]["state"])
+        original(self)
+
+    monkeypatch.setattr(campaign.CampaignRunner, "_save", recording_save)
+    env.write_manifest([env.job("a", "ok")], stage=_in(1.0))
+    flags = ("--capacity-config", budget.config["path"])
+    assert env.run(*flags, "--capacity-state-dir", budget.state_dir) == 1
+    row = env.inventory_json()["jobs"]["a"]
+    assert (row["state"], row["state_reason"]) == ("cancelled", "stage_deadline")
+    assert row["attempts"] == [] and "running" not in seen
+    last_wait = env.inventory_json()["controller_runs"][-1]["capacity"]["last_wait"]
+    assert last_wait["summary"] == "1/1 used"
+    assert os.listdir(budget.lease_dir) == [f"{held}.json"]
+
+
+def test_two_controllers_share_one_limit(tmp_path):
+    log = tmp_path / "track.log"
+    envs = [Env(tmp_path / name) for name in ("first", "second")]
+    config = _capacity_config(tmp_path / "capacity.json", 2)
+    procs = []
+    for e in envs:
+        e.write_manifest([e.job(f"j{i}", "track", log) for i in range(3)])
+        procs.append(
+            e.spawn_runner(
+                "--workers",
+                "2",
+                "--capacity-config",
+                config,
+                "--capacity-state-dir",
+                str(tmp_path / "budget"),
+            ),
+        )
+    for proc in procs:
+        out, _ = proc.communicate(timeout=120)
+        assert proc.returncode == 0, out.decode()
+    assert len(log.read_text().splitlines()) == 12
+    assert _peak_concurrency(log) == 2
+    assert os.listdir(tmp_path / "budget" / "leases") == []
+
+
+def test_capacity_flags_optional_and_default_unchanged(env):
+    env.write_manifest([env.job("a", "ok")])
+    config = _capacity_config(env.root / "capacity.json", 2)
+    bad = _capacity_config(env.root / "bad.json", campaign.MAX_WORKERS + 1)
+    state = str(env.root / "budget")
+    assert env.run("--capacity-config", config) == 2
+    assert env.run("--capacity-state-dir", state) == 2
+    assert env.run("--capacity-config", bad, "--capacity-state-dir", state) == 2
+    assert not env.inventory.exists()
+    assert env.run() == 0
+    inv = env.inventory_json()
+    assert "capacity" not in inv["controller_runs"][-1]
+    assert "capacity" not in inv["jobs"]["a"]["attempts"][0]
+    assert not os.path.exists(state)
 
 
 # ---------------------------------------------------------------------------

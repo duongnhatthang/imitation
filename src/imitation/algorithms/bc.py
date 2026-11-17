@@ -361,8 +361,12 @@ class BC(algo_base.DemonstrationAlgorithm):
             if "weight_decay" in optimizer_kwargs:  # pragma: no cover
                 raise ValueError("Use the parameter l2_weight instead of weight_decay.")
         optimizer_kwargs = optimizer_kwargs or {}
+        # A policy may declare the only parameters its optimizer may own (for
+        # example a student whose frozen encoder and critic must stay out).
+        # Policies without the hook keep the original rule: every parameter.
+        owned = getattr(self.policy, "bc_optimizer_parameters", None)
         self.optimizer = optimizer_cls(
-            self.policy.parameters(),
+            self.policy.parameters() if owned is None else owned(),
             **optimizer_kwargs,
         )
 

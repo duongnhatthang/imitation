@@ -93,6 +93,88 @@ FIT_NLL_FLOOR_RULE = 0.05
 FIT_MAX_EPOCHS = 20000
 FIT_MAX_STEPS = 20000
 
+# Opt-in fitting and evaluation protocol of ``ExperimentConfig.paired_cold_fits``.
+# Every fit is a cold fit on N retained labels whose head initialization,
+# loader shuffle, NumPy trainer stream and held-out split come from dedicated
+# streams keyed by (seed, N), inside a scoped torch RNG; evaluation at budget N
+# resets each of its episodes explicitly with its own seed from a list keyed by
+# (seed, N) (`paired_episode_seeds`). So the same N labels give the same fit,
+# and every method evaluated at budget N starts episode i from the same initial
+# state, whatever ran before and however earlier episodes ended.
+PAIRED_COLD_FITS_PROTOCOL = "paired-cold-fits/1"
+# SeedSequence spawn keys of the paired streams.
+_PAIRED_FIT_KEY, _PAIRED_EVAL_KEY = 101, 102
+
+
+def paired_fit_seeds(seed: int, n_labels: int) -> Dict[str, int]:
+    """Seeds of the paired cold fit on ``n_labels`` retained labels."""
+    state = np.random.SeedSequence(
+        int(seed),
+        spawn_key=(_PAIRED_FIT_KEY, int(n_labels)),
+    ).generate_state(3)
+    return {
+        "init": int(state[0]),
+        "shuffle": int(state[1]),
+        "numpy": int(state[2]),
+    }
+
+
+def paired_eval_seed(seed: int, budget: int) -> int:
+    """Environment seed of the paired evaluation at ``budget`` labels."""
+    state = np.random.SeedSequence(
+        int(seed),
+        spawn_key=(_PAIRED_EVAL_KEY, int(budget)),
+    ).generate_state(1)
+    return int(state[0])
+
+
+def paired_episode_seeds(
+    eval_seed: int,
+    n_episodes: int = EVAL_EPISODES,
+) -> List[int]:
+    """Distinct reset seeds of the episodes of one seeded evaluation.
+
+    Episode ``i`` resets with ``(eval_seed + i) mod 2**32``, so the list is
+    fixed by ``eval_seed`` alone and its entries are distinct while
+    ``n_episodes <= 2**32``.
+    """
+    return [(int(eval_seed) + i) % (2**32) for i in range(int(n_episodes))]
+
+
+def _paired_fit_kwargs(config, n_labels: int) -> Dict[str, int]:
+    """``_inner_train`` keywords of a paired fit; none for legacy configs."""
+    return {"n_labels": int(n_labels)} if config.paired_cold_fits else {}
+
+
+def _paired_eval_kwargs(config, budget: int) -> Dict[str, int]:
+    """``_compute_round_eval`` keywords of a paired run; none for legacy ones."""
+    if not config.paired_cold_fits:
+        return {}
+    return {"eval_seed": paired_eval_seed(config.seed, budget)}
+
+
+def pairs_sha256(obs: np.ndarray, acts: np.ndarray) -> str:
+    """Digest of supervised (observation, expert action) pairs, in order.
+
+    Observations are hashed as float32 and actions as int64 with their
+    shapes, so the digest identifies training data independently of storage.
+    """
+    obs = np.ascontiguousarray(obs, dtype=np.float32)
+    acts = np.ascontiguousarray(acts, dtype=np.int64)
+    if len(obs) != len(acts):
+        raise ValueError("obs and acts differ in length")
+    digest = hashlib.sha256()
+    for name, array in (("obs", obs), ("acts", acts)):
+        digest.update(name.encode("utf-8"))
+        digest.update(str(array.shape).encode("utf-8"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+# Methods whose round-t data never depend on the learner: a fit that is not
+# evaluated cannot influence anything later, so it is skipped
+# (``skip_unreported_fits``). FTL/FTRL collect with the learner and fit every
+# round.
+DATA_INDEPENDENT_ALGOS = ("bc_iid", "bc_prefix", "bc_pool")
+
 
 def _seed_everything(seed: int) -> None:
     """Seed every global RNG a cell can reach.
@@ -114,6 +196,10 @@ def _config_metadata(config):
     settings = dataclasses.asdict(config)
     for key in ("output_dir", "expert_cache_dir"):
         settings[key] = str(settings[key])
+    # Recorded only when enabled, so legacy configs serialize as before.
+    if settings.pop("paired_cold_fits"):
+        settings["paired_cold_fits"] = True
+        settings["paired_cold_fits_protocol"] = PAIRED_COLD_FITS_PROTOCOL
     settings["protocol_version"] = 6
     digest = hashlib.sha256()
     for name in (
@@ -185,7 +271,8 @@ def resolve_envs(
         return env_utils.ENV_GROUPS[env_group]
     if envs:
         return envs
-    return list(env_utils.ENV_CONFIGS.keys())  # default: classical only
+    # Default: the classical group, which excludes the optional variants.
+    return list(env_utils.ENV_GROUPS["classical"])
 
 
 @dataclasses.dataclass
@@ -252,6 +339,10 @@ class ExperimentConfig:
     fit_nll_floor: float = FIT_NLL_FLOOR_RULE
     fit_max_epochs: int = FIT_MAX_EPOCHS
     fit_max_steps: int = FIT_MAX_STEPS
+    # Skip fits of `DATA_INDEPENDENT_ALGOS` at rounds that are not evaluated.
+    skip_unreported_fits: bool = False
+    # Opt-in `PAIRED_COLD_FITS_PROTOCOL`: cold fits only, keyed by (seed, N).
+    paired_cold_fits: bool = False
 
     def __post_init__(self) -> None:
         if self.eval_episodes < 1:
@@ -267,6 +358,14 @@ class ExperimentConfig:
             raise ValueError("fit epochs, window and caps must be positive")
         if self.beta_rampdown < 0:
             raise ValueError("beta_rampdown must be non-negative")
+        if self.paired_cold_fits:
+            if self.warm_start:
+                raise ValueError("paired_cold_fits has cold fits only: warm_start")
+            if self.algo in ROUND_LOOP_ALGOS and not self.grow_batch_with_data:
+                raise ValueError(
+                    "paired_cold_fits uses the fixed-BC batch rule: "
+                    "grow_batch_with_data must be True",
+                )
         if self.subsample_strategy is None:
             self.subsample_strategy = (
                 "prefix" if self.algo in ("bc", "bc_prefix") else "uniform"
@@ -297,27 +396,52 @@ def _compute_round_eval(
     baselines: Dict[str, float],
     *,
     n_episodes: Optional[int] = None,
+    eval_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Roll out the current policy, evaluate all metrics on that rollout only.
 
-    ``n_episodes`` deterministic episodes (default `EVAL_EPISODES`).
+    With ``eval_seed`` every episode is reset explicitly with its own seed
+    from `paired_episode_seeds` (``eval_seed + i`` modulo 2**32 for episode
+    ``i``), so episode ``i`` starts from the same initial state for any policy
+    and whatever the environment did before, even when earlier episodes had
+    different lengths. ``eval_seed`` and the seed list
+    (``evaluation_episode_seeds``) are recorded. Without it the rollout is the
+    original one: a single reset, then VecEnv auto-resets.
 
     Returns a dict with ``rollout_cross_entropy``,
-    ``expert_rollout_cross_entropy``, ``normalized_return``,
-    ``disagreement_rate``, ``d_eval_size``.
+    ``expert_rollout_cross_entropy``, ``normalized_return`` (unclipped),
+    ``disagreement_rate``, ``d_eval_size``, ``episode_returns`` and, when the
+    rollout reports them, the optional episode evidence of
+    ``eval_utils.episode_evidence`` (``episode_lengths``,
+    ``episode_terminated``, ``episode_truncated``, ``episode_successes``,
+    ``evaluation_episode_seeds``, ``initial_state_digests``, ``success_rule``,
+    ``termination_flag_source``, ``reset_accounting``). Absent evidence is
+    omitted, never filled in. ``evaluation_deterministic`` is always recorded:
+    the ``deterministic`` argument the rollout was actually called with.
     """
-    from imitation.experiments.ftrl.eval_utils import (
-        compute_sampled_action_ce,
-        eval_policy_rollout,
-    )
+    from imitation.experiments.ftrl import eval_utils
 
-    eval_res = eval_policy_rollout(
-        policy,
-        venv,
-        n_episodes=EVAL_EPISODES if n_episodes is None else int(n_episodes),
-        deterministic=True,
-        expert_policy=expert_policy,
-    )
+    compute_sampled_action_ce = eval_utils.compute_sampled_action_ce
+    deterministic = True
+    episode_count = EVAL_EPISODES if n_episodes is None else int(n_episodes)
+    if eval_seed is None:
+        # The original call, so wrappers with the original signature still work.
+        eval_res = eval_utils.eval_policy_rollout(
+            policy,
+            venv,
+            n_episodes=episode_count,
+            deterministic=deterministic,
+            expert_policy=expert_policy,
+        )
+    else:
+        eval_res = eval_utils.eval_policy_rollout(
+            policy,
+            venv,
+            n_episodes=episode_count,
+            deterministic=deterministic,
+            expert_policy=expert_policy,
+            episode_seeds=paired_episode_seeds(eval_seed, episode_count),
+        )
     obs = eval_res.rollout_batch.obs
     expert_acts = eval_res.rollout_batch.expert_actions
 
@@ -332,7 +456,7 @@ def _compute_round_eval(
     else:
         norm_ret = (eval_res.mean_return - random_ret) / score_range
 
-    return {
+    result = {
         "rollout_cross_entropy": round(float(rollout_ce), 6),
         "expert_rollout_cross_entropy": round(float(expert_rollout_ce), 6),
         "normalized_return": round(float(norm_ret), 6),
@@ -340,7 +464,36 @@ def _compute_round_eval(
         "d_eval_size": int(obs.shape[0]),
         "episode_returns": [float(value) for value in eval_res.episode_returns],
         "evaluation_episodes": len(eval_res.episode_returns),
+        "evaluation_deterministic": deterministic,
     }
+    # Optional per-episode outcomes; absent from older rollout results.
+    for key, cast in (
+        ("episode_lengths", int),
+        ("episode_terminated", bool),
+        ("episode_truncated", bool),
+        ("episode_successes", bool),
+    ):
+        values = getattr(eval_res, key, None)
+        if values is not None:
+            result[key] = [None if v is None else cast(v) for v in values]
+    for key, value in _episode_evidence(eval_utils, eval_res).items():
+        if key not in result and value is not None:
+            result[key] = value
+    if eval_seed is not None:
+        result["eval_seed"] = int(eval_seed)
+    if eval_seed is not None and result.get("evaluation_episode_seeds") != (
+        paired_episode_seeds(eval_seed, episode_count)
+    ):
+        raise RuntimeError("the rollout did not report the requested episode seeds")
+    return result
+
+
+def _episode_evidence(eval_utils, eval_res) -> Dict[str, Any]:
+    """``eval_utils.episode_evidence`` of a full result, else nothing."""
+    evidence = getattr(eval_utils, "episode_evidence", None)
+    if evidence is None or not hasattr(eval_res, "reset_accounting"):
+        return {}
+    return evidence(eval_res)
 
 
 def eval_rounds(n_rounds: int, eval_interval: int = EVAL_INTERVAL) -> List[int]:
@@ -753,6 +906,8 @@ def _inner_train(
     config: "ExperimentConfig",
     round_num: int,
     is_dagger: bool,
+    *,
+    n_labels: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run one round of inner BC training, with optional val-split early stopping.
 
@@ -761,7 +916,7 @@ def _inner_train(
     through ``extend_and_update`` so the round counter advances and demos
     aggregate; fixed BC calls ``bc_trainer.train`` directly.
 
-    The val-split early-stop branch lands in Task 7.
+    With ``config.paired_cold_fits`` the fit is `_paired_inner_train` instead.
 
     Args:
         trainer_or_bc: A ``SimpleDAggerTrainer`` (or subclass) if ``is_dagger``;
@@ -772,23 +927,50 @@ def _inner_train(
             ``inner_early_stop=True``).
         is_dagger: ``True`` routes to ``extend_and_update``; ``False`` routes to
             ``bc_trainer.train``.
+        n_labels: Retained labels the fit trains on; required by, and only
+            used by, ``paired_cold_fits``.
 
     Returns:
         Dict with keys ``inner_es_stop_epoch`` (int, equals ``bc_n_epochs`` when
         early-stop didn't fire), ``inner_es_val_nll_best`` (float or None),
         ``inner_es_val_nll_trajectory`` (list[float]), ``inner_es_fallback``
         (str | None), and the `_bound_loader_sizes` of the loader trained on.
+        Paired fits add the ``fit_*`` provenance of `_paired_inner_train`.
+
+    Raises:
+        ValueError: ``paired_cold_fits`` without ``n_labels``.
     """
+    if config.paired_cold_fits:
+        if n_labels is None:
+            raise ValueError("paired_cold_fits needs n_labels")
+        return _paired_inner_train(trainer_or_bc, config, is_dagger, int(n_labels))
     if config.fit_rule == FIT_RULE_PLATEAU:
         return _plateau_inner_train(trainer_or_bc, config, is_dagger)
     max_epochs = int(config.bc_n_epochs)
 
     if not config.inner_early_stop:
         if is_dagger:
-            trainer_or_bc.extend_and_update({"n_epochs": max_epochs})
+            # The round's data are loaded inside extend_and_update, so the
+            # monitor resolves them at its first per-epoch measurement.
+            monitor = _FitMonitor(
+                trainer_or_bc.bc_trainer.policy,
+                lambda: rollout.flatten_trajectories(trainer_or_bc._all_demos),
+            )
+            trainer_or_bc.extend_and_update(
+                {"n_epochs": max_epochs, "on_epoch_end": monitor.record},
+            )
             sizes = _bound_loader_sizes(trainer_or_bc.bc_trainer)
         else:
-            trainer_or_bc.train(n_epochs=max_epochs, progress_bar=False)
+            monitor = _FitMonitor(
+                trainer_or_bc.policy,
+                trainer_or_bc._demo_data_loader.dataset,
+            )
+            monitor.start()
+            trainer_or_bc.train(
+                n_epochs=max_epochs,
+                progress_bar=False,
+                on_epoch_end=monitor.record,
+            )
             sizes = _bound_loader_sizes(trainer_or_bc)
         return {
             "inner_es_stop_epoch": max_epochs,
@@ -796,6 +978,11 @@ def _inner_train(
             "inner_es_val_nll_trajectory": [],
             "inner_es_fallback": None,
             **sizes,
+            **monitor.summary(
+                max_epochs,
+                early_stopped=False,
+                batches_per_epoch=sizes.get("train_batches_per_epoch"),
+            ),
         }
 
     # --- inner_early_stop=True: held-out-val early stopping ---
@@ -828,7 +1015,13 @@ def _inner_train(
     if train_idx is None:
         # Dataset too small for a meaningful val split → fixed budget on full set.
         sizes = _bound_loader_sizes(bc_trainer)
-        bc_trainer.train(n_epochs=max_epochs, progress_bar=False)
+        monitor = _FitMonitor(bc_trainer.policy, full_transitions)
+        monitor.start()
+        bc_trainer.train(
+            n_epochs=max_epochs,
+            progress_bar=False,
+            on_epoch_end=monitor.record,
+        )
         if is_dagger and dagger_current_round is not None:
             trainer_or_bc.track_round_loss(dagger_current_round)
         return {
@@ -837,8 +1030,33 @@ def _inner_train(
             "inner_es_val_nll_trajectory": [],
             "inner_es_fallback": "dataset_too_small",
             **sizes,
+            **monitor.summary(
+                max_epochs,
+                early_stopped=False,
+                batches_per_epoch=sizes.get("train_batches_per_epoch"),
+            ),
         }
 
+    log, _, _ = _holdout_fit(bc_trainer, config, full_transitions, train_idx, val_idx)
+
+    # 9. For DAgger callers, append per-round metrics now that training is
+    #    done. extend_only deferred this step so we could insert the val
+    #    split + ES loop between data load and metric tracking.
+    if is_dagger and dagger_current_round is not None:
+        trainer_or_bc.track_round_loss(dagger_current_round)
+    return log
+
+
+def _holdout_fit(bc_trainer, config, full_transitions, train_idx, val_idx):
+    """Fit on the ``train_idx`` slice with val-NLL early stopping on ``val_idx``.
+
+    Leaves the trainer bound to ``full_transitions`` with its batch sizes
+    restored, as ``_inner_train`` always has.
+
+    Returns:
+        The inner-training log and the train and validation subsets.
+    """
+    max_epochs = int(config.bc_n_epochs)
     # 4. Carve the train and val slices.
     if isinstance(full_transitions, types.TransitionsMinimal):
         # TransitionsMinimal.__getitem__ only accepts int/slice; build new
@@ -874,6 +1092,8 @@ def _inner_train(
         bc_trainer.batch_size = bc_trainer.minibatch_size = len(train_subset)
     bc_trainer.set_demonstrations(train_subset)
     sizes = _bound_loader_sizes(bc_trainer)
+    monitor = _FitMonitor(bc_trainer.policy, train_subset)
+    monitor.start()
 
     # 6. Loop epochs with val-NLL early stop.
     patience = int(config.inner_early_stop_patience)
@@ -884,8 +1104,10 @@ def _inner_train(
     patience_ctr = 0
     val_nll_trajectory: List[float] = []
     stop_epoch = max_epochs
+    early_stopped = False
     for epoch in range(max_epochs):
         bc_trainer.train(n_epochs=1, progress_bar=False, reset_tensorboard=False)
+        monitor.record()
         val_nll = _compute_val_nll(
             bc_trainer.policy,
             val_obs,
@@ -901,6 +1123,7 @@ def _inner_train(
             patience_ctr += 1
         if epoch + 1 >= min_epochs and patience_ctr >= patience:
             stop_epoch = epoch + 1
+            early_stopped = True
             break
 
     # 7. Restore best weights (if we ever saw an improvement). Note: only the
@@ -910,17 +1133,17 @@ def _inner_train(
     #    DAgger; revisit if we observe instability in wave-1 traces.
     if best_state is not None:
         bc_trainer.policy.load_state_dict(best_state)
+    fit_monitor = monitor.summary(
+        max_epochs,
+        early_stopped=early_stopped,
+        batches_per_epoch=sizes.get("train_batches_per_epoch"),
+        val_trajectory=val_nll_trajectory,
+    )
 
     # 8. Restore the full data loader for subsequent training and diagnostics.
     bc_trainer.batch_size = original_batch_size
     bc_trainer.minibatch_size = original_minibatch_size
     bc_trainer.set_demonstrations(full_transitions)
-
-    # 9. For DAgger callers, append per-round metrics now that training is
-    #    done. extend_only deferred this step so we could insert the val
-    #    split + ES loop between data load and metric tracking.
-    if is_dagger and dagger_current_round is not None:
-        trainer_or_bc.track_round_loss(dagger_current_round)
 
     # Compute the actually-best logged val NLL across the trajectory. This
     # differs from `best_val` when the very first val_nll was finite but
@@ -928,13 +1151,167 @@ def _inner_train(
     # stays None but the trajectory still has finite values worth reporting.
     finite_traj = [v for v in val_nll_trajectory if math.isfinite(v)]
     val_nll_best = min(finite_traj) if finite_traj else None
-    return {
+    log = {
         "inner_es_stop_epoch": stop_epoch,
         "inner_es_val_nll_best": val_nll_best,
         "inner_es_val_nll_trajectory": val_nll_trajectory,
         "inner_es_fallback": None,
         **sizes,
+        **fit_monitor,
     }
+    return log, train_subset, val_subset
+
+
+def _scoped_torch_rng(policy):
+    """Fork the torch CPU RNG, and the policy's CUDA device RNG if it has one."""
+    device = policy.device
+    if device.type == "cuda":
+        index = th.cuda.current_device() if device.index is None else device.index
+        return th.random.fork_rng(devices=[index])
+    return th.random.fork_rng(devices=[])
+
+
+def _paired_cold_reset(bc_trainer) -> None:
+    """Fresh trainable parameters and a fresh Adam, from the ambient torch RNG.
+
+    Trainable matrices get Xavier-uniform and vectors zeros, as in
+    ``FTRLTrainer._reinitialize_trainable_params``; frozen features are never
+    touched.
+    """
+    for param in bc_trainer.policy.parameters():
+        if param.requires_grad and param.dim() >= 2:
+            th.nn.init.xavier_uniform_(param)
+        elif param.requires_grad and param.dim() == 1:
+            th.nn.init.zeros_(param)
+    bc_trainer.optimizer.state.clear()
+    bc_trainer.optimizer.zero_grad(set_to_none=True)
+
+
+def _transitions_pairs_sha256(transitions) -> Optional[str]:
+    if transitions is None:
+        return None
+    if isinstance(transitions, list):
+        # The list-of-dicts form `_holdout_fit` also accepts.
+        if not transitions:
+            return pairs_sha256(np.zeros((0,)), np.zeros((0,)))
+        return pairs_sha256(
+            np.stack([np.asarray(t["obs"]) for t in transitions]),
+            np.stack([np.asarray(t["acts"]) for t in transitions]),
+        )
+    return pairs_sha256(np.asarray(transitions.obs), np.asarray(transitions.acts))
+
+
+def _paired_inner_train(
+    trainer_or_bc,
+    config: "ExperimentConfig",
+    is_dagger: bool,
+    n_labels: int,
+) -> Dict[str, Any]:
+    """One cold fit of `PAIRED_COLD_FITS_PROTOCOL` on ``n_labels`` labels.
+
+    Everything runs inside a forked torch RNG, so the ambient torch stream is
+    restored on exit, and draws only from streams keyed by (seed, N):
+
+    1. reseed torch with the ``init`` seed, reinitialize the trainable head
+       and clear Adam (`_paired_cold_reset`), before any data are loaded;
+    2. load the data: a DAgger caller aggregates its round demos with
+       ``extend_only`` with the trainer's own head reset suppressed (and its
+       loader peeks confined to this scope); fixed BC already holds them;
+    3. split the held-out slice with ``(seed, N)``, whatever the round;
+    4. reseed torch with the ``shuffle`` seed and swap in a NumPy trainer
+       stream from the ``numpy`` seed, then build the training loader and fit.
+
+    The batch is the fixed-BC rule, min(bc_batch_size, N), shrunk to the
+    training split as usual. So fixed BC on N labels and a round-loop fit on
+    the same N labels perform identical operations from identical states.
+
+    Returns:
+        The usual inner-training log plus ``fit_protocol``, ``fit_labels``,
+        ``fit_seed_key``, ``fit_seeds`` and the pair digests of the fitted
+        data, training split and validation split.
+
+    Raises:
+        RuntimeError: The loaded data do not hold exactly ``n_labels`` labels.
+    """
+    bc_trainer = trainer_or_bc.bc_trainer if is_dagger else trainer_or_bc
+    seeds = paired_fit_seeds(config.seed, n_labels)
+    max_epochs = int(config.bc_n_epochs)
+    ambient_numpy = bc_trainer.rng
+    dagger_current_round = None
+    with _scoped_torch_rng(bc_trainer.policy):
+        th.manual_seed(seeds["init"])
+        _paired_cold_reset(bc_trainer)
+        bc_trainer.batch_size = bc_trainer.minibatch_size = max(
+            1,
+            min(int(config.bc_batch_size), n_labels),
+        )
+        if is_dagger:
+            warm_start = trainer_or_bc.warm_start
+            trainer_or_bc.warm_start = True  # the head was reset above
+            try:
+                dagger_current_round = trainer_or_bc.extend_only()
+            finally:
+                trainer_or_bc.warm_start = warm_start
+            full_transitions = rollout.flatten_trajectories(trainer_or_bc._all_demos)
+        else:
+            full_transitions = bc_trainer._demo_data_loader.dataset
+        if len(full_transitions) != n_labels:
+            raise RuntimeError(
+                f"paired fit expected {n_labels} labels, loaded "
+                f"{len(full_transitions)}",
+            )
+        if config.fit_rule == FIT_RULE_EPOCHS and config.inner_early_stop:
+            train_idx, val_idx = _split_transitions_for_val(
+                n_transitions=n_labels,
+                seed=int(config.seed),
+                round_num=n_labels,
+                val_frac=float(config.inner_early_stop_val_frac),
+                min_val_size=int(config.inner_early_stop_min_val_size),
+            )
+        else:
+            train_idx = val_idx = None
+        th.manual_seed(seeds["shuffle"])
+        bc_trainer.rng = np.random.default_rng(seeds["numpy"])
+        try:
+            if config.fit_rule == FIT_RULE_PLATEAU:
+                log = _plateau_fit(bc_trainer, config, full_transitions)
+                train_subset, val_subset = full_transitions, None
+            elif train_idx is None:
+                bc_trainer.set_demonstrations(full_transitions)
+                sizes = _bound_loader_sizes(bc_trainer)
+                bc_trainer.train(n_epochs=max_epochs, progress_bar=False)
+                train_subset, val_subset = full_transitions, None
+                log = {
+                    "inner_es_stop_epoch": max_epochs,
+                    "inner_es_val_nll_best": None,
+                    "inner_es_val_nll_trajectory": [],
+                    "inner_es_fallback": (
+                        "dataset_too_small" if config.inner_early_stop else None
+                    ),
+                    **sizes,
+                }
+            else:
+                log, train_subset, val_subset = _holdout_fit(
+                    bc_trainer,
+                    config,
+                    full_transitions,
+                    train_idx,
+                    val_idx,
+                )
+        finally:
+            bc_trainer.rng = ambient_numpy
+    if dagger_current_round is not None:
+        trainer_or_bc.track_round_loss(dagger_current_round)
+    log.update(
+        fit_protocol=PAIRED_COLD_FITS_PROTOCOL,
+        fit_labels=n_labels,
+        fit_seed_key=[int(config.seed), n_labels],
+        fit_seeds=seeds,
+        fit_data_pairs_sha256=_transitions_pairs_sha256(full_transitions),
+        fit_train_pairs_sha256=_transitions_pairs_sha256(train_subset),
+        fit_val_pairs_sha256=_transitions_pairs_sha256(val_subset),
+    )
+    return log
 
 
 def _should_outer_early_stop(
@@ -1469,6 +1846,13 @@ def _run_dagger_variant(
     disagreement_history: List[float] = []
     per_round: List[Dict[str, Any]] = []
 
+    if config.paired_cold_fits:
+        # The untrained round-0 head is the paired cold head on 0 labels, so it
+        # does not depend on the RNG history of policy construction either.
+        with _scoped_torch_rng(bc_trainer.policy):
+            th.manual_seed(paired_fit_seeds(config.seed, 0)["init"])
+            _paired_cold_reset(bc_trainer)
+
     # Round 0: evaluate the fresh (untrained) policy.
     eval_start = time.monotonic()
     round0_eval = _compute_round_eval(
@@ -1477,8 +1861,9 @@ def _run_dagger_variant(
         venv,
         baselines,
         n_episodes=_eval_episodes(config, final=config.n_rounds == 0),
+        **_paired_eval_kwargs(config, 0),
     )
-    round0_eval["checkpoint"] = _save_policy(config, policy, 0)
+    round0_eval.update(_checkpoint_fields(config, policy, 0))
     disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
         {
@@ -1568,7 +1953,28 @@ def _run_dagger_variant(
             bc_trainer.batch_size = bc_trainer.minibatch_size = max(
                 1, min(config.bc_batch_size, accumulated)
             )
-        inner_log = _inner_train(trainer, config, round_num=round_num, is_dagger=True)
+        if (
+            config.skip_unreported_fits
+            and config.algo in DATA_INDEPENDENT_ALGOS
+            and round_num not in evaluated_rounds
+        ):
+            # Load this round's data and advance, without training: this fit
+            # is never evaluated and cannot affect later data.
+            warm_start = trainer.warm_start
+            trainer.warm_start = True
+            try:
+                trainer.extend_only()
+            finally:
+                trainer.warm_start = warm_start
+            inner_log = {"fit_skipped": True}
+        else:
+            inner_log = _inner_train(
+                trainer,
+                config,
+                round_num=round_num,
+                is_dagger=True,
+                **_paired_fit_kwargs(config, cum_obs + config.samples_per_round),
+            )
         cum_obs += config.samples_per_round
 
         # --- Evaluate the policy at the reported training budget ---
@@ -1586,6 +1992,7 @@ def _run_dagger_variant(
                 venv,
                 baselines,
                 n_episodes=_eval_episodes(config, final=is_final),
+                **_paired_eval_kwargs(config, cum_obs),
             )
             disagreement_history.append(eval_data["disagreement_rate"])
             logger.info(
@@ -1616,16 +2023,16 @@ def _run_dagger_variant(
                 )
 
         metrics = list(trainer.get_metrics())
-        m = metrics[-1]
+        m = metrics[-1] if metrics and not inner_log.get("fit_skipped") else None
         round_data: Dict[str, Any] = {
             "round": round_num,
             "n_observations": cum_obs,
             "collection_steps": collection_steps,
             "collection_expert_queries": collection_steps,
             "trajectories_collected_this_round": len(collected),
-            "train_cross_entropy": round(m.cross_entropy, 6),
-            "l2_norm": round(m.l2_norm, 6),
-            "total_loss": round(m.total_loss, 6),
+            "train_cross_entropy": None if m is None else round(m.cross_entropy, 6),
+            "l2_norm": None if m is None else round(m.l2_norm, 6),
+            "total_loss": None if m is None else round(m.total_loss, 6),
             "rollout_cross_entropy": None,
             "expert_rollout_cross_entropy": None,
             "normalized_return": None,
@@ -1636,8 +2043,8 @@ def _run_dagger_variant(
 
         if eval_data is not None:
             round_data.update(eval_data)
-            round_data["checkpoint"] = _save_policy(
-                config, bc_trainer.policy, round_num
+            round_data.update(
+                _checkpoint_fields(config, bc_trainer.policy, round_num),
             )
 
         per_round.append(round_data)
@@ -1691,18 +2098,39 @@ def _collect_and_subsample_transitions(
     raise ValueError(f"Unknown subsample strategy: {strategy!r}")
 
 
-def _save_policy(config, policy, round_num):
-    """Retain evaluated policies so recovery tests do not require retraining."""
+def _policy_path(config, round_num) -> pathlib.Path:
+    """Where `_save_policy` keeps the policy evaluated at ``round_num``."""
     name = config.result_name_override or config.algo
-    path = (
+    return (
         config.output_dir
         / "checkpoints"
         / f"{name}_{config.env_name.replace('/', '_')}_seed{config.seed}"
         / f"round-{round_num:05d}.pt"
     )
+
+
+def _save_policy(config, policy, round_num):
+    """Retain evaluated policies so recovery tests do not require retraining."""
+    path = _policy_path(config, round_num)
     path.parent.mkdir(parents=True, exist_ok=True)
     policy.save(path)
     return str(path)
+
+
+def _checkpoint_fields(config, policy, round_num) -> Dict[str, Any]:
+    """Save ``policy`` as `_save_policy` does and return its record fields.
+
+    A policy with a ``save_bound`` hook (the capacity family) writes its own
+    checkpoint and returns a binding of the exact bytes it wrote, recorded as
+    ``checkpoint_binding``. Every other policy gives ``{"checkpoint": path}``
+    only, as before.
+    """
+    save_bound = getattr(policy, "save_bound", None)
+    if save_bound is None:
+        return {"checkpoint": _save_policy(config, policy, round_num)}
+    path = _policy_path(config, round_num)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return {"checkpoint": str(path), "checkpoint_binding": save_bound(path)}
 
 
 def _shared_expert_data(config, venv, expert_policy):
@@ -1818,7 +2246,13 @@ def _fit_fixed_bc(
         custom_logger=custom_logger,
         device=device,
     )
-    inner_log = _inner_train(bc_trainer, config, round_num=0, is_dagger=False)
+    inner_log = _inner_train(
+        bc_trainer,
+        config,
+        round_num=0,
+        is_dagger=False,
+        **_paired_fit_kwargs(config, len(transitions)),
+    )
     return bc_trainer, inner_log
 
 
@@ -1869,9 +2303,12 @@ def _run_bc(
         venv,
         baselines,
         n_episodes=_eval_episodes(config, final=True),
+        **_paired_eval_kwargs(config, len(all_transitions)),
     )
 
-    eval_data["checkpoint"] = _save_policy(config, bc_trainer.policy, config.n_rounds)
+    eval_data.update(
+        _checkpoint_fields(config, bc_trainer.policy, config.n_rounds),
+    )
     l2_norms = [th.sum(th.square(w)).item() for w in bc_trainer.policy.parameters()]
     l2_norm = sum(l2_norms) / 2
 

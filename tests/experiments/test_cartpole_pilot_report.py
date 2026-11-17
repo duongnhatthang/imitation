@@ -209,5 +209,13 @@ def test_figure_draws_offline_bc_flat_and_online_curves_by_condition():
                     assert list(ln.get_xdata()) == [
                         p["labels"] for p in points[f"run-{m}-{r}"]
                     ]
+        # Shared fixed view on the normalized panel; stored values unchanged.
+        ret_ax = fig.axes[0]
+        assert pilot.NORMALIZED_RETURN_YLIM == (-0.5, 1.5)
+        assert ret_ax.get_yscale() == "linear"
+        assert ret_ax.get_ylim() == pilot.NORMALIZED_RETURN_YLIM
+        job = pilot.ONLINE_IDS[0]
+        stored = [p["normalized_return"] for p in points[job]]
+        assert any(list(ln.get_ydata()) == stored for ln in ret_ax.get_lines())
     finally:
         plt.close(fig)

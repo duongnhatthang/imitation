@@ -3,18 +3,70 @@
 Provides observation wrappers (OneHotObsWrapper for discrete-state environments,
 FlattenTupleObsWrapper for tuple-of-discrete environments) and a unified
 make_env factory that auto-applies them where needed.
+
+Also defines and registers two FrozenLake variant tasks. Importing this module
+registers them, so the factory always finds them:
+
+* ``FrozenLakeVariedStart-v0``: the deterministic 4x4 FrozenLake with a reset
+  uniform over the safe nonterminal states.
+* ``FrozenLakeSlippery-v0``: the standard stochastic 4x4 FrozenLake, exactly
+  ``FrozenLake-v1`` with its default ``is_slippery=True`` (each move goes in
+  the intended or one of the two perpendicular directions, 1/3 each), the
+  fixed start state 0 and the 100-step cap. The original ``FrozenLake-v1``
+  task keeps its configured deterministic dynamics.
 """
 
 from typing import Dict, Optional
 
 import gymnasium as gym
 import numpy as np
+from gymnasium.envs.toy_text.frozen_lake import FrozenLakeEnv
 from stable_baselines3.common.vec_env import VecEnv
 
 from imitation.data.wrappers import RolloutInfoWrapper
 from imitation.util import util
 
-# Environment configurations for the 8 classical MDPs.
+FROZENLAKE_VARIED_START = "FrozenLakeVariedStart-v0"
+# Every frozen ("F") or start ("S") cell of the 4x4 map; holes and goal excluded.
+FROZENLAKE_VARIED_START_SUPPORT = (0, 1, 2, 3, 4, 6, 8, 9, 10, 13, 14)
+
+
+class FrozenLakeVariedStartEnv(FrozenLakeEnv):
+    """Deterministic 4x4 FrozenLake reset uniformly over safe nonterminal states.
+
+    Map, transition table ``P`` and rewards are exactly those of
+    ``FrozenLake-v1`` with ``is_slippery=False``; only the reset distribution
+    ``initial_state_distrib`` differs.
+    """
+
+    def __init__(self, render_mode: Optional[str] = None) -> None:
+        super().__init__(render_mode=render_mode, map_name="4x4", is_slippery=False)
+        support = list(FROZENLAKE_VARIED_START_SUPPORT)
+        distribution = np.zeros(self.observation_space.n, dtype=np.float64)
+        distribution[support] = 1.0 / len(support)
+        self.initial_state_distrib = distribution
+
+
+if FROZENLAKE_VARIED_START not in gym.registry:
+    gym.register(
+        id=FROZENLAKE_VARIED_START,
+        entry_point="imitation.experiments.ftrl.env_utils:FrozenLakeVariedStartEnv",
+        max_episode_steps=100,
+    )
+
+FROZENLAKE_SLIPPERY = "FrozenLakeSlippery-v0"
+# Registered kwargs: the stock environment, default map, standard slips.
+FROZENLAKE_SLIPPERY_KWARGS = {"map_name": "4x4", "is_slippery": True}
+
+if FROZENLAKE_SLIPPERY not in gym.registry:
+    gym.register(
+        id=FROZENLAKE_SLIPPERY,
+        entry_point="gymnasium.envs.toy_text.frozen_lake:FrozenLakeEnv",
+        kwargs=dict(FROZENLAKE_SLIPPERY_KWARGS),
+        max_episode_steps=100,
+    )
+
+# Environment configurations for the 8 classical MDPs and the variant tasks.
 # obs_type: "discrete" means Discrete obs space that needs one-hot encoding.
 # obs_size: size of the Discrete space (only for discrete obs_type).
 # ppo_timesteps: PPO training steps to solve the env (benchmarked locally with
@@ -137,7 +189,25 @@ ENV_CONFIGS: Dict[str, dict] = {
             "_note": "LunarLander PPO plateau; 0.95/5M exhausts budget.",
         },
     },
+    # Variant task, not one of the 8 classical MDPs (see VARIANT_ENVS).
+    FROZENLAKE_VARIED_START: {
+        "obs_type": "discrete",
+        "obs_size": 16,
+        "ppo_timesteps": 10_000,
+        "env_kwargs": {},
+    },
+    # Variant task; the slips come from the registered kwargs, not from here.
+    # The PPO budget is an untuned placeholder: expert preparation owns it.
+    FROZENLAKE_SLIPPERY: {
+        "obs_type": "discrete",
+        "obs_size": 16,
+        "ppo_timesteps": 200_000,
+        "env_kwargs": {},
+    },
 }
+
+# Variant environments: configured for the factory, kept out of "classical".
+VARIANT_ENVS = (FROZENLAKE_VARIED_START, FROZENLAKE_SLIPPERY)
 
 
 def is_atari(env_name: str) -> bool:
@@ -146,7 +216,7 @@ def is_atari(env_name: str) -> bool:
 
 
 ENV_GROUPS: Dict[str, list] = {
-    "classical": list(ENV_CONFIGS.keys()),
+    "classical": [name for name in ENV_CONFIGS if name not in VARIANT_ENVS],
     # Ordered fastest-to-slowest by expected wall-clock time per experiment.
     # Pong/Breakout have short episodes and converge quickly (SimPLe reached
     # max Pong/Freeway in 100k interactions). MsPacman has long episodes

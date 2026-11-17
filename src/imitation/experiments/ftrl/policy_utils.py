@@ -15,8 +15,16 @@ def load_policy_checkpoint(path, device="cpu"):
 
     These trusted experiment artifacts contain constructor metadata as well as
     weights. Explicit loading avoids PyTorch 2.6's changed weights-only default.
+    Checkpoints of the one-hidden capacity family (constructor data with a
+    ``capacity_spec``) are rebuilt and verified by
+    ``capacity_policy.policy_from_saved``, which raises ``ValueError`` on any
+    mismatch; other constructor data still go to ``ActorCriticPolicy``.
     """
     saved = th.load(path, map_location=device, weights_only=False)
+    if "capacity_spec" in saved["data"]:
+        from imitation.experiments.agnostic import capacity_policy
+
+        return capacity_policy.policy_from_saved(saved, device)
     policy = ActorCriticPolicy(**saved["data"])
     policy.load_state_dict(saved["state_dict"])
     return policy.to(device)

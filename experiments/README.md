@@ -68,9 +68,6 @@ Install the helper and any private policy through the existing wrapper's
 
 Budget overrides: `CLASSICAL_ROUNDS`, `ATARI_ROUNDS`, `SEEDS`,
 `SAMPLES_PER_ROUND`, and `TRAJECTORIES_PER_ROUND`. Worker overrides:
-`CLASSICAL_WORKERS` and `ATARI_WORKERS`. Coverage follows the training seed
-Budget overrides: `CLASSICAL_ROUNDS`, `ATARI_ROUNDS`, `SEEDS`,
-`SAMPLES_PER_ROUND`, and `TRAJECTORIES_PER_ROUND`. Worker overrides:
 `CLASSICAL_WORKERS` and `ATARI_WORKERS`. `ENVS` filters classical
 environments and `ATARI_ENVS` separately filters the optional Atari stage. Coverage follows the training seed
 count by default; set `COVERAGE_SEEDS` to change that list.
@@ -205,3 +202,7 @@ See [the experiment plan](AGNOSTIC_EXPERIMENT_PLAN.md) for the one-week,
 pilot-calibrated study, misspecification controls, and equal-budget comparisons.
 The restricted learner modes and controlled MDP are proposed work, not yet
 implemented by this baseline-default change.
+
+## Required publication for new studies
+
+Follow the experiment storage and result publication rules in `../AGENTS.md`. Raw experiment artifacts and numerical analysis stay on the execution server. Only figures are mirrored into the main checkout at `experiments/plots/<run-id>/{classical,atari}/{learning_curves,coverage,runtime}`. This applies equally to worktree launches, new baselines, pilots, and diagnostics. A run is not delivered until its expected labeled figures appear there. Preserve per-seed t-SNE arrival heatmaps and separate overlap maps.

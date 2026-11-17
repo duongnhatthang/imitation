@@ -37,6 +37,9 @@ Three commands, each writing one fresh output directory:
     through the same trainer. Fixed BC is the offline baseline of ``_run_bc``:
     one cold fit on the whole pool with ``run_experiment._fit_fixed_bc`` and
     one evaluation, a frozen policy that is a flat reference, not a curve.
+    BC-prefix (`PREFIX_METHOD`, only under a spec that opts in) is the
+    original ``bc_prefix`` baseline: the BC-iid trainer replaying the pool in
+    chronological order, a cold refit on the first t pool labels at round t.
     Evaluation is ``_compute_round_eval`` (100 deterministic episodes,
     normalized return, learner and expert rollout cross-entropy,
     disagreement, raw episode returns); evaluated policies are checkpointed
@@ -51,6 +54,36 @@ hash); baselines are measured once per data job on a dedicated environment
 whose random-action sampler is seeded; the expert comes from a verified
 qualified preparation rather than the expert cache; online methods train with
 the batch rule fixed BC uses.
+
+Environment and protocol: every job takes a keyword ``spec`` (`RunnerSpec`).
+The default `CARTPOLE_V2` is the CartPole pilot above, unchanged. An
+environment-generic spec (built by `task_pilot.runner_spec`) names another
+protocol, binds a verified `tasks.Task` description into every record and
+data check, loads experts with `task_experts.load_qualified_expert` and may
+normalize with a pinned reference measured by another data job. A spec with
+``paired_cold_fits`` runs every method under
+``run_experiment.PAIRED_COLD_FITS_PROTOCOL`` (`PAIRED_COLD_FITS_RULE`); its
+records add ``paired_cold_fits`` to the run config and ``fit_*``,
+``eval_seed`` and ``evaluation_episode_seeds`` fields to the rows. Specs
+without it keep their configs; their rows gain only the optional episode
+evidence the evaluation reports.
+
+Normalization reference: every environment, CliffWalking included,
+normalizes with the uniform random return its data job measured
+(`measure_baselines`, overrides only from
+``env_baselines.normalization_reference``). Generic run configs describe it
+as ``normalization_reference`` (`UNIFORM_RANDOM_REFERENCE_RULE`). Data and
+reference records are read as recorded, never rewritten: baselines without
+reference metadata hold the uniform random return, and baselines recording
+another lower reference are refused (`_uniform_random_baselines`).
+
+Capacity family: a spec whose
+``learner`` is a `capacity_policy.CapacityRunner` (built by
+`task_pilot.capacity_runner_spec`) replaces the linear head by a fresh
+one-hidden student on the teacher's frozen encoder, on full observations only;
+its teacher must be an explicit-architecture one-hidden preparation, and the
+spec, teacher, encoder and actual parameter counts are bound into every data
+record, run record and verified checkpoint.
 
 Safety: every command verifies its inputs before claiming a fresh, empty
 output directory, and refuses anything else without reading it. The
@@ -83,7 +116,15 @@ import torch as th
 from stable_baselines3.common.vec_env import VecEnvWrapper
 
 from imitation.data import rollout, serialize, types
-from imitation.experiments.agnostic import classical, pilot, restriction, rollouts
+from imitation.experiments.agnostic import (
+    capacity_policy,
+    classical,
+    pilot,
+    restriction,
+    rollouts,
+    task_experts,
+    tasks,
+)
 from imitation.experiments.ftrl import (
     env_baselines,
     env_utils,
@@ -105,6 +146,8 @@ EPISODE_CAP = 500
 PILOT_SEED = 300
 AUDIT_SEED = 301
 METHODS = ("ftl", "bc", "bc_iid")
+# Opt-in only: a spec must list it in ``methods`` (see `RunnerSpec`).
+PREFIX_METHOD = "bc_prefix"
 PILOT_RESTRICTION = "cart_position_angular_velocity_zero"
 # cart_position_zero stays registered for historical checkpoints only.
 RUN_RESTRICTIONS = ("identity", PILOT_RESTRICTION)
@@ -148,6 +191,63 @@ _SOURCE_FILES = (
     "util/util.py",
 )
 _PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+@dataclasses.dataclass(frozen=True)
+class RunnerSpec:
+    """Environment and protocol identity of one restriction runner.
+
+    ``task`` is None only for the CartPole pilot protocol, whose records and
+    checks stay exactly as they were. Otherwise it is a registered
+    `tasks.Task`, and records carry its verified description. ``methods``
+    are the methods its runs accept; `PREFIX_METHOD` is never a default.
+    ``paired_cold_fits`` opts every run in to
+    ``run_experiment.PAIRED_COLD_FITS_PROTOCOL`` (`PAIRED_COLD_FITS_RULE`).
+    ``calibration_candidates`` are extra restrictions, also listed in
+    ``run_restrictions``, that are not part of the task's ladder; their
+    descriptions are bound into every run record of the spec.
+    ``learner`` is
+    None for the linear-head learner; a `capacity_policy.CapacityRunner`
+    selects the one-hidden capacity student (generic tasks only).
+    """
+
+    env_name: str
+    episode_cap: int
+    protocol: str
+    data_protocol: str
+    run_restrictions: Tuple[str, ...]
+    source_files: Tuple[str, ...]
+    audit_seed: int
+    max_job_limit_seconds: float
+    task: Optional[Any] = None
+    methods: Tuple[str, ...] = METHODS
+    paired_cold_fits: bool = False
+    calibration_candidates: Tuple[str, ...] = ()
+    learner: Optional[Any] = None
+
+    @property
+    def audit_schema(self) -> str:
+        return self.protocol + "/audit"
+
+    @property
+    def run_schema(self) -> str:
+        return self.protocol + "/run"
+
+    @property
+    def data_schema(self) -> str:
+        return self.data_protocol + "/data"
+
+
+CARTPOLE_V2 = RunnerSpec(
+    env_name=ENV_NAME,
+    episode_cap=EPISODE_CAP,
+    protocol=PROTOCOL,
+    data_protocol=DATA_PROTOCOL,
+    run_restrictions=RUN_RESTRICTIONS,
+    source_files=_SOURCE_FILES,
+    audit_seed=AUDIT_SEED,
+    max_job_limit_seconds=MAX_JOB_LIMIT_SECONDS,
+)
 
 COLLECTION_RULE = (
     "FTL: one expert predict call and one learner predict call per collected "
@@ -193,6 +293,38 @@ FIXED_BC_RULE = (
     "The frozen policy is a flat reference across the online label axis, not "
     "a function of it; it never fits prefixes."
 )
+BC_PREFIX_RULE = (
+    "BC-prefix: the original run_experiment bc_prefix baseline. Round t "
+    "replays pool transition t through the BC-iid trainer, so the round-t fit "
+    "is a cold fit (warm_start false) on the first t chronological pool "
+    "labels; evaluated like BC-iid. It collects nothing and makes no expert "
+    "label queries; fixed BC is unchanged."
+)
+PAIRED_COLD_FITS_RULE = (
+    "Paired cold fits (run_experiment.PAIRED_COLD_FITS_PROTOCOL): every fit is "
+    "a cold fit on its N retained labels; head initialization, Adam reset, "
+    "loader shuffle, NumPy trainer stream and held-out split come from "
+    "dedicated streams keyed by (seed, N) inside a scoped torch RNG, and the "
+    "batch is min(bc_batch_size, N). Fixed BC on N pool labels and BC-prefix "
+    "at round N therefore fit identically. Every evaluation at budget N resets "
+    "each of its 100 episodes explicitly, episode i with seed (s + i) mod 2**32 "
+    "where s is keyed by (seed, N), shared by all methods "
+    "(evaluation_episode_seeds); auto-reset states are discarded. Episode i "
+    "therefore starts from the same initial state for every method "
+    "(initial_state_digests); trajectories still differ once actions differ."
+)
+EVALUATION_RESET_RULE = (
+    "Evaluation resets come from the rollout's own reset_accounting: explicit "
+    "resets pass through the run's environment wrapper and are counted there "
+    "too; VecEnv auto-resets happen inside the wrapped environment and are "
+    "not. Null when an evaluation did not report them."
+)
+UNIFORM_RANDOM_REFERENCE = "uniform_random"
+UNIFORM_RANDOM_REFERENCE_RULE = (
+    "Every environment: the lower normalization reference is the uniform "
+    "random return measured by the data job's baseline episodes; normalized "
+    "return (R - R_random) / (R_expert - R_random), unclipped."
+)
 _SHA256_HEX = "0123456789abcdef"
 
 
@@ -206,17 +338,9 @@ def pairs_sha256(obs: np.ndarray, acts: np.ndarray) -> str:
 
     Observations are hashed as float32 and actions as int64 with their
     shapes, so the digest identifies training data independently of storage.
+    Same digest as the ``fit_*_pairs_sha256`` of paired fits.
     """
-    obs = np.ascontiguousarray(obs, dtype=np.float32)
-    acts = np.ascontiguousarray(acts, dtype=np.int64)
-    if len(obs) != len(acts):
-        raise ValueError("obs and acts differ in length")
-    digest = hashlib.sha256()
-    for name, array in (("obs", obs), ("acts", acts)):
-        digest.update(name.encode("utf-8"))
-        digest.update(str(array.shape).encode("utf-8"))
-        digest.update(array.tobytes())
-    return digest.hexdigest()
+    return run_experiment.pairs_sha256(obs, acts)
 
 
 _ARRAYS = ("obs", "acts", "next_obs", "dones", "episode_index", "step_index")
@@ -336,6 +460,7 @@ def collect_chronological_pool(
     *,
     check: Callable[[str], None] = _no_check,
     counters: Optional[Dict[str, Any]] = None,
+    env_name: str = ENV_NAME,
 ) -> Tuple[ExpertData, Dict[str, Any]]:
     """Fixed-BC pool: complete expert episodes until at least ``budget`` steps.
 
@@ -351,7 +476,7 @@ def collect_chronological_pool(
     counters = _new_counters() if counters is None else counters
     start = time.monotonic()
     seeds = _seed_stream(seed, _POOL_RESETS)
-    venv = env_utils.make_env(ENV_NAME, 1, _seed_stream(seed, _POOL_RESETS))
+    venv = env_utils.make_env(env_name, 1, _seed_stream(seed, _POOL_RESETS))
     rows: List[Tuple] = []
     lengths: List[int] = []
     reset_seeds: List[int] = []
@@ -383,6 +508,7 @@ def collect_iid_stream(
     *,
     check: Callable[[str], None] = _no_check,
     counters: Optional[Dict[str, Any]] = None,
+    env_name: str = ENV_NAME,
 ) -> Tuple[ExpertData, Dict[str, Any]]:
     """BC-iid stream: one uniformly selected state per independent episode.
 
@@ -401,7 +527,7 @@ def collect_iid_stream(
     start = time.monotonic()
     seeds = _seed_stream(seed, _STREAM_RESETS)
     selection = _seed_stream(seed, _STREAM_SELECTION)
-    venv = env_utils.make_env(ENV_NAME, 1, _seed_stream(seed, _STREAM_RESETS))
+    venv = env_utils.make_env(env_name, 1, _seed_stream(seed, _STREAM_RESETS))
     rows: List[Tuple] = []
     lengths: List[int] = []
     reset_seeds: List[int] = []
@@ -447,12 +573,73 @@ class CountingVecEnv(VecEnvWrapper):
         return obs, rewards, dones, infos
 
 
+def _uniform_random_baselines(baselines) -> bool:
+    """Whether recorded baselines hold the measured uniform random reference.
+
+    Baselines without reference metadata hold it. Recorded metadata must
+    agree: type ``uniform_random``, no ``stalled_return`` and any
+    ``measured_uniform_random_return`` equal to ``random_return``. Records
+    are only read, never rewritten.
+    """
+    if not isinstance(baselines, dict):
+        return False
+    kind = baselines.get("normalization_reference_type", UNIFORM_RANDOM_REFERENCE)
+    measured = baselines.get(
+        "measured_uniform_random_return",
+        baselines.get("random_return"),
+    )
+    return (
+        kind == UNIFORM_RANDOM_REFERENCE
+        and baselines.get("stalled_return") is None
+        and measured == baselines.get("random_return")
+    )
+
+
+def _reference_descriptor(baselines: Dict[str, Any]) -> Dict[str, Any]:
+    """The lower normalization reference a run uses, from verified baselines.
+
+    ``reference_type_recorded`` says whether the baselines carried the type
+    or predate the metadata; either way they hold the uniform random return.
+    """
+    if not _uniform_random_baselines(baselines):
+        raise classical.Refused(
+            "baselines do not hold the measured uniform random reference",
+        )
+    return {
+        "type": UNIFORM_RANDOM_REFERENCE,
+        "lower_return": baselines["random_return"],
+        "expert_return": baselines["expert_return"],
+        "measured_uniform_random_return": baselines["random_return"],
+        "reference_type_recorded": "normalization_reference_type" in baselines,
+        "rule": UNIFORM_RANDOM_REFERENCE_RULE,
+    }
+
+
+def _evaluation_resets(evals: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summed ``reset_accounting`` of completed evaluations, never imputed.
+
+    Each count is null unless every evaluation reported it.
+    """
+    reports = [r.get("reset_accounting") for r in evals]
+    totals: Dict[str, Any] = {}
+    for key in ("explicit_resets", "auto_resets", "discarded_auto_resets"):
+        values = [
+            report.get(key) if isinstance(report, dict) else None for report in reports
+        ]
+        totals[key] = (
+            sum(int(v) for v in values) if all(v is not None for v in values) else None
+        )
+    totals["rule"] = EVALUATION_RESET_RULE
+    return totals
+
+
 def measure_baselines(
     expert,
     seed: int,
     n_episodes: int,
     check: Callable[[str], None] = _no_check,
     observer: Optional[Dict[str, Any]] = None,
+    env_name: str = ENV_NAME,
 ) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """Normalization baselines as in ``env_baselines.compute_baselines``.
 
@@ -462,12 +649,16 @@ def measure_baselines(
     ``observer["venv"]`` receives the counting environment, so an interrupted
     measurement still reports its observed steps.
 
+    ``random_return`` is the measured uniform random return in every
+    environment, CliffWalking included; ``env_baselines.normalization_reference``
+    supplies any overrides (none), so the original three keys are returned.
+
     Returns:
         The baselines and their counted costs.
     """
     start = time.monotonic()
     venv = CountingVecEnv(
-        env_utils.make_env(ENV_NAME, 1, _seed_stream(seed, _BASELINE_ENV))
+        env_utils.make_env(env_name, 1, _seed_stream(seed, _BASELINE_ENV))
     )
     venv.action_space.seed(
         int(_seed_stream(seed, _BASELINE_ACTIONS).integers(0, _SEED_HIGH))
@@ -493,6 +684,9 @@ def measure_baselines(
         "random_return": float(random_return),
         "expert_self_ce": float(expert_result.current_round_ce),
     }
+    baselines.update(
+        env_baselines.normalization_reference(env_name, float(random_return)),
+    )
     costs = {
         "expert_episodes": int(n_episodes),
         "random_episodes": int(n_episodes),
@@ -525,7 +719,7 @@ def pool_logical_cost(episode_lengths: Sequence[int], budget: int) -> Dict[str, 
 
 
 def eval_budgets(n_rounds: int, eval_interval: int) -> List[int]:
-    """Budgets the round loop evaluates: round 1, every interval, the last."""
+    """Historical pilot evaluations after zero: first, periodic and final."""
     points = {1, int(n_rounds)}
     points.update(range(eval_interval, n_rounds + 1, eval_interval))
     return sorted(points)
@@ -552,10 +746,10 @@ def trained_pairs(demos_dir: pathlib.Path) -> Tuple[np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 
-def source_identity() -> Dict[str, Any]:
+def source_identity(source_files: Sequence[str] = _SOURCE_FILES) -> Dict[str, Any]:
     """Digests of the source files that determine pilot behavior."""
     files = {}
-    for rel in _SOURCE_FILES:
+    for rel in source_files:
         path = _PACKAGE_ROOT / rel
         files[rel] = pilot.sha256_file(path) if path.is_file() else "missing"
     status = pilot._git("status", "--porcelain")
@@ -567,21 +761,34 @@ def source_identity() -> Dict[str, Any]:
     }
 
 
-def _validate_limits(seed: Optional[int], job_limit_seconds: float) -> None:
+def _spec_source(spec: RunnerSpec) -> Dict[str, Any]:
+    if spec.source_files == _SOURCE_FILES:
+        return source_identity()
+    return source_identity(spec.source_files)
+
+
+def _validate_limits(
+    seed: Optional[int],
+    job_limit_seconds: float,
+    spec: RunnerSpec = CARTPOLE_V2,
+) -> None:
     if seed is not None:
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise classical.Refused(f"seed must be a non-negative integer: {seed!r}")
-        if seed == AUDIT_SEED:
-            raise classical.Refused(f"seed {AUDIT_SEED} is reserved for the mask audit")
+        if seed == spec.audit_seed:
+            raise classical.Refused(
+                f"seed {spec.audit_seed} is reserved for the mask audit",
+            )
     limit = job_limit_seconds
+    cap = spec.max_job_limit_seconds
     if (
         isinstance(limit, bool)
         or not isinstance(limit, (int, float))
         or not math.isfinite(limit)
-        or not 0 < limit <= MAX_JOB_LIMIT_SECONDS
+        or not 0 < limit <= cap
     ):
         raise classical.Refused(
-            f"job_limit_seconds must be in (0, {MAX_JOB_LIMIT_SECONDS}]: {limit!r}",
+            f"job_limit_seconds must be in (0, {cap}]: {limit!r}",
         )
 
 
@@ -610,11 +817,20 @@ def _deadlines(
     }
 
 
-def _load_expert(preparation_dir) -> Tuple[Any, Dict[str, Any]]:
-    model, identity = classical.load_verified_expert(
-        pathlib.Path(preparation_dir),
-        ENV_NAME,
-    )
+def _load_expert(
+    preparation_dir,
+    spec: RunnerSpec = CARTPOLE_V2,
+) -> Tuple[Any, Dict[str, Any]]:
+    if spec.task is None:
+        model, identity = classical.load_verified_expert(
+            pathlib.Path(preparation_dir),
+            spec.env_name,
+        )
+    else:
+        model, identity = task_experts.load_qualified_expert(
+            pathlib.Path(preparation_dir),
+            spec.env_name,
+        )
     identity = dict(identity)
     # Keep machine paths out of records: the digests identify the expert.
     identity["preparation_dir_name"] = pathlib.Path(
@@ -623,37 +839,64 @@ def _load_expert(preparation_dir) -> Tuple[Any, Dict[str, Any]]:
     return model.policy, identity
 
 
-def _check_cap(venv=None) -> int:
-    cap = gym.spec(ENV_NAME).max_episode_steps
+def _check_cap(venv=None, spec: RunnerSpec = CARTPOLE_V2) -> int:
+    if spec.task is not None:
+        # The verified description already holds the factory's effective cap.
+        try:
+            cap = tasks.describe(spec.task)["episode_cap"]
+            if venv is not None and tasks.venv_episode_cap(venv) != cap:
+                raise RuntimeError(f"Run environment cap differs from {cap}")
+        except tasks.TaskMismatch as exc:
+            raise classical.Refused(str(exc)) from None
+        if cap != spec.episode_cap:
+            raise classical.Refused(
+                f"{spec.env_name} cap {cap} is not {spec.episode_cap}",
+            )
+        return int(cap)
+    cap = gym.spec(spec.env_name).max_episode_steps
     if venv is not None:
         cap_env = venv.get_attr("spec")[0].max_episode_steps
         if cap_env != cap:
             raise RuntimeError(f"Environment cap {cap_env} differs from spec {cap}")
-    if cap != EPISODE_CAP:
-        raise classical.Refused(f"{ENV_NAME} time limit {cap} is not {EPISODE_CAP}")
+    if cap != spec.episode_cap:
+        raise classical.Refused(
+            f"{spec.env_name} time limit {cap} is not {spec.episode_cap}",
+        )
     return int(cap)
 
 
-def _base_record(schema, identity, limits, clock) -> Dict[str, Any]:
-    return {
-        "protocol": DATA_PROTOCOL if schema == DATA_SCHEMA else PROTOCOL,
+def _base_record(schema, identity, limits, clock, spec=CARTPOLE_V2) -> Dict[str, Any]:
+    record = {
+        "protocol": spec.data_protocol if schema == spec.data_schema else spec.protocol,
         "schema": schema,
-        "env_name": ENV_NAME,
-        "episode_cap": EPISODE_CAP,
+        "env_name": spec.env_name,
+        "episode_cap": spec.episode_cap,
         "expert_sha256": identity["expert_sha256"],
         "preparation": identity,
         "deadline": limits,
-        "source": source_identity(),
+        "source": _spec_source(spec),
         "package_versions": pilot.package_versions(),
         "started_at_utc": clock().isoformat(),
     }
+    if spec.task is not None:
+        record["task"] = tasks.describe(spec.task)
+        record["task_sha256"] = tasks.task_sha256(spec.task)
+    return record
 
 
-def _start(output_dir, schema, identity, limits, guard, render_extra):
+def _start(
+    output_dir,
+    schema,
+    identity,
+    limits,
+    guard,
+    render_extra,
+    spec: RunnerSpec = CARTPOLE_V2,
+):
     """Claim the output and build lifecycle state and writer."""
     output_dir = pathlib.Path(output_dir)
     claim = classical.claim_fresh_output_dir(output_dir, guard.clock)
-    base = _base_record(schema, identity, limits, guard.clock)
+    base = _base_record(schema, identity, limits, guard.clock, spec)
     state: Dict[str, Any] = {
         "status": "running",
         "in_flight": None,
@@ -679,6 +922,104 @@ def _start(output_dir, schema, identity, limits, guard, render_extra):
 
     writer = classical.ResultWriter(output_dir / RESULT_FILE, render)
     return state, writer
+
+
+def _check_expert_quality(identity, spec: RunnerSpec, allow_relaxed: bool) -> None:
+    """Refuse an expert that passes only a relaxed per-environment threshold."""
+    if spec.task is None:
+        return
+    quality = identity.get("quality") or {}
+    if not quality.get("per_env_passed"):
+        raise classical.Refused("The expert did not pass its qualification threshold")
+    if not quality.get("global_passed") and not allow_relaxed:
+        raise classical.Refused(
+            "The expert fails the global 0.80 quality check (relaxed-only); "
+            "using it needs an explicit allow_relaxed_expert",
+        )
+
+
+CAPACITY_POLICY_RULE = (
+    "capacity-one-hidden: the qualified teacher's frozen features extractor "
+    "(full observation, identity restriction), then a fresh one-hidden actor "
+    "of the student width and a categorical head; only the actor is trained"
+)
+
+
+def _capacity_teacher(expert, identity, spec: RunnerSpec) -> Dict[str, Any]:
+    """Refuse a capacity teacher that is not a verified one-hidden preparation.
+
+    The preparation must claim the declared architecture explicitly (a legacy
+    config claims nothing and is refused even if its modules happen to fit),
+    and the loaded policy must have exactly that actor and activation.
+
+    Returns:
+        `capacity_policy.teacher_architecture` of the expert.
+    """
+    learner = spec.learner
+    if spec.task is None:
+        raise classical.Refused("the capacity family needs a generic task spec")
+    if identity.get("expert_source") != "preparation":
+        raise classical.Refused(
+            "a capacity teacher must come from an expert preparation",
+        )
+    claimed = (identity.get("architecture") or {}).get("claimed") or {}
+    if claimed.get("pi") != [learner.teacher_width]:
+        raise classical.Refused(
+            f"the teacher preparation does not claim the one-hidden "
+            f"[{learner.teacher_width}] architecture: {claimed.get('pi')!r}",
+        )
+    try:
+        description = capacity_policy.teacher_architecture(
+            expert,
+            learner.teacher_width,
+        )
+    except ValueError as exc:
+        raise classical.Refused(f"incompatible capacity teacher: {exc}") from None
+    if description["activation_fn"] != claimed.get("activation_fn"):
+        raise classical.Refused("the teacher activation differs from its claim")
+    if description["policy_state_sha256"] != identity.get("policy_state_sha256"):
+        raise classical.Refused("the teacher state differs from its preparation")
+    return description
+
+
+def _verified_checkpoint(path, capacity, binding, expected_path) -> Dict[str, Any]:
+    """Verify a capacity checkpoint against its writer's binding and the run.
+
+    ``binding`` is what ``save_bound`` returned when it wrote ``path``
+    (`run_experiment._checkpoint_fields`); ``expected_path`` is where this
+    run keeps the checkpoint of the record's budget. The trusted loader then
+    hashes and parses a single read of the file against the binding's file,
+    state and spec digests.
+
+    Returns:
+        The row fields: the verified spec digest and a copy of the binding.
+
+    Raises:
+        ValueError: For a missing or foreign binding, another path or spec,
+            or any `capacity_policy.load_checkpoint` refusal.
+    """
+    if (
+        not isinstance(binding, dict)
+        or binding.get("schema") != capacity_policy.CHECKPOINT_BINDING_SCHEMA
+    ):
+        raise ValueError(f"{path} has no capacity checkpoint writer binding")
+    if not binding.get("path") == str(path) == str(expected_path):
+        raise ValueError(
+            f"the writer bound {binding.get('path')}, not {path} at the run's "
+            f"{expected_path}",
+        )
+    if binding.get("spec_sha256") != capacity["spec_sha256"]:
+        raise ValueError(f"the writer bound {path} to another capacity spec")
+    policy = capacity_policy.load_checkpoint(
+        path,
+        expected_spec_sha256=capacity["spec_sha256"],
+        expected_file_sha256=binding.get("file_sha256"),
+        expected_state_sha256=binding.get("state_sha256"),
+    )
+    return {
+        "checkpoint_capacity_spec_sha256": policy.capacity_spec_sha256,
+        "checkpoint_binding": dict(binding),
+    }
 
 
 def _refused(exc: classical.Refused) -> int:
@@ -759,15 +1100,25 @@ def prepare_data(
     budget: int = DEFAULT_BUDGET,
     baseline_episodes: int = BASELINE_EPISODES,
     clock: Callable[[], datetime.datetime] = rollouts.utc_now,
+    spec: RunnerSpec = CARTPOLE_V2,
+    allow_relaxed_expert: bool = False,
 ) -> int:
     """Acquire the shared fixed-BC pool, BC-iid stream and baselines once."""
     output_dir = pathlib.Path(output_dir)
     try:
-        _validate_limits(seed, job_limit_seconds)
+        _validate_limits(seed, job_limit_seconds, spec)
         if int(budget) <= 0 or int(baseline_episodes) <= 0:
             raise classical.Refused("budget and baseline_episodes must be positive")
-        _check_cap()
-        expert, identity = _load_expert(preparation_dir)
+        if spec.learner is not None and allow_relaxed_expert:
+            raise classical.Refused(
+                "the capacity family never accepts a relaxed-only expert",
+            )
+        _check_cap(spec=spec)
+        expert, identity = _load_expert(preparation_dir, spec)
+        _check_expert_quality(identity, spec, allow_relaxed_expert)
+        teacher = None
+        if spec.learner is not None:
+            teacher = _capacity_teacher(expert, identity, spec)
         guard, limits = _deadlines(deadline, job_limit_seconds, clock)
         live: Dict[str, Any] = {
             "counters": {"pool": _new_counters(), "stream": _new_counters()},
@@ -784,9 +1135,14 @@ def prepare_data(
             "stream": STREAM_RULE,
             "expert_action_rule": classical.ACTION_RULE,
         }
+        if spec.task is not None:
+            config["allow_relaxed_expert"] = bool(allow_relaxed_expert)
+        if teacher is not None:
+            config["learner_family"] = spec.learner.family
+            config["capacity_teacher"] = teacher
         state, writer = _start(
             output_dir,
-            DATA_SCHEMA,
+            spec.data_schema,
             identity,
             limits,
             guard,
@@ -802,6 +1158,7 @@ def prepare_data(
                 "baselines_costs": live["baselines_costs"],
                 "baselines_observed": _observed_baseline(live),
             },
+            spec,
         )
     except classical.Refused as exc:
         return _refused(exc)
@@ -826,6 +1183,7 @@ def prepare_data(
             seed,
             check=guard.check,
             counters=live["counters"]["pool"],
+            env_name=spec.env_name,
         )
         store("pool", POOL_FILE, pool, pool_stats)
         state["in_flight"] = "BC-iid stream collection"
@@ -835,6 +1193,7 @@ def prepare_data(
             seed,
             check=guard.check,
             counters=live["counters"]["stream"],
+            env_name=spec.env_name,
         )
         store("stream", STREAM_FILE, stream, stream_stats)
         state["in_flight"] = "baseline measurement"
@@ -844,6 +1203,7 @@ def prepare_data(
             int(baseline_episodes),
             check=guard.check,
             observer=live["baseline_observer"],
+            env_name=spec.env_name,
         )
 
     return classical._run_lifecycle(state, writer, body, guard)
@@ -889,13 +1249,21 @@ def _finite_baselines(baselines) -> bool:
     )
 
 
-def _verify_data(data_dir, seed, identity, n_rounds, expected_data_sha256=None):
+def _verify_data(
+    data_dir,
+    seed,
+    identity,
+    n_rounds,
+    expected_data_sha256=None,
+    spec: RunnerSpec = CARTPOLE_V2,
+):
     """Check the shared data job and return its record, data, digest, acceptance.
 
     The record is hashed and parsed from the same bytes. Every check below
     applies whatever the source version; a record from another source version
     is accepted only if ``expected_data_sha256`` equals its SHA256, and a pin
-    that does not match refuses even same-source data.
+    that does not match refuses even same-source data. Under a generic spec
+    the record must also carry the current verified task description.
     """
     data_dir = pathlib.Path(data_dir)
     path = data_dir / RESULT_FILE
@@ -917,13 +1285,13 @@ def _verify_data(data_dir, seed, identity, n_rounds, expected_data_sha256=None):
     source = record.get("source")
     source = source if isinstance(source, dict) else {}
     files = source.get("files")
-    current = source_identity()
+    current = _spec_source(spec)
     checks = {
-        "schema": record.get("schema") == DATA_SCHEMA,
-        "protocol": record.get("protocol") == DATA_PROTOCOL,
+        "schema": record.get("schema") == spec.data_schema,
+        "protocol": record.get("protocol") == spec.data_protocol,
         "status_complete": record.get("status") == "complete",
-        "env_name": record.get("env_name") == ENV_NAME,
-        "episode_cap": record.get("episode_cap") == EPISODE_CAP,
+        "env_name": record.get("env_name") == spec.env_name,
+        "episode_cap": record.get("episode_cap") == spec.episode_cap,
         "seed": record.get("seed") == seed,
         "config_sha256": record.get("config_sha256") == pilot.config_digest(config),
         "config_seed": config.get("seed") == seed,
@@ -940,7 +1308,13 @@ def _verify_data(data_dir, seed, identity, n_rounds, expected_data_sha256=None):
         "expert_sha256": record.get("expert_sha256") == identity["expert_sha256"],
         "preparation_identity": record.get("preparation") == identity,
         "baselines": _finite_baselines(record.get("baselines")),
+        "baseline_reference": _uniform_random_baselines(record.get("baselines")),
     }
+    if spec.task is not None:
+        checks["task"] = record.get("task") == tasks.describe(spec.task)
+        checks["task_sha256"] = record.get("task_sha256") == tasks.task_sha256(
+            spec.task,
+        )
     failed = sorted(k for k, ok in checks.items() if not ok)
     if failed:
         raise classical.Refused(f"Data record {path} failed checks {failed}")
@@ -982,15 +1356,139 @@ def _verify_data(data_dir, seed, identity, n_rounds, expected_data_sha256=None):
     return record, datasets, record_sha, acceptance
 
 
+def _verify_reference(reference_dir, expected_sha256, identity, spec: RunnerSpec):
+    """Check a pinned data record whose baselines normalize a generic run.
+
+    The pin proves which bytes were chosen; the checks prove they describe the
+    current task. The reference must be a complete data job with exactly the
+    generic protocol and data schema, the current task description and digest,
+    the current package versions, an internally consistent config (digest,
+    pool, stream and action rules, a valid non-audit seed equal to the
+    record's) and source map (combined digest, the protocol's file set), the
+    same expert checkpoint and policy state, and complete original baseline
+    evidence: `BASELINE_EPISODES` expert and random episodes in config and
+    costs, with consistent step counts. Its seed may differ from the run's and
+    its source bytes may differ from the current source. For CartPole only,
+    the pilot data pair is also accepted; such a record has no task field, so
+    it is bound by that pair, the 500 step cap and the pilot's file set.
+
+    Returns:
+        The reference provenance block, baselines included.
+    """
+    pin = _validate_pin(expected_sha256)
+    if pin is None:
+        raise classical.Refused("A reference data record must be pinned by SHA256")
+    path = pathlib.Path(reference_dir) / RESULT_FILE
+    try:
+        raw = path.read_bytes()
+        record = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise classical.Refused(f"Unreadable reference record {path}: {exc}")
+    record_sha = hashlib.sha256(raw).hexdigest()
+    if record_sha != pin:
+        raise classical.Refused(
+            f"Reference record {path} has SHA256 {record_sha}, not the pinned {pin}",
+        )
+    if not isinstance(record, dict):
+        raise classical.Refused(f"{path} is not a data record")
+    pair = (record.get("protocol"), record.get("schema"))
+    legacy = spec.env_name == CARTPOLE_V2.env_name and pair == (
+        CARTPOLE_V2.data_protocol,
+        CARTPOLE_V2.data_schema,
+    )
+    expected_files = CARTPOLE_V2.source_files if legacy else spec.source_files
+
+    def as_dict(value):
+        return value if isinstance(value, dict) else {}
+
+    def count(value, low, high):
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and low <= value <= high
+        )
+
+    config = as_dict(record.get("config"))
+    source = as_dict(record.get("source"))
+    files = source.get("files")
+    costs = as_dict(record.get("baselines_costs"))
+    seed = record.get("seed")
+    cap = spec.episode_cap
+    most = BASELINE_EPISODES * cap
+    checks = {
+        "protocol_pair": pair == (spec.data_protocol, spec.data_schema) or legacy,
+        "status_complete": record.get("status") == "complete",
+        "env_name": record.get("env_name") == spec.env_name,
+        "episode_cap": record.get("episode_cap") == cap,
+        "task": legacy or record.get("task") == tasks.describe(spec.task),
+        "task_sha256": legacy
+        or record.get("task_sha256") == tasks.task_sha256(spec.task),
+        "package_versions": record.get("package_versions") == pilot.package_versions(),
+        "config_sha256": record.get("config_sha256") == pilot.config_digest(config),
+        "config_rules": config.get("pool") == POOL_RULE
+        and config.get("stream") == STREAM_RULE
+        and config.get("expert_action_rule") == classical.ACTION_RULE,
+        "seed": count(seed, 0, _SEED_HIGH)
+        and seed != spec.audit_seed
+        and config.get("seed") == seed,
+        "source_integrity": isinstance(files, dict)
+        and source.get("combined_sha256") == pilot.config_digest(files),
+        "source_file_set": isinstance(files, dict)
+        and sorted(files) == sorted(expected_files),
+        "expert": record.get("expert_sha256") == identity["expert_sha256"]
+        and as_dict(record.get("preparation")).get("policy_state_sha256")
+        == identity.get("policy_state_sha256"),
+        "baselines": _finite_baselines(record.get("baselines")),
+        "baseline_reference": _uniform_random_baselines(record.get("baselines")),
+        "baseline_episodes": config.get("baseline_episodes")
+        == costs.get("expert_episodes")
+        == costs.get("random_episodes")
+        == BASELINE_EPISODES,
+        "baseline_steps": count(costs.get("expert_env_steps"), BASELINE_EPISODES, most)
+        and count(costs.get("random_env_steps"), BASELINE_EPISODES, most)
+        and costs.get("env_steps_counted")
+        == costs["expert_env_steps"] + costs["random_env_steps"],
+    }
+    failed = sorted(k for k, ok in checks.items() if not ok)
+    if failed:
+        raise classical.Refused(f"Reference record {path} failed checks {failed}")
+    return {
+        "source": "pinned reference data job",
+        "data_result_sha256": record_sha,
+        "expected_sha256": pin,
+        "producer_protocol": record.get("protocol"),
+        "producer_schema": record["schema"],
+        "producer_seed": record.get("seed"),
+        "producer_source_combined_sha256": (record.get("source") or {}).get(
+            "combined_sha256",
+        ),
+        "baselines": record["baselines"],
+        "baselines_costs": costs,
+        "checks": sorted(checks),
+    }
+
+
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
 
 
-def _experiment_config(method, seed, n_rounds, eval_interval, output_dir):
+def _experiment_config(
+    method,
+    seed,
+    n_rounds,
+    eval_interval,
+    output_dir,
+    env_name=ENV_NAME,
+    paired_cold_fits=False,
+    bc_n_epochs=None,
+    eval_episodes=None,
+    final_eval_episodes=None,
+    capacity=False,
+):
     return run_experiment.ExperimentConfig(
         algo=method,
-        env_name=ENV_NAME,
+        env_name=env_name,
         seed=seed,
         policy_mode="linear",
         n_rounds=n_rounds,
@@ -999,16 +1497,23 @@ def _experiment_config(method, seed, n_rounds, eval_interval, output_dir):
         l2_decay=False,
         warm_start=False,
         beta_rampdown=0,
-        bc_n_epochs=BC_EPOCHS,
+        bc_n_epochs=BC_EPOCHS if bc_n_epochs is None else bc_n_epochs,
         eval_interval=eval_interval,
-        eval_episodes=100,
-        evaluate_first_round=True,
-        fit_rule=run_experiment.FIT_RULE_EPOCHS,
+        eval_episodes=(run_experiment.EVAL_EPISODES if capacity else 100)
+        if eval_episodes is None else eval_episodes,
+        final_eval_episodes=final_eval_episodes,
+        evaluate_first_round=not capacity,
+        fit_rule=(
+            run_experiment.FIT_RULE_PLATEAU if capacity
+            else run_experiment.FIT_RULE_EPOCHS
+        ),
+        skip_unreported_fits=capacity,
         output_dir=pathlib.Path(output_dir),
         expert_cache_dir=pathlib.Path(output_dir) / "unused-expert-cache",
-        learning_rate=LEARNING_RATE,
+        learning_rate=run_experiment.BC_LEARNING_RATE if capacity else LEARNING_RATE,
         outer_early_stop=False,
         grow_batch_with_data=True,
+        paired_cold_fits=paired_cold_fits,
     )
 
 
@@ -1026,45 +1531,192 @@ def run_job(
     eval_interval: int = EVAL_INTERVAL,
     expected_data_sha256: Optional[str] = None,
     clock: Callable[[], datetime.datetime] = rollouts.utc_now,
+    spec: RunnerSpec = CARTPOLE_V2,
+    reference_data_dir: Optional[pathlib.Path] = None,
+    expected_reference_sha256: Optional[str] = None,
+    allow_relaxed_expert: bool = False,
+    bc_n_epochs: Optional[int] = None,
+    eval_episodes: Optional[int] = None,
+    final_eval_episodes: Optional[int] = None,
 ) -> int:
-    """Run one (method, restriction) pilot job into a fresh directory."""
+    """Run one (method, restriction) pilot job into a fresh directory.
+
+    Under a generic ``spec`` the baselines that normalize returns come from
+    the run's own data job unless ``reference_data_dir`` names a pinned
+    reference data job (`_verify_reference`); a non-identity restriction that
+    leaves a single distinct observation on the data job's pool is refused.
+    ``bc_n_epochs`` (generic specs only) replaces the `BC_EPOCHS` cap of every
+    fit; the default None keeps `BC_EPOCHS` and the config unchanged.
+    """
     output_dir = pathlib.Path(output_dir).absolute()
+    generic = spec.task is not None
+    learner = spec.learner
+    capacity: Optional[Dict[str, Any]] = None
     try:
-        _validate_limits(seed, job_limit_seconds)
+        _validate_limits(seed, job_limit_seconds, spec)
         pin = _validate_pin(expected_data_sha256)
-        if method not in METHODS:
-            raise classical.Refused(f"method must be one of {METHODS}: {method!r}")
-        if restriction_id not in RUN_RESTRICTIONS:
+        if method not in spec.methods:
             raise classical.Refused(
-                f"restriction must be one of {RUN_RESTRICTIONS}: {restriction_id!r}",
+                f"method must be one of {spec.methods}: {method!r}",
+            )
+        if restriction_id not in spec.run_restrictions:
+            raise classical.Refused(
+                f"restriction must be one of {spec.run_restrictions}: "
+                f"{restriction_id!r}",
             )
         if int(n_rounds) <= 0 or int(eval_interval) <= 0:
             raise classical.Refused("n_rounds and eval_interval must be positive")
-        _check_cap()
-        expert, identity = _load_expert(preparation_dir)
+        for name, value in (("eval_episodes", eval_episodes),
+                            ("final_eval_episodes", final_eval_episodes)):
+            if value is not None and int(value) <= 0:
+                raise classical.Refused(f"{name} must be positive")
+        if not generic and (
+            reference_data_dir is not None
+            or expected_reference_sha256 is not None
+            or allow_relaxed_expert
+        ):
+            raise classical.Refused(
+                "the CartPole pilot protocol takes no external reference or "
+                "relaxed-expert permission",
+            )
+        if bc_n_epochs is not None and (
+            not generic
+            or isinstance(bc_n_epochs, bool)
+            or not isinstance(bc_n_epochs, int)
+            or bc_n_epochs <= 0
+        ):
+            raise classical.Refused(
+                "bc_n_epochs must be a positive integer on a generic spec: "
+                f"{bc_n_epochs!r}",
+            )
+        if learner is not None:
+            if bc_n_epochs is not None:
+                raise classical.Refused("bc_n_epochs applies only to fixed-epoch fits")
+            if learner.student_width is None:
+                raise classical.Refused("a capacity run needs a student_width")
+            if restriction_id != "identity":
+                raise classical.Refused(
+                    "the capacity family runs on full observations: restriction "
+                    f"must be identity, not {restriction_id!r}",
+                )
+            if allow_relaxed_expert:
+                raise classical.Refused(
+                    "the capacity family never accepts a relaxed-only expert",
+                )
+            if reference_data_dir is not None or expected_reference_sha256:
+                raise classical.Refused(
+                    "the capacity family normalizes with its own data job",
+                )
+        _check_cap(spec=spec)
+        expert, identity = _load_expert(preparation_dir, spec)
+        _check_expert_quality(identity, spec, allow_relaxed_expert)
         data_record, datasets, data_sha, acceptance = _verify_data(
             data_dir,
             seed,
             identity,
             n_rounds,
             pin,
+            spec,
         )
+        if learner is not None:
+            teacher = _capacity_teacher(expert, identity, spec)
+            if data_record["config"].get("capacity_teacher") != teacher:
+                raise classical.Refused(
+                    "the data job's capacity teacher differs from the run's",
+                )
+            try:
+                probe = capacity_policy.make_capacity_policy(
+                    expert,
+                    hidden_width=learner.student_width,
+                    initialization_seed=seed,
+                    teacher_hidden_width=learner.teacher_width,
+                )
+            except ValueError as exc:
+                raise classical.Refused(str(exc)) from None
+            counts = probe.capacity_spec["parameters"]
+            capacity = {
+                "family": learner.family,
+                "student_width": learner.student_width,
+                "teacher_width": learner.teacher_width,
+                "student_widths_declared": list(capacity_policy.STUDENT_WIDTHS),
+                "spec": probe.capacity_spec,
+                "spec_sha256": probe.capacity_spec_sha256,
+                "teacher_architecture": teacher,
+                "teacher_preparation_architecture": identity["architecture"],
+                "encoder_sha256": probe.capacity_spec["encoder"]["state_sha256"],
+                "trainable_parameters": sum(
+                    p.numel() for p in probe.parameters() if p.requires_grad
+                ),
+                "optimizer_parameters": sum(
+                    p.numel() for p in probe.bc_optimizer_parameters()
+                ),
+                "total_parameters_excluding_critic": counts["total_excluding_critic"],
+                "implementation_parameters": sum(p.numel() for p in probe.parameters()),
+                "initialization_seed_source": "the run seed",
+                "scope": (
+                    "benchmark" if n_rounds == DEFAULT_BUDGET else ("reduced-budget")
+                ),
+                "eval_interval": int(eval_interval),
+                "policy_mode_note": "run_experiment policy_mode 'linear' only "
+                "routes the factory-built partially frozen learner; the factory "
+                "is capacity_policy.make_capacity_policy",
+            }
+            del probe
         if method == "bc" and len(datasets["pool"]) != n_rounds:
             raise classical.Refused(
                 f"fixed BC fits the whole pool once: n_rounds {n_rounds} must "
                 f"equal the pool size {len(datasets['pool'])}",
             )
+        reference = None
+        if generic and reference_data_dir is not None:
+            reference = _verify_reference(
+                reference_data_dir,
+                expected_reference_sha256,
+                identity,
+                spec,
+            )
+        elif expected_reference_sha256 is not None:
+            raise classical.Refused("expected_reference_sha256 needs a reference")
+        if generic:
+            pool_obs = datasets["pool"].obs
+            mask = restriction.get_restriction(restriction_id)
+            distinct = {
+                "pool": int(len(np.unique(pool_obs, axis=0))),
+                "masked_pool": int(len(np.unique(mask.apply(pool_obs), axis=0))),
+            }
+            if restriction_id != "identity" and distinct["masked_pool"] == 1:
+                raise classical.Refused(
+                    f"{restriction_id} leaves one distinct observation on the pool",
+                )
         guard, limits = _deadlines(deadline, job_limit_seconds, clock)
     except classical.Refused as exc:
         return _refused(exc)
 
-    config = _experiment_config(method, seed, n_rounds, eval_interval, output_dir)
+    config = _experiment_config(
+        method,
+        seed,
+        n_rounds,
+        eval_interval,
+        output_dir,
+        spec.env_name,
+        spec.paired_cold_fits,
+        bc_n_epochs,
+        eval_episodes=eval_episodes,
+        final_eval_episodes=final_eval_episodes,
+        capacity=capacity is not None,
+    )
     experiment = {
         k: v
         for k, v in dataclasses.asdict(config).items()
         if k not in ("output_dir", "expert_cache_dir", "result_name_override")
     }
-    shared_name = {"bc": "pool", "bc_iid": "stream"}.get(method)
+    if not spec.paired_cold_fits:
+        # Absent unless opted in, so legacy configs and digests are unchanged.
+        del experiment["paired_cold_fits"]
+    prefix = method == PREFIX_METHOD
+    shared_name = {"bc": "pool", "bc_iid": "stream", PREFIX_METHOD: "pool"}.get(
+        method,
+    )
     shared = datasets.get(shared_name)
     shared_entry = data_record["datasets"][shared_name] if shared_name else None
     run_config = {
@@ -1072,22 +1724,72 @@ def run_job(
         "method": method,
         "restriction_id": restriction_id,
         "restriction": dataclasses.asdict(restriction.get_restriction(restriction_id)),
-        "policy": "linear: expert clone, frozen features, reinitialized action_net; "
-        "restriction applied before the frozen features",
-        "beta": {"ftl": 0.0, "bc_iid": 1.0, "bc": None}[method],
-        "eval_episodes": 100,
+        "policy": (
+            "linear: expert clone, frozen features, reinitialized action_net; "
+            "restriction applied before the frozen features"
+            if capacity is None
+            else CAPACITY_POLICY_RULE
+        ),
+        "beta": {"ftl": 0.0, "bc_iid": 1.0, "bc": None, PREFIX_METHOD: None}[method],
+        "eval_episodes": int(config.eval_episodes),
         "eval_deterministic": True,
         "eval_budgets": (
             [n_rounds]
             if method == "bc"
             else [0] + eval_budgets(n_rounds, eval_interval)
+            if config.evaluate_first_round
+            else run_experiment.eval_rounds(n_rounds, eval_interval)
         ),
         "fixed_bc": FIXED_BC_RULE if method == "bc" else None,
         "batch_rule": BATCH_RULE,
         "mixture": False,
         "experiment": experiment,
     }
-    demos_rel = f"scratch/{method}_{ENV_NAME}_seed{seed}/demos"
+    if capacity is not None:
+        run_config["eval_protocol"] = run_experiment.EVAL_PROTOCOL
+    if config.final_eval_episodes is not None:
+        run_config["final_eval_episodes"] = int(config.final_eval_episodes)
+    if prefix:
+        # Added only here, so the configs of the other methods are unchanged.
+        run_config["bc_prefix"] = BC_PREFIX_RULE
+    if spec.paired_cold_fits:
+        run_config["paired_cold_fits"] = PAIRED_COLD_FITS_RULE
+    baselines = (
+        data_record["baselines"] if reference is None else reference["baselines"]
+    )
+    if spec.calibration_candidates:
+        run_config["calibration_candidates"] = {
+            rid: pilot.config_digest(restriction.describe_restriction(rid))
+            for rid in spec.calibration_candidates
+        }
+    if generic:
+        run_config.update(
+            restriction=restriction.describe_restriction(restriction_id),
+            restriction_sha256=pilot.config_digest(
+                restriction.describe_restriction(restriction_id),
+            ),
+            task_sha256=tasks.task_sha256(spec.task),
+            allow_relaxed_expert=bool(allow_relaxed_expert),
+            distinct_observations=distinct,
+            normalization_reference=_reference_descriptor(baselines),
+            reference=(
+                reference
+                or {
+                    "source": "own data job",
+                    "data_result_sha256": data_sha,
+                    "baselines": data_record["baselines"],
+                }
+            ),
+        )
+    capacity_fields: Dict[str, Any] = {}
+    if capacity is not None:
+        run_config.update(learner_family=capacity["family"], capacity=capacity)
+        capacity_fields = {
+            "learner_family": capacity["family"],
+            "student_width": capacity["student_width"],
+            "capacity_spec_sha256": capacity["spec_sha256"],
+        }
+    demos_rel = f"scratch/{method}_{spec.env_name}_seed{seed}/demos"
     live: Dict[str, Any] = {
         "records": [],
         "venv": None,
@@ -1156,16 +1858,23 @@ def run_job(
                     "expert_action_entries": eval_steps,
                     "learner_predict_calls": eval_steps,
                     "rule": EVALUATION_RULE,
+                    "resets": _evaluation_resets(evals),
                 },
                 "retained_labels": int(records[-1]["n_observations"]) if records else 0,
                 "training": {
                     "fits": len(fits),
                     "epochs": sum(int(r["inner_es_stop_epoch"]) for r in fits),
                     "early_stopped_fits": sum(
-                        int(r["inner_es_stop_epoch"]) < BC_EPOCHS for r in fits
+                        int(r["inner_es_stop_epoch"]) < config.bc_n_epochs for r in fits
                     ),
                     "fixed_budget_fallback_fits": sum(
                         r.get("inner_es_fallback") is not None for r in fits
+                    ),
+                    "monitored_fits": sum(
+                        r.get("fit_monitor") is not None for r in fits
+                    ),
+                    "cap_without_plateau_fits": sum(
+                        bool(r.get("fit_cap_without_plateau")) for r in fits
                     ),
                 },
             },
@@ -1206,7 +1915,7 @@ def run_job(
     try:
         state, writer = _start(
             output_dir,
-            RUN_SCHEMA,
+            spec.run_schema,
             identity,
             limits,
             guard,
@@ -1231,20 +1940,41 @@ def run_job(
                 "trained_pairs_sha256": live["trained_pairs_sha256"],
                 "records": live["records"],
                 "accounting": accounting(),
+                **capacity_fields,
             },
+            spec,
         )
     except classical.Refused as exc:
         return _refused(exc)
     live["state"] = state
 
-    baselines = data_record["baselines"]
-    factory = functools.partial(
-        restriction.make_linear_policy,
-        restriction_id=restriction_id,
-    )
+    if capacity is None:
+        factory = functools.partial(
+            restriction.make_linear_policy,
+            restriction_id=restriction_id,
+        )
+    else:
+        # Initialization comes from the run seed's named streams only; no
+        # global RNG advances, whatever the width.
+        factory = functools.partial(
+            capacity_policy.make_capacity_policy,
+            hidden_width=capacity["student_width"],
+            initialization_seed=seed,
+            teacher_hidden_width=capacity["teacher_width"],
+        )
 
     def relative(path):
         return os.path.relpath(path, output_dir)
+
+    def bound_checkpoint(path, binding, round_num):
+        fields = _verified_checkpoint(
+            path,
+            capacity,
+            binding,
+            run_experiment._policy_path(config, round_num),
+        )
+        fields["checkpoint_binding"]["path"] = relative(path)
+        return fields
 
     def append(row):
         live["records"].append(row)
@@ -1253,12 +1983,25 @@ def run_job(
     def on_round(record, timing):
         row = dict(record)
         if "checkpoint" in row:
+            if capacity is not None:
+                row.update(
+                    bound_checkpoint(
+                        row["checkpoint"],
+                        row.get("checkpoint_binding"),
+                        row["round"],
+                    ),
+                )
             row["checkpoint"] = relative(row["checkpoint"])
         row["wall_seconds"] = dict(timing)
         t = int(row["n_observations"])
         if method == "bc_iid" and t:
             lengths = shared_entry["stats"]["episode_lengths"]
             row["logical"] = {"labels": t, "episodes": t, "env_steps": sum(lengths[:t])}
+            if row.get("d_eval_size") is not None:
+                row["prefix_pairs_sha256"] = shared.pairs_sha256(t)
+        elif prefix and t:
+            lengths = shared_entry["stats"]["episode_lengths"]
+            row["logical"] = pool_logical_cost(lengths, t)
             if row.get("d_eval_size") is not None:
                 row["prefix_pairs_sha256"] = shared.pairs_sha256(t)
         append(row)
@@ -1297,11 +2040,22 @@ def run_job(
             expert,
             venv,
             baselines,
-            n_episodes=config.eval_episodes,
+            n_episodes=run_experiment._eval_episodes(config, final=True),
+            **run_experiment._paired_eval_kwargs(config, n_rounds),
         )
         eval_end = time.monotonic()
-        checkpoint = run_experiment._save_policy(config, trainer.policy, n_rounds)
+        saved = run_experiment._checkpoint_fields(config, trainer.policy, n_rounds)
+        checkpoint = saved["checkpoint"]
         live["trained_pairs_sha256"] = trained
+        verified = (
+            {}
+            if capacity is None
+            else bound_checkpoint(
+                checkpoint,
+                saved.get("checkpoint_binding"),
+                n_rounds,
+            )
+        )
         append(
             {
                 "round": 0,
@@ -1311,6 +2065,7 @@ def run_job(
                 "logical": pool_logical_cost(lengths, n_rounds),
                 **inner_log,
                 **evaluation,
+                **verified,
                 "checkpoint": relative(checkpoint),
                 "wall_seconds": {
                     "fit": eval_start - fit_start,
@@ -1324,10 +2079,10 @@ def run_job(
         state["in_flight"] = "setup"
         run_experiment._seed_everything(seed)
         rng = np.random.default_rng(seed)
-        venv = CountingVecEnv(env_utils.make_env(ENV_NAME, 1, rng))
+        venv = CountingVecEnv(env_utils.make_env(spec.env_name, 1, rng))
         live["venv"] = venv
         try:
-            _check_cap(venv)
+            _check_cap(venv, spec)
             th.manual_seed(seed)
             live["setup_seconds"] = time.monotonic() - start
             if method == "bc":
@@ -1343,21 +2098,24 @@ def run_job(
                     device=DEVICE,
                     policy_factory=factory,
                     offline_data=(
-                        shared.transitions(n_rounds) if method == "bc_iid" else None
+                        shared.transitions(n_rounds) if shared_name else None
                     ),
                     offline_source=(
                         {"collection_steps": shared_entry["stats"]["env_steps"]}
-                        if method == "bc_iid"
+                        if shared_name
                         else None
                     ),
                     round_callback=on_round,
                 )
                 obs, acts = trained_pairs(output_dir / demos_rel)
                 live["trained_pairs_sha256"] = pairs_sha256(obs, acts)
-                if method == "bc_iid" and live["trained_pairs_sha256"] != (
+                if shared_name and live["trained_pairs_sha256"] != (
                     shared.pairs_sha256(n_rounds)
                 ):
-                    raise RuntimeError("BC-iid trained on data other than the stream")
+                    name = "BC-prefix" if prefix else "BC-iid"
+                    raise RuntimeError(
+                        f"{name} trained on data other than the {shared_name}",
+                    )
         finally:
             venv.close()
             live["total_seconds"] = time.monotonic() - start

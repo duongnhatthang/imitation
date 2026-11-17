@@ -14,14 +14,24 @@ Adding a new MDP requires adding its reference baseline here -- the tests in
 ``tests/experiments/test_env_baselines.py`` enforce that every environment in
 ``ENV_CONFIGS`` and ``ATARI_CONFIGS`` has a corresponding entry.
 
-Random scores come from uniform-random rollouts (100 episodes).
-Expert scores come from well-trained PPO agents or published benchmarks.
+Random scores come from uniform-random rollouts (100 episodes), except for
+the variant tasks, whose random score is the exact expected return of the
+uniform-random policy (`finite_horizon_value` on the transition table, the
+reset distribution and the 100-step cap). Expert scores come from well-trained
+PPO agents or published benchmarks, except ``FrozenLakeSlippery-v0``, whose
+expert score is the exact finite-horizon optimum.
+
+Every environment, CliffWalking included, normalizes against its uniform-random
+lower reference. The CliffWalking stalled-policy return (-200, -1 per step
+until the 200-step cap) is only a diagnostic horizontal benchmark
+(`STALL_BENCHMARK_RETURNS`), never a lower normalization reference.
 """
 
 import json
 import logging
 import pathlib
-from typing import Dict, Tuple
+from fractions import Fraction
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from stable_baselines3.common.vec_env import VecEnv
@@ -41,6 +51,21 @@ REFERENCE_BASELINES: Dict[str, Dict[str, float]] = {
     "Taxi-v3": {"random_score": -763.0, "expert_score": 7.9},
     "Blackjack-v1": {"random_score": -0.40, "expert_score": -0.06},
     "LunarLander-v2": {"random_score": -176.0, "expert_score": 250.0},
+    # ---- Variant tasks ----
+    # Exact uniform-random value, float of the rational from
+    # finite_horizon_value(P, uniform reset over the 11 safe states, 100, 4).
+    # The optimal policy succeeds from every reset state.
+    "FrozenLakeVariedStart-v0": {
+        "random_score": 0.09037647670287287,
+        "expert_score": 1.0,
+    },
+    # Floats of the exact rationals in REFERENCE_METADATA: uniform-random and
+    # optimal finite_horizon_value from state 0 with the intended 1/3 slips
+    # (rational_transitions), 100 actions.
+    "FrozenLakeSlippery-v0": {
+        "random_score": 0.013939795959171435,
+        "expert_score": 0.7441902878292673,
+    },
     # ---- Atari Tier 1 ----
     "PongNoFrameskip-v4": {"random_score": -20.7, "expert_score": 20.5},
     "BreakoutNoFrameskip-v4": {"random_score": 1.7, "expert_score": 405.7},
@@ -77,6 +102,70 @@ REFERENCE_BASELINES: Dict[str, Dict[str, float]] = {
 # Minimum fraction of (expert - random) that a measured expert must achieve
 # to be considered acceptable.
 EXPERT_QUALITY_THRESHOLD: float = 0.80
+
+# Diagnostic horizontal benchmarks at the stalled-policy return (CliffWalking
+# only): -1 per step until the 200-step cap. Never a normalization reference.
+STALL_BENCHMARK_RETURNS: Dict[str, float] = {"CliffWalking-v0": -200.0}
+STALL_BENCHMARK_RULE = (
+    "CliffWalking only: diagnostic horizontal benchmark at the stalled-policy "
+    "return -200 (-1 per step until the 200-step cap). It is never a lower "
+    "normalization reference; normalization uses the uniform-random "
+    "random_score."
+)
+
+# Provenance of reference scores that are not plain uniform-random rollouts
+# and published or PPO expert scores. Read through `reference_metadata`.
+REFERENCE_METADATA: Dict[str, Dict[str, Any]] = {
+    "CliffWalking-v0": {
+        "normalization_reference_type": "uniform_random",
+        "random_score_rule": "historic uniform-random score carried over "
+        "unchanged; not measured under the current 200-step cap (it lies below "
+        "-20000, the worst return of any 200-step episode)",
+        "stall_benchmark_return": STALL_BENCHMARK_RETURNS["CliffWalking-v0"],
+        "stall_benchmark_rule": STALL_BENCHMARK_RULE,
+    },
+    "FrozenLakeSlippery-v0": {
+        "normalization_reference_type": "uniform_random",
+        "random_score_exact": (
+            "700012139250010050149443607275333445793063125491190300891/"
+            "50216813883093446110686315385661331328818843555712276103168"
+        ),
+        "expert_score_exact": (
+            "127846315164763240597097944751513986598202943912/"
+            "171792506910670443678820376588540424234035840667"
+        ),
+        "random_score_rule": "exact uniform-random finite_horizon_value from "
+        "state 0, 100 actions, intended 1/3 slips (rational_transitions)",
+        "expert_score_rule": "exact finite-horizon optimum (a nonstationary "
+        "policy, the upper benchmark); a stationary expert can fall short of "
+        "it and is qualified against the usual threshold",
+    },
+}
+
+
+def reference_metadata(env_name: str) -> Dict[str, Any]:
+    """How the reference scores of ``env_name`` were obtained.
+
+    Every environment has the uniform-random lower reference; entries in
+    `REFERENCE_METADATA` add provenance and diagnostic benchmarks.
+    """
+    meta = {"normalization_reference_type": "uniform_random"}
+    meta.update(REFERENCE_METADATA.get(env_name, {}))
+    return meta
+
+
+def normalization_reference(
+    env_name: Optional[str],
+    measured_uniform_random_return: float,
+) -> Dict[str, Any]:
+    """Overrides of the measured lower normalization reference: always empty.
+
+    Every environment, CliffWalking included, keeps its measured uniform
+    random return as ``random_return``; `STALL_BENCHMARK_RETURNS` are
+    diagnostic benchmarks only.
+    """
+    del env_name, measured_uniform_random_return
+    return {}
 
 
 def validate_expert_quality(
@@ -123,6 +212,95 @@ def validate_expert_quality(
             f"({EXPERT_QUALITY_THRESHOLD:.0%} of [{random_score}, {expert_score}]). "
             f"The expert may be degenerate."
         )
+
+
+def rational_transitions(
+    P: Mapping[int, Mapping[int, Sequence[Tuple[Any, int, Any, bool]]]],
+    max_denominator: int = 1000,
+) -> Dict[int, Dict[int, list]]:
+    """Copy of ``P`` with each float probability as its intended rational.
+
+    Toy-text tables store intended probabilities such as 1/3 as floats, whose
+    exact value ``Fraction(x)`` is not 1/3. Each probability becomes the
+    closest rational with denominator at most ``max_denominator``, accepted
+    only if it rounds back to the same float.
+
+    Raises:
+        ValueError: If no such rational rounds back to a stored probability.
+    """
+    table: Dict[int, Dict[int, list]] = {}
+    for s, actions in P.items():
+        table[s] = {}
+        for a, outcomes in actions.items():
+            rows = []
+            for p, nxt, r, done in outcomes:
+                exact = Fraction(p).limit_denominator(max_denominator)
+                if float(exact) != float(p):
+                    raise ValueError(
+                        f"P[{s}][{a}]: probability {p!r} is no rational with "
+                        f"denominator <= {max_denominator}",
+                    )
+                rows.append((exact, nxt, r, done))
+            table[s][a] = rows
+    return table
+
+
+def finite_horizon_value(
+    P: Mapping[int, Mapping[int, Sequence[Tuple[Any, int, Any, bool]]]],
+    initial_distribution: Sequence[Any],
+    horizon: int,
+    n_actions: int,
+    *,
+    optimal: bool = False,
+    policy: Optional[Mapping[int, int]] = None,
+) -> Fraction:
+    """Exact expected return of at most ``horizon`` actions on a tabular MDP.
+
+    Backward induction over ``P[s][a] = [(prob, next, reward, done), ...]``
+    (the gymnasium toy-text layout) in exact rational arithmetic: floats are
+    converted with ``Fraction(x)``, which is exact. A ``done`` transition ends
+    the episode; running out of actions truncates it with no further reward.
+
+    Args:
+        P: Transition table.
+        initial_distribution: Reset weight indexed by state (exact if given
+            as ``Fraction``).
+        horizon: Maximum number of actions (the episode cap).
+        n_actions: Number of actions.
+        optimal: If True, the best action in every state and step; otherwise
+            the uniform-random policy.
+        policy: If given, the deterministic stationary policy ``policy[s]``
+            instead of the uniform-random one.
+
+    Returns:
+        ``sum_s initial_distribution[s] * V_horizon(s)`` as a ``Fraction``.
+
+    Raises:
+        ValueError: If both ``optimal`` and ``policy`` are given.
+    """
+    if optimal and policy is not None:
+        raise ValueError("Give either optimal=True or a policy, not both")
+    states = sorted(P)
+    value = {s: Fraction(0) for s in states}
+    for _ in range(int(horizon)):
+        q = {
+            s: [
+                sum(
+                    Fraction(p) * (Fraction(r) + (0 if done else value[nxt]))
+                    for p, nxt, r, done in P[s][a]
+                )
+                for a in range(n_actions)
+            ]
+            for s in states
+        }
+        if policy is not None:
+            value = {s: q[s][policy[s]] for s in states}
+        else:
+            value = {s: max(q[s]) if optimal else sum(q[s]) / n_actions for s in states}
+    return sum(
+        (Fraction(initial_distribution[s]) * value[s] for s in states),
+        Fraction(0),
+    )
 
 
 def compute_random_return(venv: VecEnv, n_episodes: int = 100) -> float:

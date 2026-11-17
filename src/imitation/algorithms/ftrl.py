@@ -222,12 +222,21 @@ class FTRLTrainer(dagger.SimpleDAggerTrainer):
             )
 
     def _reinitialize_trainable_params(self) -> None:
-        """Reinitialize trainable parameters and discard optimizer history."""
-        for p in self.policy.parameters():
-            if p.requires_grad and p.dim() >= 2:
-                th.nn.init.xavier_uniform_(p)
-            elif p.requires_grad and p.dim() == 1:
-                th.nn.init.zeros_(p)
+        """Reinitialize trainable parameters and discard optimizer history.
+
+        A policy with a ``cold_refit_reinitialize`` hook draws its own fresh
+        parameters (for example from a named stream that leaves global RNGs
+        untouched); other policies keep the original global-RNG Xavier rule.
+        """
+        reinitialize = getattr(self.policy, "cold_refit_reinitialize", None)
+        if reinitialize is not None:
+            reinitialize()
+        else:
+            for p in self.policy.parameters():
+                if p.requires_grad and p.dim() >= 2:
+                    th.nn.init.xavier_uniform_(p)
+                elif p.requires_grad and p.dim() == 1:
+                    th.nn.init.zeros_(p)
         self.bc_trainer.optimizer.state.clear()
         self.bc_trainer.optimizer.zero_grad(set_to_none=True)
 

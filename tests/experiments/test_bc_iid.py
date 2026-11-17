@@ -87,7 +87,9 @@ def tiny_experiment(tmp_path, monkeypatch):
         learning_rate=0.0,
         outer_early_stop=False,
         inner_early_stop=False,
+        # These tests pin the per-round fit mechanics of the earlier rule.
         fit_rule="epoch-cap/1",
+        skip_unreported_fits=False,
     )
 
 

@@ -57,13 +57,16 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 import gymnasium as gym
 from stable_baselines3 import PPO
 
-from imitation.experiments.agnostic import classical, pilot, quantized, rollouts
+from imitation.experiments.agnostic import classical, pilot, quantized, rollouts, tasks
 from imitation.experiments.ftrl import env_utils, expert_training
 from imitation.util import util
 
 logger = logging.getLogger(__name__)
 
+# Stage 2 (``audit``, ``run-cell``) needs a predeclared quantizer.
 SUPPORTED_ENVS = ("CartPole-v1", "Acrobot-v1", "MountainCar-v0")
+# Stage 1 prepares experts for every classical restriction task.
+PREPARATION_ENVS = tuple(tasks.TASKS)
 
 EXIT_QUALIFIED = 0
 EXIT_NOT_QUALIFIED = 1
@@ -76,6 +79,12 @@ TRAINER_NAME = (
 )
 CHECKPOINT_DIR = "trainer_cache"
 CLAIM_FILE = "preparation.claim"
+
+# Explicit teacher architectures (``--actor-net-arch``). The default config,
+# with no ``architecture`` block, keeps the inherited [64, 64] and its bytes.
+ARCHITECTURE_SCHEMA = "agnostic-expert-architecture/1"
+ONE_HIDDEN_NET_ARCH = (64,)
+SUPPORTED_ACTOR_NET_ARCHS = (ONE_HIDDEN_NET_ARCH,)
 
 TRAINING_INTERRUPTIBILITY = (
     "The inherited convergence trainer is not interruptible by the deadline: "
@@ -114,6 +123,53 @@ def _training_env_reset_seeds(env_name: str, seed: int) -> List[int]:
     return sorted(set(drawn) | {seed + i for i in range(n_train)})
 
 
+def _validated_net_arch(actor_net_arch: Any) -> Optional[List[int]]:
+    if actor_net_arch is None:
+        return None
+    widths = list(actor_net_arch) if isinstance(actor_net_arch, (list, tuple)) else []
+    plain = all(isinstance(w, int) and not isinstance(w, bool) for w in widths)
+    if not plain or tuple(widths) not in SUPPORTED_ACTOR_NET_ARCHS:
+        raise ValueError(
+            f"actor_net_arch must be one of {SUPPORTED_ACTOR_NET_ARCHS}: "
+            f"{actor_net_arch!r}",
+        )
+    return widths
+
+
+def architecture_claim(net_arch: Sequence[int]) -> Dict[str, Any]:
+    """The architecture an explicit-architecture preparation commits to.
+
+    PPO's ``MlpPolicy`` with ``net_arch=list(net_arch)`` gives the actor and
+    the critic these hidden widths, SB3's default Tanh activation and the
+    flattening features extractor; deterministic predict takes the argmax.
+    """
+    return {
+        "schema": ARCHITECTURE_SCHEMA,
+        "pi": list(net_arch),
+        "vf": list(net_arch),
+        "activation_fn": "torch.nn.modules.activation.Tanh",
+        "features_extractor": (
+            "stable_baselines3.common.torch_layers.FlattenExtractor"
+        ),
+        "action_rule": "deterministic predict (argmax)",
+    }
+
+
+def architecture_mismatches(
+    claim: Mapping[str, Any],
+    actual: Mapping[str, Any],
+) -> List[str]:
+    """Claimed fields the actual `expert_training.policy_architecture` breaks."""
+    failed = [
+        key
+        for key in ("pi", "vf", "activation_fn", "features_extractor")
+        if claim.get(key) != actual.get(key)
+    ]
+    if actual.get("module_activations") != [claim.get("activation_fn")]:
+        failed.append("module_activations")
+    return failed
+
+
 def build_preparation_config(
     env_name: str,
     *,
@@ -122,26 +178,35 @@ def build_preparation_config(
     eval_episodes: int,
     convergence_override: Optional[Mapping[str, Any]],
     max_eval_env_steps: Optional[int] = None,
+    actor_net_arch: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """Build the full config that identifies an expert preparation.
 
     Args:
-        env_name: One of `SUPPORTED_ENVS`.
+        env_name: One of `PREPARATION_ENVS`.
         seed: PPO training seed.
         qualification_seed: Env reset seed for qualification episodes.
         eval_episodes: Number of fresh qualification episodes.
         convergence_override: Optional partial convergence config.
         max_eval_env_steps: Cap on qualification env steps. Defaults to
-            ``eval_episodes * max_episode_steps``.
+            ``eval_episodes`` times the effective episode cap of the original
+            factory, which for CliffWalking and Blackjack is the configured
+            fallback because their registered cap is None.
+        actor_net_arch: None for the inherited [64, 64] config, unchanged;
+            otherwise one of `SUPPORTED_ACTOR_NET_ARCHS`, which sets
+            ``expert.net_arch`` and adds a versioned ``expert.architecture``
+            claim (`architecture_claim`).
 
     Returns:
         JSON-compatible config dict.
 
     Raises:
-        ValueError: On unsupported env, bad counts, or overlapping seeds.
+        ValueError: On unsupported env or architecture, bad counts, or
+            overlapping seeds.
     """
-    if env_name not in SUPPORTED_ENVS:
-        raise ValueError(f"Unsupported env {env_name!r}; use {SUPPORTED_ENVS}")
+    net_arch = _validated_net_arch(actor_net_arch)
+    if env_name not in PREPARATION_ENVS:
+        raise ValueError(f"Unsupported env {env_name!r}; use {PREPARATION_ENVS}")
     if int(eval_episodes) <= 0:
         raise ValueError("eval_episodes must be positive")
     if int(seed) < 0 or int(qualification_seed) < 0:
@@ -152,7 +217,10 @@ def build_preparation_config(
             f"qualification_seed {qualification_seed} overlaps training seeds "
             f"{training_seeds} for seed {seed}",
         )
-    horizon = gym.spec(env_name).max_episode_steps
+    registered = gym.spec(env_name).max_episode_steps
+    horizon = tasks.effective_episode_cap(env_name)
+    if registered is not None and registered != horizon:
+        raise ValueError(f"{env_name} factory cap {horizon} != registered {registered}")
     if max_eval_env_steps is None:
         max_eval_env_steps = int(eval_episodes) * int(horizon)
     if int(max_eval_env_steps) <= 0:
@@ -160,10 +228,21 @@ def build_preparation_config(
 
     convergence = pilot.merged_convergence_config(env_name, convergence_override)
     env_cfg = env_utils.ENV_CONFIGS[env_name]
-    return {
+    # Only fallback-cap tasks get the extra keys, so the configs (and digests)
+    # of tasks with a registered cap are unchanged.
+    cap_rule = (
+        {}
+        if registered is not None
+        else {
+            "env_registered_max_episode_steps": None,
+            "env_episode_cap_rule": "env_utils fallback TimeLimit",
+        }
+    )
+    config = {
         "schema": pilot.PREPARATION_SCHEMA,
         "env_name": env_name,
         "env_max_episode_steps": int(horizon),
+        **cap_rule,
         "seed": int(seed),
         "qualification_seed": int(qualification_seed),
         "eval_episodes": int(eval_episodes),
@@ -192,6 +271,10 @@ def build_preparation_config(
             "max_env_steps": int(max_eval_env_steps),
         },
     }
+    if net_arch is not None:
+        config["expert"]["net_arch"] = list(net_arch)
+        config["expert"]["architecture"] = architecture_claim(net_arch)
+    return config
 
 
 def _error(exc: BaseException) -> Dict[str, str]:
@@ -297,11 +380,12 @@ def prepare_expert(
     max_eval_env_steps: Optional[int] = None,
     trainer: Optional[Callable[..., Any]] = None,
     clock: Callable[[], datetime.datetime] = rollouts.utc_now,
+    actor_net_arch: Optional[Sequence[int]] = None,
 ) -> int:
     """Train and qualify an expert, recording evidence in ``output_dir``.
 
     Args:
-        env_name: One of `SUPPORTED_ENVS`.
+        env_name: One of `PREPARATION_ENVS`.
         output_dir: Directory for ``preparation.json`` and the checkpoint.
         seed: PPO training seed.
         qualification_seed: Env reset seed for qualification, disjoint from
@@ -313,6 +397,9 @@ def prepare_expert(
         max_eval_env_steps: Optional cap on qualification env steps.
         trainer: Replacement for the inherited trainer (tests only).
         clock: Returns the current aware time.
+        actor_net_arch: Explicit teacher architecture (`build_preparation_config`).
+            When given, the trainer receives ``net_arch`` and the trained
+            policy must match the claim, or the preparation fails.
 
     Returns:
         Process exit code; `EXIT_QUALIFIED` only for a complete, qualified
@@ -329,7 +416,9 @@ def prepare_expert(
         eval_episodes=eval_episodes,
         convergence_override=convergence_override,
         max_eval_env_steps=max_eval_env_steps,
+        actor_net_arch=actor_net_arch,
     )
+    claim_architecture = config["expert"].get("architecture")
     output_dir = pathlib.Path(output_dir)
     if _has_existing_entries(output_dir):
         return _inspect_existing(output_dir, config)
@@ -377,6 +466,9 @@ def prepare_expert(
         },
         "elapsed_seconds": elapsed,
     }
+    if claim_architecture is not None:
+        # Top-level alias, so a campaign manifest can pin the architecture.
+        record["actor_net_arch"] = config["expert"]["net_arch"]
 
     def finish(status: str, exc: Optional[BaseException] = None) -> int:
         record["status"] = status
@@ -412,6 +504,11 @@ def prepare_expert(
     pilot.atomic_write_json(record_path, record)
     cache_dir = output_dir / CHECKPOINT_DIR
     t0 = time.monotonic()
+    # Only explicit-architecture preparations pass net_arch, so the inherited
+    # call (and any trainer written for it) is unchanged.
+    architecture_kwargs = (
+        {} if claim_architecture is None else {"net_arch": config["expert"]["net_arch"]}
+    )
     try:
         trainer(
             env_name,
@@ -421,6 +518,7 @@ def prepare_expert(
             convergence_override=(
                 config["convergence_config"] if convergence_override else None
             ),
+            **architecture_kwargs,
         )
     except Exception as exc:
         elapsed["expert_training"] = time.monotonic() - t0
@@ -440,7 +538,17 @@ def prepare_expert(
             "policy_state_sha256": pilot.policy_state_sha256(model.policy),
         }
         record["expert_sha256"] = digest
+        if claim_architecture is not None:
+            actual = expert_training.policy_architecture(model.policy)
+            record["checkpoint"]["architecture"] = actual
         pilot.atomic_write_json(record_path, record)
+        if claim_architecture is not None:
+            failed = architecture_mismatches(claim_architecture, actual)
+            if failed:
+                raise ValueError(
+                    f"Trained architecture {actual} differs from the claimed "
+                    f"architecture in {failed}",
+                )
     except Exception as exc:
         return finish("failed", exc)
 
@@ -507,7 +615,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     prep = sub.add_parser("prepare-expert", help="Train and qualify an expert.")
-    prep.add_argument("--env", required=True, choices=SUPPORTED_ENVS)
+    prep.add_argument("--env", required=True, choices=PREPARATION_ENVS)
     prep.add_argument("--output-dir", required=True, type=pathlib.Path)
     prep.add_argument("--seed", required=True, type=int)
     prep.add_argument("--qualification-seed", required=True, type=int)
@@ -525,6 +633,15 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="JSON object merged over the env's convergence config.",
     )
     prep.add_argument("--max-eval-env-steps", type=int, default=None)
+    prep.add_argument(
+        "--actor-net-arch",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit teacher hidden widths, one of "
+        f"{[list(a) for a in SUPPORTED_ACTOR_NET_ARCHS]}; omit for the "
+        "inherited [64, 64] config.",
+    )
 
     aud = sub.add_parser("audit", help="Stage 2 alias audit (diagnostic labels).")
     cell = sub.add_parser("run-cell", help="Stage 2 FTL / BC-iid / fixed BC cell.")
@@ -635,6 +752,7 @@ def main(
             convergence_override=args.convergence_override,
             max_eval_env_steps=args.max_eval_env_steps,
             trainer=trainer,
+            actor_net_arch=args.actor_net_arch,
         )
     except ValueError as exc:
         logger.error("Invalid arguments: %s", exc)

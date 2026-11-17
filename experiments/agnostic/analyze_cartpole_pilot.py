@@ -36,6 +36,11 @@ import numpy as np  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
+from imitation.experiments.ftrl.plot_results import (  # noqa: E402, F401
+    NORMALIZED_RETURN_YLIM,
+    set_normalized_return_axis,
+)
+
 SOURCE_COMMIT = "2896ffe"
 PROTOCOL = "agnostic-cartpole-restriction-pilot/1"
 SEED = 300
@@ -495,10 +500,8 @@ def curves_figure(points, refs, rows, baselines, cap, ceiling, n_episodes, n_rou
     ax = axes[0, 0]
     ax.axhline(1.0, color="#555555", ls=":", lw=1.2, zorder=0)
     ax.axhline(0.0, color="#999999", ls="-.", lw=1.0, zorder=0)
-    # Limits follow the stored values so nothing is clipped.
-    norm = ([p["normalized_return"] for j in ONLINE_IDS for p in points[j]]
-            + [refs[j]["normalized_return"] for j in BC_IDS])
-    ax.set_ylim(min(0.0, min(norm)) - 0.08, max(1.0, max(norm)) + 0.08)
+    # Shared fixed view; the stored values are plotted unchanged.
+    set_normalized_return_axis(ax)
     same = "equals" if expert_return == cap else "differs from"
     ceiling_text = (
         f"Ceiling: normalized 1 is raw {expert_return:g}, the expert reference;\n"

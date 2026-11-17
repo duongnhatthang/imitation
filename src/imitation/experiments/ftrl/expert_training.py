@@ -9,9 +9,10 @@ budget is exhausted before convergence.
 import collections
 import logging
 import pathlib
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
+import torch as th
 from stable_baselines3 import PPO
 from stable_baselines3.common.policies import BasePolicy
 
@@ -20,6 +21,45 @@ from imitation.experiments.ftrl.env_baselines import REFERENCE_BASELINES
 from imitation.experiments.ftrl.eval_utils import eval_policy_rollout
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_NET_ARCH = (64, 64)
+
+
+def _qualified(cls: type) -> str:
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def policy_architecture(policy) -> Dict[str, Any]:
+    """Actual architecture of an SB3 actor-critic policy, read from its modules.
+
+    Args:
+        policy: An SB3 ``ActorCriticPolicy`` (for example ``model.policy``).
+
+    Returns:
+        Hidden widths of the actor and critic MLPs, their activation classes,
+        the features extractor class, features and action dimensions.
+    """
+
+    def describe(net):
+        widths = [m.out_features for m in net if isinstance(m, th.nn.Linear)]
+        others = sorted(
+            {_qualified(type(m)) for m in net} - {"torch.nn.modules.linear.Linear"}
+        )
+        return widths, others
+
+    pi, pi_activations = describe(policy.mlp_extractor.policy_net)
+    vf, vf_activations = describe(policy.mlp_extractor.value_net)
+    head = policy.action_net
+    return {
+        "pi": pi,
+        "vf": vf,
+        "activation_fn": _qualified(policy.activation_fn),
+        "module_activations": sorted(set(pi_activations) | set(vf_activations)),
+        "features_extractor": _qualified(type(policy.features_extractor)),
+        "features_dim": int(policy.features_dim),
+        "n_actions": int(getattr(head, "out_features", -1)),
+    }
 
 
 def _normalize(mean_return: float, env_name: str) -> float:
@@ -36,6 +76,7 @@ def train_classical_expert_until_converged(
     rng: np.random.Generator,
     seed: int,
     convergence_override: Optional[Dict[str, float]] = None,
+    net_arch: Optional[Sequence[int]] = None,
 ) -> BasePolicy:
     """Train a PPO MlpPolicy expert with chunked learn + convergence detection.
 
@@ -46,6 +87,8 @@ def train_classical_expert_until_converged(
         seed: PPO seed.
         convergence_override: If provided, fully replaces the per-env config.
             Intended for tests that want to force a non-convergence path.
+        net_arch: Hidden widths shared by the actor and critic MLPs; None
+            keeps the original `DEFAULT_NET_ARCH`.
 
     Returns:
         The converged `model.policy`.
@@ -81,7 +124,9 @@ def train_classical_expert_until_converged(
     model = PPO(
         "MlpPolicy",
         train_venv,
-        policy_kwargs=dict(net_arch=[64, 64]),
+        policy_kwargs=dict(
+            net_arch=list(DEFAULT_NET_ARCH if net_arch is None else net_arch),
+        ),
         seed=seed,
         verbose=0,
         # Last, so no per-env config can move this MLP off the CPU: SB3's

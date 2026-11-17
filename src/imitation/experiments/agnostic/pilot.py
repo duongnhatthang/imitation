@@ -41,6 +41,8 @@ _SOURCE_FILES = (
     "experiments/agnostic/pilot.py",
     "experiments/agnostic/rollouts.py",
     "experiments/agnostic/run_classical.py",
+    "experiments/agnostic/tasks.py",
+    "experiments/agnostic/task_experts.py",
     "experiments/ftrl/expert_training.py",
     "experiments/ftrl/env_utils.py",
     "experiments/ftrl/env_baselines.py",

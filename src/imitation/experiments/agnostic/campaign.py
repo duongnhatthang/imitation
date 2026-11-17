@@ -41,6 +41,15 @@ exit whose result JSON reports ``status`` in ``QUALITY_FAILURE_STATUSES``
 (the producer contract for a scientific or quality gate failure). The failed
 artifact stays in place for inspection.
 
+Shared capacity (opt-in): ``--capacity-config CFG --capacity-state-dir DIR``
+makes the runner claim a slot lease from ``resource_budget`` before each launch,
+bind it to the child process group once spawned, and release it only after the
+group is reaped. Controllers sharing ``DIR`` never exceed the config ``limit``
+together. External campaigns listed in the config are not modified: their
+inventories are read (bound to the expected canonical manifest hash) and
+charged by ``inventory_capacity_charge``. ``--workers`` still caps this runner.
+Without the flags the runner behaves exactly as before.
+
 Exit codes: 0 when every job has a validated complete result, 1 when any job
 does not, 2 for refused input (invalid manifest, incompatible inventory,
 source mismatch, ineligible retry, lock held), 128+N after signal N.
@@ -63,6 +72,8 @@ import time
 import uuid
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
+from imitation.experiments.agnostic import resource_budget
+
 MANIFEST_VERSION = 1
 INVENTORY_VERSION = 1
 HARD_CAP = "2026-10-07T01:01:00Z"
@@ -76,6 +87,8 @@ MAX_KILL_GRACE_SECONDS = 60.0
 UNREAPED_GROUP_TIMEOUT_SECONDS = 10.0
 MAX_RESULT_BYTES = 16 * 1024 * 1024
 POLL_INTERVAL_SECONDS = 0.1
+# Minimum spacing of shared-capacity acquisition attempts while waiting.
+CAPACITY_RETRY_SECONDS = 2.0
 
 JOB_KINDS = ("expert", "learner")
 JOB_STATES = (
@@ -451,6 +464,107 @@ def _check_inventory_compatible(inv: Any, manifest: Dict[str, Any]) -> None:
             raise CampaignError(f"existing inventory row {job_id} is malformed")
 
 
+def inventory_capacity_charge(entry: Dict[str, str]) -> Dict[str, Any]:
+    """Worker slots another campaign's inventory may occupy, read-only.
+
+    The inventory must be bound to ``entry["manifest_sha256"]`` through both
+    ``inventory.json`` and the canonical manifest copy. While its last
+    controller run is open and its pid is alive, the reservation is
+    ``min(workers, pending + running)``, so its next launch is never raced.
+    Independently, every job whose latest attempt is unfinished (running,
+    interrupted, or left unreaped) and not covered by that reservation is
+    charged one slot while its recorded group exists, or always when no group
+    was recorded, since a crash between fork and record cannot be ruled out.
+
+    Args:
+        entry: ``inventory_dir`` and expected ``manifest_sha256``.
+
+    Returns:
+        Report with ``charge`` and the facts it was derived from.
+
+    Raises:
+        CapacityError: If any state is missing, malformed, or mismatched.
+    """
+    directory, expected = entry["inventory_dir"], entry["manifest_sha256"]
+
+    def refuse(why: str) -> resource_budget.CapacityError:
+        return resource_budget.CapacityError(f"external campaign {directory}: {why}")
+
+    try:
+        with open(os.path.join(directory, "manifest.canonical.json"), "rb") as f:
+            manifest = _load_json_strict(f.read().decode("utf-8"))
+        with open(os.path.join(directory, "inventory.json"), "rb") as f:
+            inv = _load_json_strict(f.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise refuse(f"unreadable state: {exc}") from exc
+    if hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest() != expected:
+        raise refuse("canonical manifest does not match the expected hash")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("jobs"), list):
+        raise refuse("canonical manifest has no job list")
+    if not all(isinstance(job, dict) for job in manifest["jobs"]):
+        raise refuse("canonical manifest job malformed")
+    if not isinstance(inv, dict) or inv.get("version") != INVENTORY_VERSION:
+        raise refuse("unsupported inventory format")
+    if inv.get("manifest_sha256") != expected:
+        raise refuse("inventory is bound to a different manifest")
+    jobs, runs = inv.get("jobs"), inv.get("controller_runs")
+    if not isinstance(jobs, dict) or not isinstance(runs, list):
+        raise refuse("inventory jobs or controller_runs malformed")
+    if set(jobs) != {job.get("id") for job in manifest["jobs"]}:
+        raise refuse("inventory job set does not match manifest")
+    for row in jobs.values():
+        if (
+            not isinstance(row, dict)
+            or row.get("state") not in JOB_STATES
+            or not isinstance(row.get("attempts"), list)
+            or not all(isinstance(a, dict) for a in row["attempts"])
+        ):
+            raise refuse("inventory row malformed")
+    last = runs[-1] if runs else None
+    if last is not None and not (
+        isinstance(last, dict)
+        and type(last.get("controller_pid")) is int
+        and last["controller_pid"] > 0
+        and type(last.get("workers")) is int
+        and 1 <= last["workers"] <= MAX_WORKERS
+    ):
+        raise refuse("last controller run malformed")
+    active = (
+        last is not None
+        and last.get("ended_at") is None
+        and resource_budget.pid_alive(last["controller_pid"])
+    )
+    states = [row["state"] for row in jobs.values()]
+    open_jobs = states.count("pending") + states.count("running")
+    reserved = min(last["workers"], open_jobs) if active else 0
+    orphan_groups = unverifiable = 0
+    for row in jobs.values():
+        if not row["attempts"] or (active and row["state"] in ("pending", "running")):
+            continue
+        attempt = row["attempts"][-1]
+        termination = attempt.get("termination")
+        unreaped = isinstance(termination, dict) and bool(
+            termination.get("group_members_unreaped"),
+        )
+        if attempt.get("state") not in ("running", "interrupted") and not unreaped:
+            continue
+        pgid = attempt.get("pgid")
+        if type(pgid) is not int or pgid <= 0:
+            unverifiable += 1
+        elif resource_budget.group_alive(pgid):
+            orphan_groups += 1
+    return {
+        "charge": reserved + orphan_groups + unverifiable,
+        "controller_active": active,
+        "workers": last["workers"] if last is not None else None,
+        "pending": states.count("pending"),
+        "running": states.count("running"),
+        "reserved": reserved,
+        "orphan_groups": orphan_groups,
+        "unverifiable_attempts": unverifiable,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Result validation
 # ---------------------------------------------------------------------------
@@ -547,6 +661,7 @@ class _Running:
         self.cleanup_reason: Optional[str] = None
         self.kill_at: Optional[float] = None
         self.kill_sent_mono: Optional[float] = None
+        self.lease_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +680,7 @@ class CampaignRunner:
         retry_ids: Sequence[str] = (),
         kill_grace: float = DEFAULT_KILL_GRACE_SECONDS,
         poll_interval: Optional[float] = None,
+        capacity: Optional[resource_budget.CapacityBudget] = None,
     ):
         if type(workers) is not int or not 1 <= workers <= MAX_WORKERS:
             raise CampaignError(f"workers must be an integer in [1, {MAX_WORKERS}]")
@@ -588,6 +704,9 @@ class CampaignRunner:
         self.stop_signal: Optional[int] = None
         self.abort_reason: Optional[str] = None
         self.run_record: Dict[str, Any] = {}
+        self.capacity = capacity
+        self.capacity_retry_at = 0.0
+        self.capacity_wait: Optional[Dict[str, Any]] = None
         # Deadlines are mapped to the monotonic clock once, at startup.
         wall, mono = time.time(), time.monotonic()
         self.stage_deadline = mono + (manifest["stage_deadline"].timestamp() - wall)
@@ -704,9 +823,50 @@ class CampaignRunner:
         os.replace(path, archived)
         return {"from": path, "to": archived, "sha256": sha}
 
-    def _launch(self, job_id: str) -> None:
+    def _acquire_capacity(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Claim a shared slot for the next launch.
+
+        Returns:
+            None when no budget is configured, the grant record when a lease was
+            acquired, or ``{}`` when the launch must wait (full or invalid state).
+        """
+        if self.capacity is None:
+            return None
+        now = time.monotonic()
+        if now < self.capacity_retry_at:
+            return {}
+        label = {
+            "campaign_id": self.manifest["campaign_id"],
+            "inventory_dir": self.inventory_dir,
+            "job_id": job_id,
+        }
+        lease_id, usage = self.capacity.try_acquire(label)
+        if lease_id is None:
+            self.capacity_retry_at = now + CAPACITY_RETRY_SECONDS
+            summary = usage.get("refused") or f"{usage['used']}/{usage['limit']} used"
+            if self.capacity_wait is None or self.capacity_wait["summary"] != summary:
+                print(f"[campaign] waiting for shared capacity: {summary}")
+                # Persisted with the next save, e.g. if the wait ends in a deadline.
+                self.run_record["capacity"]["last_wait"] = {
+                    "at": _iso(_utcnow()),
+                    "summary": summary,
+                }
+            if self.capacity_wait is None:
+                self.capacity_wait = {"since": now}
+            self.capacity_wait.update(summary=summary)
+            return {}
+        waited = now - self.capacity_wait["since"] if self.capacity_wait else 0.0
+        self.capacity_wait = None
+        return {"lease_id": lease_id, "waited_seconds": waited, "usage_before": usage}
+
+    def _release_capacity(self, lease_id: Optional[str], reaped: bool) -> None:
+        if self.capacity is not None and lease_id is not None:
+            self.capacity.release(lease_id, reaped)
+
+    def _launch(self, job_id: str, grant: Optional[Dict[str, Any]] = None) -> None:
         job = self.jobs[job_id]
         row = self._row(job_id)
+        lease_id = grant["lease_id"] if grant else None
         number = len(row["attempts"]) + 1
         attempt_id = f"{job_id}-a{number}-{uuid.uuid4().hex[:12]}"
         log_dir = os.path.join(self.inventory_dir, "logs", job_id)
@@ -741,6 +901,8 @@ class CampaignRunner:
             "archived_prior_result": None,
             "validation": None,
         }
+        if grant:
+            attempt["capacity"] = grant
         row["attempts"].append(attempt)
         self._set_state(job_id, "running", None)
         try:
@@ -772,6 +934,8 @@ class CampaignRunner:
             )
             self._set_state(job_id, "failed", "launch_error")
             self._save()
+            # Popen reaps the child itself when it raises, so no group exists.
+            self._release_capacity(lease_id, reaped=True)
             print(f"[campaign] {job_id}: launch failed: {exc}")
             return
         # Track the live group before any fallible bookkeeping, so an error
@@ -784,7 +948,10 @@ class CampaignRunner:
             deadline,
             reason,
         )
+        self.running[job_id].lease_id = lease_id
         attempt["pid"] = attempt["pgid"] = proc.pid
+        if lease_id is not None:
+            self.capacity.bind_child(lease_id, proc.pid, proc.pid)
         self._save()
         print(f"[campaign] {job_id}: launched {attempt_id} pid={proc.pid}")
 
@@ -871,6 +1038,8 @@ class CampaignRunner:
         else:
             self._accept_or_reject(job, attempt)
         self._save()
+        # An unreaped group keeps its slot charged until the group is gone.
+        self._release_capacity(entry.lease_id, reaped=not unreaped)
         print(f"[campaign] {job_id}: {attempt['state']} ({attempt['attempt_id']})")
 
     def _accept_or_reject(self, job: Dict[str, Any], attempt: Dict[str, Any]) -> None:
@@ -953,9 +1122,22 @@ class CampaignRunner:
             # Re-check right before each launch: a tick above may have found
             # a source change, and signals or deadlines may have arrived.
             while pending and len(self.running) < self.workers:
-                if self._enforce_stop(pending, check_source=True):
+                # Claim shared capacity first, so waiting never rehashes the
+                # source; the job stays pending until it actually launches.
+                grant = self._acquire_capacity(pending[0])
+                if grant == {}:
                     break
-                self._launch(pending.pop(0))
+                lease_id = grant["lease_id"] if grant else None
+                if self._enforce_stop(pending, check_source=True):
+                    self._release_capacity(lease_id, reaped=True)
+                    break
+                job_id = pending.pop(0)
+                try:
+                    self._launch(job_id, grant)
+                except BaseException:
+                    if job_id not in self.running:  # Popen never returned a child
+                        self._release_capacity(lease_id, reaped=True)
+                    raise
             if pending or self.running:
                 time.sleep(self.poll_interval)
 
@@ -973,6 +1155,13 @@ class CampaignRunner:
             _signal_group(entry.pgid, signal.SIGKILL)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 entry.proc.wait(timeout=UNREAPED_GROUP_TIMEOUT_SECONDS)
+            # Best effort: never mask the original error. A slot left charged
+            # here is pruned once this controller and the group are gone.
+            with contextlib.suppress(Exception):
+                reaped = entry.proc.poll() is not None and not (
+                    resource_budget.group_alive(entry.pgid)
+                )
+                self._release_capacity(entry.lease_id, reaped=reaped)
 
     def run(self) -> int:
         """Run the stage. Returns the process exit code."""
@@ -995,6 +1184,8 @@ class CampaignRunner:
                 "retry_requests": self.retry_ids,
                 "exit_code": None,
             }
+            if self.capacity is not None:
+                self.run_record["capacity"] = self.capacity.describe()
             self.inv["controller_runs"].append(self.run_record)
             self._save()
             handled = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
@@ -1047,6 +1238,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_KILL_GRACE_SECONDS,
         help="seconds between TERM and KILL of a process group (<= 60)",
     )
+    parser.add_argument("--capacity-config", help="shared capacity config JSON")
+    parser.add_argument("--capacity-state-dir", help="absolute shared lease directory")
     return parser
 
 
@@ -1058,12 +1251,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if not args.inventory_dir:
             raise CampaignError("--inventory-dir is required with --manifest")
+        capacity = None
+        if (args.capacity_config is None) != (args.capacity_state_dir is None):
+            raise CampaignError(
+                "--capacity-config and --capacity-state-dir go together",
+            )
+        if args.capacity_config is not None:
+            try:
+                capacity = resource_budget.CapacityBudget(
+                    resource_budget.load_config(args.capacity_config, MAX_WORKERS),
+                    args.capacity_state_dir,
+                    inventory_capacity_charge,
+                )
+            except (resource_budget.CapacityError, OSError) as exc:
+                raise CampaignError(f"invalid shared capacity: {exc}") from exc
         runner = CampaignRunner(
             load_manifest(args.manifest),
             args.inventory_dir,
             workers=args.workers,
             retry_ids=args.retry_infrastructure,
             kill_grace=args.kill_grace,
+            capacity=capacity,
         )
         return runner.run()
     except CampaignError as exc:

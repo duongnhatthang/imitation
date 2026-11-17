@@ -1,4 +1,4 @@
-"""Learner-only observation restrictions for the approved CartPole pilot.
+"""Learner-only observation restrictions for the classical restriction tasks.
 
 A restriction ``M`` is a fixed, parameter-free, dimension-preserving map on the
 learner's observation. The linear learner of the previous pipeline clones the
@@ -8,10 +8,38 @@ here ``M`` is applied before the frozen features, so the learner computes
 evaluation and cross-entropy). The expert is a separate object and keeps
 reading the full observation.
 
-Three restrictions exist: ``identity``, ``cart_position_zero`` (CartPole
-``x := 0``; the historical x-only pilot, kept so its checkpoints still load)
+CartPole restrictions of the pilot: ``identity``, ``cart_position_zero``
+(``x := 0``; the historical x-only pilot, kept so its checkpoints still load)
 and ``cart_position_angular_velocity_zero`` (``x := 0`` and
 ``theta_dot := 0``; ``x_dot`` and ``theta`` unchanged).
+
+The predeclared ladders of the other tasks (`tasks.TASKS`) add two kinds.
+Zeroing restrictions (`Restriction`) set listed coordinates of a continuous
+observation to 0; this removes a learner feature and never touches the
+simulator. Alias restrictions (`AliasRestriction`) decode a concatenated
+one-hot observation, map the joint state index to its frozen representative
+(`tasks.alias_table`) and re-encode it, so the output is always a valid
+encoding. They refuse any input that is not one-hot in every block. Random
+state binnings (`tasks.RANDOM_ALIAS_SPECS`, opt-in calibration candidates)
+are alias restrictions too, whose representative is the first shuffled member
+of a random bin; their records also carry the static partition descriptor.
+
+Quantized restrictions (`QuantizedRestriction`) are opt-in calibration
+candidates (`tasks.CALIBRATION_CANDIDATES`), never on an original ladder. Each
+listed coordinate is replaced by a fixed representative value of its bin
+(`QuantizedFeature`); the others pass through. The numpy and torch forms run
+the same float64 operations and cast back to the input dtype, so they agree
+bitwise, also on bin edges; outputs are clipped into the observation-space
+bounds, and the map is idempotent. Inputs must have the declared last-axis
+size and be finite.
+
+Random-offset grids (`random_grid.RandomGridRestriction`, ids in
+`tasks.RANDOM_GRID_SPECS`) are opt-in candidates for the continuous tasks,
+never on an original ladder. Every coordinate goes to the frozen
+representative of its cell in a random-offset grid of the declared Box; the
+numpy and torch forms agree bitwise. A grid saves its descriptor digest with
+restricted checkpoints, and a restricted policy refuses an observation space
+whose Box bits differ from the declared ones.
 
 `audit_cartpole_position` checks, on simulator-valid paired states that differ
 only in cart position, whether the expert gives different labels to states
@@ -20,7 +48,9 @@ exist under the mask, never a positive on-policy error floor.
 """
 
 import dataclasses
+import functools
 import itertools
+import json
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
@@ -29,6 +59,7 @@ import torch as th
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
+from imitation.experiments.agnostic import random_grid, tasks
 from imitation.experiments.ftrl import policy_utils
 
 
@@ -76,29 +107,399 @@ RESTRICTIONS: Dict[str, Restriction] = {
 }
 
 
-def get_restriction(restriction_id: str) -> Restriction:
+def _zeroing(restriction_id: str, env_name: str, hidden: Sequence[str]) -> Restriction:
+    task = tasks.get_task(env_name)
+    indices = tuple(sorted(task.feature_names.index(name) for name in hidden))
+    kept = [n for i, n in enumerate(task.feature_names) if i not in indices]
+    return Restriction(
+        restriction_id=restriction_id,
+        zeroed_indices=indices,
+        obs_shape=(task.obs_dim,),
+        description=(
+            f"{env_name} learner features {', '.join(hidden)} := 0; "
+            f"kept: {', '.join(kept)}."
+        ),
+    )
+
+
+RESTRICTIONS.update(
+    (r.restriction_id, r)
+    for r in (
+        _zeroing(
+            "cart_position_velocity_angular_velocity_zero",
+            "CartPole-v1",
+            ("x", "x_dot", "theta_dot"),
+        ),
+        _zeroing("acrobot_theta2_dot_zero", "Acrobot-v1", ("theta2_dot",)),
+        _zeroing(
+            "acrobot_theta_dots_zero",
+            "Acrobot-v1",
+            ("theta1_dot", "theta2_dot"),
+        ),
+        _zeroing(
+            "acrobot_theta2_and_dots_zero",
+            "Acrobot-v1",
+            ("cos_theta2", "sin_theta2", "theta1_dot", "theta2_dot"),
+        ),
+        _zeroing("mountaincar_velocity_zero", "MountainCar-v0", ("velocity",)),
+        _zeroing("mountaincar_position_zero", "MountainCar-v0", ("position",)),
+        _zeroing(
+            "lunarlander_angular_velocity_zero",
+            "LunarLander-v2",
+            ("angular_velocity",),
+        ),
+        _zeroing(
+            "lunarlander_velocities_zero",
+            "LunarLander-v2",
+            ("vx", "vy", "angular_velocity"),
+        ),
+        _zeroing(
+            "lunarlander_velocities_angle_zero",
+            "LunarLander-v2",
+            ("vx", "vy", "angle", "angular_velocity"),
+        ),
+    )
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantizedFeature:
+    """Fixed bin map of one coordinate, computed in float64.
+
+    ``round_to_step``: ``round(x / step) * step`` (ties to even).
+    ``sign_dead_zone``: ``0`` if ``|x| <= dead_zone``, else
+    ``sign(x) * magnitude``. Both are then clipped to ``[low, high]``.
+    """
+
+    name: str
+    index: int
+    rule: str
+    step: Optional[float]
+    dead_zone: Optional[float]
+    magnitude: Optional[float]
+    low: float
+    high: float
+
+
+def _quantize_column(x, feature: QuantizedFeature, lib):
+    """``x`` is float64; ``lib`` is ``np`` or ``th`` (same operations)."""
+    if feature.rule == "round_to_step":
+        out = lib.round(x / feature.step) * feature.step
+    elif feature.rule == "sign_dead_zone":
+        out = lib.where(
+            lib.abs(x) <= feature.dead_zone,
+            lib.zeros_like(x),
+            lib.sign(x) * feature.magnitude,
+        )
+    else:
+        raise ValueError(f"Unknown quantization rule {feature.rule!r}")
+    # Adding +0.0 turns -0.0 into +0.0, so equal bins have equal bits.
+    return lib.clip(out, feature.low, feature.high) + 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantizedRestriction:
+    """A fixed, dimension-preserving per-coordinate bin map."""
+
+    restriction_id: str
+    env_name: str
+    features: Tuple[QuantizedFeature, ...]
+    obs_shape: Tuple[int, ...]
+    description: str
+
+    @property
+    def descriptor_sha256(self) -> str:
+        """Digest of the full descriptor; saved with restricted checkpoints."""
+        return tasks._digest(dataclasses.asdict(self))
+
+    def check_input(self, shape: Tuple[int, ...], finite: bool) -> None:
+        if len(shape) < 1 or tuple(shape[-1:]) != self.obs_shape:
+            raise ValueError(
+                f"{self.restriction_id}: input shape {tuple(shape)} does not end "
+                f"in {self.obs_shape}",
+            )
+        if not finite:
+            raise ValueError(f"{self.restriction_id}: input is not finite")
+
+    def apply(self, obs: np.ndarray) -> np.ndarray:
+        """Return the quantized copy of ``obs`` (last axis is the feature axis)."""
+        obs = np.asarray(obs)
+        self.check_input(obs.shape, bool(np.all(np.isfinite(obs))))
+        wide = obs.astype(np.float64)
+        for feature in self.features:
+            wide[..., feature.index] = _quantize_column(
+                wide[..., feature.index],
+                feature,
+                np,
+            )
+        return wide.astype(obs.dtype)
+
+
+def _mountaincar_bins(
+    restriction_id: str,
+    position_step: float,
+    velocity_dead_zone: float,
+) -> QuantizedRestriction:
+    # MountainCar-v0 observation-space bounds, as float32 values.
+    low = [float(np.float32(-1.2)), float(np.float32(-0.07))]
+    high = [float(np.float32(0.6)), float(np.float32(0.07))]
+    magnitude = 0.035
+    return QuantizedRestriction(
+        restriction_id=restriction_id,
+        env_name="MountainCar-v0",
+        features=(
+            QuantizedFeature(
+                name="position",
+                index=0,
+                rule="round_to_step",
+                step=position_step,
+                dead_zone=None,
+                magnitude=None,
+                low=low[0],
+                high=high[0],
+            ),
+            QuantizedFeature(
+                name="velocity",
+                index=1,
+                rule="sign_dead_zone",
+                step=None,
+                dead_zone=velocity_dead_zone,
+                magnitude=magnitude,
+                low=low[1],
+                high=high[1],
+            ),
+        ),
+        obs_shape=(2,),
+        description=(
+            f"MountainCar-v0 learner position rounded to a multiple of "
+            f"{position_step}; velocity := 0 if |velocity| <= "
+            f"{velocity_dead_zone}, else sign(velocity) * {magnitude}; "
+            f"clipped to the observation-space bounds."
+        ),
+    )
+
+
+QUANTIZED_RESTRICTIONS: Dict[str, QuantizedRestriction] = {
+    r.restriction_id: r
+    for r in (
+        _mountaincar_bins("mountaincar_bins_pos005_vel005", 0.05, 0.005),
+        _mountaincar_bins("mountaincar_bins_pos005_vel015", 0.05, 0.015),
+        _mountaincar_bins("mountaincar_bins_pos010_vel005", 0.1, 0.005),
+        _mountaincar_bins("mountaincar_bins_pos010_vel015", 0.1, 0.015),
+    )
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class AliasRestriction:
+    """A frozen representative map on a concatenated one-hot observation."""
+
+    restriction_id: str
+    env_name: str
+    blocks: Tuple[int, ...]
+    representative: Tuple[int, ...]
+    table_sha256: str
+    obs_shape: Tuple[int, ...]
+    description: str
+
+    def decode(self, obs: np.ndarray) -> np.ndarray:
+        """Joint state indices of one-hot observations (last axis features)."""
+        obs = np.asarray(obs)
+        joint = np.zeros(obs.shape[:-1], dtype=np.int64)
+        offset = 0
+        for n in self.blocks:
+            part = obs[..., offset : offset + n]
+            if not (np.all((part == 0) | (part == 1)) and np.all(part.sum(-1) == 1)):
+                raise ValueError(f"{self.restriction_id}: input is not one-hot")
+            joint = joint * n + part.argmax(-1)
+            offset += n
+        return joint
+
+    def encode(self, joint: np.ndarray, dtype=np.float32) -> np.ndarray:
+        """One-hot encodings of joint state indices."""
+        joint = np.asarray(joint, dtype=np.int64)
+        parts = []
+        for n in reversed(self.blocks):
+            joint, k = np.divmod(joint, n)
+            parts.append(np.eye(n, dtype=dtype)[k])
+        return np.concatenate(parts[::-1], axis=-1)
+
+    def apply(self, obs: np.ndarray) -> np.ndarray:
+        """Return the re-encoded representative of every observation."""
+        obs = np.asarray(obs)
+        table = np.asarray(self.representative, dtype=np.int64)
+        return self.encode(table[self.decode(obs)], dtype=obs.dtype)
+
+
+ALIAS_RESTRICTIONS: Tuple[str, ...] = tuple(tasks.ALIAS_RUNGS)
+# Random state binnings (`tasks.RANDOM_ALIAS_SPECS`), also `AliasRestriction`s.
+RANDOM_ALIAS_RESTRICTIONS: Tuple[str, ...] = tuple(tasks.RANDOM_ALIAS_SPECS)
+# Random-offset grids of the continuous tasks (`random_grid.get_grid`).
+RANDOM_GRID_RESTRICTIONS: Tuple[str, ...] = tuple(tasks.RANDOM_GRID_SPECS)
+
+
+@functools.lru_cache(maxsize=None)
+def _alias_restriction(restriction_id: str) -> AliasRestriction:
+    record = tasks.alias_table(restriction_id)
+    blocks = tuple(record["blocks"])
+    if restriction_id in tasks.RANDOM_ALIAS_SPECS:
+        partition = record["partition"]
+        description = (
+            f"{record['env_name']} learner sees the first shuffled member of "
+            f"its random bin: the reachable nonterminal states are split into "
+            f"{partition['n_bins']} balanced random bins (partition seed "
+            f"{partition['seed']}, {partition['generator']}); other states "
+            f"keep identity."
+        )
+    else:
+        description = (
+            f"{record['env_name']} learner sees the smallest-index reachable "
+            f"nonterminal state sharing every factor except: {record['hidden']}."
+        )
+    return AliasRestriction(
+        restriction_id=restriction_id,
+        env_name=record["env_name"],
+        blocks=blocks,
+        representative=tuple(record["representative"]),
+        table_sha256=record["table_sha256"],
+        obs_shape=(int(sum(blocks)),),
+        description=description,
+    )
+
+
+def get_restriction(restriction_id: str):
     """Look up a registered restriction.
+
+    Returns:
+        A `Restriction`, `QuantizedRestriction`, `AliasRestriction` or
+        `random_grid.RandomGridRestriction`.
 
     Raises:
         ValueError: If ``restriction_id`` is not registered.
     """
-    try:
-        return RESTRICTIONS[restriction_id]
-    except (KeyError, TypeError):
-        raise ValueError(
-            f"Unknown restriction {restriction_id!r}; "
-            f"expected one of {sorted(RESTRICTIONS)}",
-        ) from None
+    for registry in (RESTRICTIONS, QUANTIZED_RESTRICTIONS):
+        try:
+            return registry[restriction_id]
+        except (KeyError, TypeError):
+            pass
+    if isinstance(restriction_id, str) and (
+        restriction_id in ALIAS_RESTRICTIONS
+        or restriction_id in RANDOM_ALIAS_RESTRICTIONS
+    ):
+        return _alias_restriction(restriction_id)
+    if random_grid.is_grid_id(restriction_id):
+        return random_grid.get_grid(restriction_id)
+    known = (
+        sorted(RESTRICTIONS)
+        + sorted(QUANTIZED_RESTRICTIONS)
+        + sorted(ALIAS_RESTRICTIONS)
+        + sorted(RANDOM_ALIAS_RESTRICTIONS)
+        + sorted(RANDOM_GRID_RESTRICTIONS)
+    )
+    raise ValueError(
+        f"Unknown restriction {restriction_id!r}; expected one of {known}",
+    )
+
+
+def restriction_digest(found) -> Optional[str]:
+    """Digest saved with a restricted checkpoint, or None for zeroing ones.
+
+    It is the frozen table digest of an alias restriction and the descriptor
+    digest of a quantized one or a random grid.
+    """
+    if isinstance(found, AliasRestriction):
+        return found.table_sha256
+    if isinstance(
+        found,
+        (QuantizedRestriction, random_grid.RandomGridRestriction),
+    ):
+        return found.descriptor_sha256
+    return None
+
+
+def describe_restriction(restriction_id: str) -> Dict[str, Any]:
+    """JSON record of a restriction; for zeroing ones exactly its fields."""
+    found = get_restriction(restriction_id)
+    if isinstance(found, Restriction):
+        return dataclasses.asdict(found)
+    if isinstance(found, QuantizedRestriction):
+        record = json.loads(json.dumps(dataclasses.asdict(found)))
+        record.update(kind="quantized", descriptor_sha256=found.descriptor_sha256)
+        return record
+    if isinstance(found, random_grid.RandomGridRestriction):
+        record = found.descriptor()
+        record.update(
+            kind="random_grid",
+            descriptor_sha256=found.descriptor_sha256,
+            nominal_cells=found.nominal_cells,
+        )
+        return record
+    record = tasks.alias_table(restriction_id)
+    record.update(
+        kind="alias",
+        obs_shape=list(found.obs_shape),
+        description=found.description,
+    )
+    return record
 
 
 class ObservationMask(th.nn.Module):
-    """Parameter-free torch form of a `Restriction`. Draws no random numbers."""
+    """Parameter-free torch form of a restriction. Draws no random numbers."""
 
     def __init__(self, restriction_id: str):
         super().__init__()
         self.restriction = get_restriction(restriction_id)
+        if isinstance(self.restriction, AliasRestriction):
+            self.register_buffer(
+                "representative",
+                th.as_tensor(self.restriction.representative, dtype=th.long),
+                persistent=False,
+            )
+        if isinstance(self.restriction, random_grid.RandomGridRestriction):
+            self.grid = random_grid.GridMask(self.restriction)
+
+    def _alias(self, obs: th.Tensor) -> th.Tensor:
+        joint = th.zeros(obs.shape[:-1], dtype=th.long, device=obs.device)
+        offset = 0
+        for n in self.restriction.blocks:
+            part = obs[..., offset : offset + n]
+            if not (
+                bool(th.all((part == 0) | (part == 1)))
+                and bool(th.all(part.sum(-1) == 1))
+            ):
+                raise ValueError(
+                    f"{self.restriction.restriction_id}: input is not one-hot",
+                )
+            joint = joint * n + part.argmax(-1)
+            offset += n
+        joint = self.representative[joint]
+        parts = []
+        for n in reversed(self.restriction.blocks):
+            parts.append(th.nn.functional.one_hot(joint % n, n).to(obs.dtype))
+            joint = joint // n
+        return th.cat(parts[::-1], dim=-1)
+
+    def _quantize(self, obs: th.Tensor) -> th.Tensor:
+        self.restriction.check_input(
+            tuple(obs.shape),
+            bool(th.all(th.isfinite(obs))),
+        )
+        wide = obs.to(th.float64).clone()
+        for feature in self.restriction.features:
+            wide[..., feature.index] = _quantize_column(
+                wide[..., feature.index],
+                feature,
+                th,
+            )
+        return wide.to(obs.dtype)
 
     def forward(self, obs: th.Tensor) -> th.Tensor:
+        if isinstance(self.restriction, AliasRestriction):
+            return self._alias(obs)
+        if isinstance(self.restriction, QuantizedRestriction):
+            return self._quantize(obs)
+        if isinstance(self.restriction, random_grid.RandomGridRestriction):
+            return self.grid(obs)
         indices = self.restriction.zeroed_indices
         if not indices:
             return obs
@@ -145,9 +546,14 @@ class RestrictedActorCriticPolicy(ActorCriticPolicy):
     extractors, so wrapping them (including the ``pi_``/``vf_`` aliases)
     restricts every path. ``restriction_id``, ``freeze_features`` and
     ``share_features_extractor`` are saved as constructor data, so
-    `load_policy_checkpoint` rebuilds the same mask and frozen layers. The
-    plain `policy_utils.load_policy_checkpoint` rejects these checkpoints with
-    a ``TypeError`` instead of silently dropping the mask.
+    `load_policy_checkpoint` rebuilds the same mask and frozen layers. An
+    alias, quantized or random grid restriction also saves its
+    ``restriction_sha256`` (the frozen table or descriptor digest,
+    `restriction_digest`), and a checkpoint whose digest differs from the
+    rebuilt restriction is refused. A random grid also refuses an observation
+    space whose Box bits differ from its declared Box. The plain
+    `policy_utils.load_policy_checkpoint` rejects these checkpoints with a
+    ``TypeError`` instead of silently dropping the mask.
     """
 
     def __init__(
@@ -155,10 +561,18 @@ class RestrictedActorCriticPolicy(ActorCriticPolicy):
         *args: Any,
         restriction_id: str = "identity",
         freeze_features: bool = False,
+        restriction_sha256: Optional[str] = None,
         **kwargs: Any,
     ):
         restriction = get_restriction(restriction_id)
+        table = restriction_digest(restriction)
+        if restriction_sha256 is not None and restriction_sha256 != table:
+            raise ValueError(
+                f"Restriction {restriction_id!r} has table {table}, not the "
+                f"saved {restriction_sha256}",
+            )
         self.restriction_id = restriction.restriction_id
+        self.restriction_sha256 = table
         self.freeze_features = bool(freeze_features)
         super().__init__(*args, **kwargs)
         shape = tuple(self.observation_space.shape or ())
@@ -167,6 +581,8 @@ class RestrictedActorCriticPolicy(ActorCriticPolicy):
                 f"Restriction {restriction_id!r} needs observation shape "
                 f"{restriction.obs_shape}, got {shape}",
             )
+        if isinstance(restriction, random_grid.RandomGridRestriction):
+            restriction.check_box(self.observation_space)
         if self.freeze_features:
             policy_utils.freeze_feature_layers(self)
 
@@ -183,6 +599,8 @@ class RestrictedActorCriticPolicy(ActorCriticPolicy):
             restriction_id=self.restriction_id,
             freeze_features=self.freeze_features,
         )
+        if self.restriction_sha256 is not None:
+            data["restriction_sha256"] = self.restriction_sha256
         return data
 
 
@@ -201,7 +619,7 @@ def make_linear_policy(
 
     Args:
         expert: Trained expert policy (a plain ``ActorCriticPolicy``).
-        restriction_id: A key of `RESTRICTIONS`.
+        restriction_id: A registered restriction id (`get_restriction`).
 
     Returns:
         The restricted linear learner.
@@ -256,11 +674,12 @@ def load_policy_checkpoint(path, device: str = "cpu") -> RestrictedActorCriticPo
 # ---------------------------------------------------------------------------
 
 AUDIT_ENV = "CartPole-v1"
-# Masks the fixed x-grid audit applies to: both hide cart position, so every
+# Masks the fixed x-grid audit applies to: all hide cart position, so every
 # pair of grid states on one base collides under them.
 AUDIT_RESTRICTIONS: Tuple[str, ...] = (
     "cart_position_zero",
     "cart_position_angular_velocity_zero",
+    "cart_position_velocity_angular_velocity_zero",
 )
 # Predeclared nonterminal cart positions, well inside |x| < 2.4.
 AUDIT_X_GRID: Tuple[float, ...] = (-1.8, -0.6, 0.6, 1.8)

@@ -138,6 +138,7 @@ def test_baseline_data_and_evaluation_budget(tmp_path, monkeypatch, early_stop):
     expert.get_env().close()
 
 
+from imitation.experiments.ftrl import env_utils
 from imitation.experiments.ftrl.run_experiment import (
     ExperimentConfig,
     resolve_envs,
@@ -292,6 +293,11 @@ class TestResolveEnvs:
         envs = resolve_envs(env_group=None, envs=None)
         assert "CartPole-v1" in envs
         assert not any("NoFrameskip" in e for e in envs)
+        # The original eight; optional variants stay out of the default.
+        assert envs == env_utils.ENV_GROUPS["classical"] and len(envs) == 8
+        assert not set(envs) & set(env_utils.VARIANT_ENVS)
+        envs.append("mutated")
+        assert "mutated" not in env_utils.ENV_GROUPS["classical"]
 
     def test_both_raises(self):
         with pytest.raises(ValueError, match="not both"):

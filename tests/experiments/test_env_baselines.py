@@ -1,10 +1,15 @@
 """Tests for env_baselines: reference scores and expert quality validation."""
 
+import json
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
+from imitation.experiments.ftrl import env_baselines
 from imitation.experiments.ftrl.env_baselines import (
     REFERENCE_BASELINES,
+    load_or_compute_baselines,
     validate_expert_quality,
 )
 
@@ -51,6 +56,90 @@ class TestValidateExpertQuality:
     def test_unknown_env_passes(self):
         is_ok, msg = validate_expert_quality("UnknownEnv-v0", 100.0)
         assert is_ok
+
+
+CLIFF = "CliffWalking-v0"
+
+
+class TestCliffBaselinesCache:
+    """CliffWalking baselines keep the uniform random return, cached or fresh."""
+
+    def _write(self, tmp_path, record):
+        path = tmp_path / CLIFF / "baselines.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(record, indent=2))
+        return path
+
+    def _fail_compute(self, *args, **kwargs):
+        raise AssertionError("cached baselines must not be recomputed")
+
+    def test_cached_uniform_random_baselines_are_returned_unchanged(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        record = {
+            "expert_return": -13.0,
+            "random_return": -7123.25,
+            "expert_self_ce": 0.01,
+        }
+        path = self._write(tmp_path, record)
+        before = path.read_bytes()
+        monkeypatch.setattr(env_baselines, "compute_baselines", self._fail_compute)
+        rng = np.random.default_rng(0)
+        loaded = load_or_compute_baselines(CLIFF, None, None, tmp_path, rng)
+        assert loaded == record
+        assert path.read_bytes() == before
+
+    def test_historical_stalled_record_is_read_without_mutation(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        # Diagnostic-only records from the withdrawn stalled reference.
+        record = {
+            "expert_return": -13.0,
+            "random_return": -200.0,
+            "expert_self_ce": 0.01,
+            "measured_uniform_random_return": -7123.25,
+            "normalization_reference_type": "stalled_policy",
+            "stalled_return": -200.0,
+        }
+        path = self._write(tmp_path, record)
+        before = path.read_bytes()
+        monkeypatch.setattr(env_baselines, "compute_baselines", self._fail_compute)
+        rng = np.random.default_rng(0)
+        assert load_or_compute_baselines(CLIFF, None, None, tmp_path, rng) == record
+        assert path.read_bytes() == before
+
+    def test_fresh_baselines_keep_the_measured_uniform_random_return(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from imitation.experiments.ftrl import eval_utils
+
+        expert = SimpleNamespace(mean_return=-13.0, current_round_ce=0.02)
+        monkeypatch.setattr(
+            eval_utils,
+            "eval_policy_rollout",
+            lambda *args, **kwargs: expert,
+        )
+        monkeypatch.setattr(
+            env_baselines,
+            "compute_random_return",
+            lambda venv, n_episodes: -4321.5,
+        )
+        rng = np.random.default_rng(0)
+        fresh = load_or_compute_baselines(CLIFF, None, None, tmp_path, rng)
+        expected = {
+            "expert_return": -13.0,
+            "random_return": -4321.5,
+            "expert_self_ce": 0.02,
+        }
+        assert fresh == expected
+        cached = json.loads((tmp_path / CLIFF / "baselines.json").read_text())
+        assert cached == expected
 
 
 from stable_baselines3.common.evaluation import evaluate_policy
