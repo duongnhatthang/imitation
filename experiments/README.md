@@ -15,7 +15,7 @@ runtime inside tmux. It validates the implementation, runs a short smoke test,
 then completes classical training and plots. Atari runs only with `RUN_ATARI=1`. Defaults:
 five seeds, 1,000 classical rounds, 200 Atari rounds, one retained sample per
 round, and a minimum of one trajectory per round. The default algorithms are
-`ftl ftrl bc bc_iid`; `bc_prefix` and `bc_pool` require an explicit `ALGOS`
+`ftl ftrl bc bc_prefix`; `bc_iid` and `bc_pool` require an explicit `ALGOS`
 override. All round-loop baselines default to cold refits of weights and
 optimizer state. FTL/FTRL use beta zero from the first rollout; BC-iid uses
 beta one for expert-only collection.
@@ -44,6 +44,27 @@ only. It excludes raw metrics, NPZ caches, trajectories, checkpoints, and logs.
 Its `push` command transfers Git-tracked code instead of recursively sending
 local result trees. Historical plots use run folders named `legacy-*`.
 Raw archives stay on the execution machine.
+
+The classical `--zoom-classical-return` option chooses each task's linear
+return limits from the second half of its displayed mean curves and
+uncertainty bands, adds 10% padding, and uses a minimum span of 0.10.
+The full annotation-budget axis remains visible. Early points outside the
+range are disclosed. The report renderer applies the same rule independently
+to each environment and observation or capacity condition.
+
+Every plots-only pull builds `imitation_learning_experiment_results.pdf`
+on the execution machine and places it at the root of the run's local plot
+directory. The bookmarked review includes current learning curves, runtime,
+diagnostics, and the lowest available coverage seed per task and arm. All
+coverage seeds remain available as separate images. Older PDF bytes are
+archived when the published plots change. The compiler requires Pillow and
+ReportLab in the execution Python environment (`pip install -e ".[reports]"`).
+
+To build the PDF immediately after rendering, use
+`python experiments/compile_results_pdf.py --plots-dir <run>/plots --run-id <id>`.
+The publication command also supports `--refresh --results-pdf`.
+Standalone coverage launchers use the classical plot layout by default. For
+an Atari coverage run, set `EXP_PLOTS_COVERAGE` to the run's Atari plot root.
 
 The review layout has one current `learning_curves/` directory and one
 `coverage/<environment>/` directory per task. Preserve the per-seed arrival
@@ -79,7 +100,7 @@ hash and all experiment settings.
 
 ### FTL, FTRL, BC-iid, and fixed BC
 
-The learning-curve and coverage sweeps run `ftl`, `ftrl`, `bc_iid`, and `bc`.
+The learning-curve and coverage sweeps run `ftl`, `ftrl`, `bc_prefix`, and `bc` by default.
 BC-iid replaces the former `bc_dagger` growing-dataset baseline.
 
 BC-iid collects fresh complete trajectories using the same expert policy as BC,

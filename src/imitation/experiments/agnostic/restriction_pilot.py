@@ -171,6 +171,7 @@ _POOL_RESETS, _STREAM_RESETS, _STREAM_SELECTION, _BASELINE_ENV, _BASELINE_ACTION
     4,
     5,
 )
+_EVAL_ENV = 6
 _SEED_HIGH = 2**31 - 1
 
 _SOURCE_FILES = (
@@ -224,6 +225,7 @@ class RunnerSpec:
     paired_cold_fits: bool = False
     calibration_candidates: Tuple[str, ...] = ()
     learner: Optional[Any] = None
+    statewise_followup: bool = False
 
     @property
     def audit_schema(self) -> str:
@@ -1132,7 +1134,7 @@ def prepare_data(
             "budget": int(budget),
             "baseline_episodes": int(baseline_episodes),
             "pool": POOL_RULE,
-            "stream": STREAM_RULE,
+            "stream": None if spec.statewise_followup else STREAM_RULE,
             "expert_action_rule": classical.ACTION_RULE,
         }
         if spec.task is not None:
@@ -1186,16 +1188,17 @@ def prepare_data(
             env_name=spec.env_name,
         )
         store("pool", POOL_FILE, pool, pool_stats)
-        state["in_flight"] = "BC-iid stream collection"
-        stream, stream_stats = collect_iid_stream(
-            expert,
-            budget,
-            seed,
-            check=guard.check,
-            counters=live["counters"]["stream"],
-            env_name=spec.env_name,
-        )
-        store("stream", STREAM_FILE, stream, stream_stats)
+        if not spec.statewise_followup:
+            state["in_flight"] = "BC-iid stream collection"
+            stream, stream_stats = collect_iid_stream(
+                expert,
+                budget,
+                seed,
+                check=guard.check,
+                counters=live["counters"]["stream"],
+                env_name=spec.env_name,
+            )
+            store("stream", STREAM_FILE, stream, stream_stats)
         state["in_flight"] = "baseline measurement"
         live["baselines"], live["baselines_costs"] = measure_baselines(
             expert,
@@ -1298,7 +1301,7 @@ def _verify_data(
         "config_budget": isinstance(config.get("budget"), int)
         and config["budget"] >= n_rounds,
         "config_rules": config.get("pool") == POOL_RULE
-        and config.get("stream") == STREAM_RULE
+        and config.get("stream") == (None if spec.statewise_followup else STREAM_RULE)
         and config.get("expert_action_rule") == classical.ACTION_RULE,
         "source_combined_sha256": isinstance(files, dict)
         and source.get("combined_sha256") == pilot.config_digest(files),
@@ -1327,7 +1330,10 @@ def _verify_data(
             "exact SHA256 (expected_data_sha256)",
         )
     datasets = {}
-    for name, file_name in (("pool", POOL_FILE), ("stream", STREAM_FILE)):
+    dataset_files = [("pool", POOL_FILE)]
+    if not spec.statewise_followup:
+        dataset_files.append(("stream", STREAM_FILE))
+    for name, file_name in dataset_files:
         entry = (record.get("datasets") or {}).get(name) or {}
         data_path = data_dir / file_name
         if entry.get("file") != file_name or not data_path.is_file():
@@ -1426,7 +1432,7 @@ def _verify_reference(reference_dir, expected_sha256, identity, spec: RunnerSpec
         "package_versions": record.get("package_versions") == pilot.package_versions(),
         "config_sha256": record.get("config_sha256") == pilot.config_digest(config),
         "config_rules": config.get("pool") == POOL_RULE
-        and config.get("stream") == STREAM_RULE
+        and config.get("stream") == (None if spec.statewise_followup and not legacy else STREAM_RULE)
         and config.get("expert_action_rule") == classical.ACTION_RULE,
         "seed": count(seed, 0, _SEED_HIGH)
         and seed != spec.audit_seed
@@ -1703,7 +1709,7 @@ def run_job(
         bc_n_epochs,
         eval_episodes=eval_episodes,
         final_eval_episodes=final_eval_episodes,
-        capacity=capacity is not None,
+        capacity=capacity is not None or spec.statewise_followup,
     )
     experiment = {
         k: v
@@ -1747,6 +1753,12 @@ def run_job(
     }
     if capacity is not None:
         run_config["eval_protocol"] = run_experiment.EVAL_PROTOCOL
+    if spec.statewise_followup:
+        run_config["eval_protocol"] = "periodic-paired-reset-seeds/1"
+        run_config["statewise_followup"] = (
+            "Separate seeded evaluation environment. FTL labels one uniform "
+            "pre-action state per learner episode. BC replays the expert pool."
+        )
     if config.final_eval_episodes is not None:
         run_config["final_eval_episodes"] = int(config.final_eval_episodes)
     if prefix:
@@ -1793,6 +1805,7 @@ def run_job(
     live: Dict[str, Any] = {
         "records": [],
         "venv": None,
+        "evaluation_venv": None,
         "trained_pairs_sha256": None,
         "setup_seconds": None,
         "total_seconds": None,
@@ -1812,11 +1825,15 @@ def run_job(
             )
         else:
             steps = episodes = 0
-        counted = None if venv is None else int(venv.steps)
+        counters = [env for env in (venv, live["evaluation_venv"]) if env is not None]
+        counted = sum(int(env.steps) for env in counters) if counters else None
         unattributed = None if counted is None else counted - (steps + eval_steps)
         complete = (live["state"] or {}).get("status") == "complete"
         exact = complete and unattributed == 0
-        queries = steps + eval_steps if exact else None
+        train_queries = steps
+        if spec.statewise_followup and method == "ftl" and records:
+            train_queries = int(records[-1].get("collection_expert_queries", 0))
+        queries = train_queries + eval_steps if exact else None
         wall = {
             "setup": live["setup_seconds"],
             "total": live["total_seconds"],
@@ -1834,9 +1851,10 @@ def run_job(
         return {
             "observed": {
                 "env_steps": counted,
-                "env_resets": None if venv is None else int(venv.resets),
+                "env_resets": sum(int(env.resets) for env in counters) if counters else None,
                 "finished_episodes": (
-                    None if venv is None else int(venv.completed_episodes)
+                    sum(int(env.completed_episodes) for env in counters)
+                    if counters else None
                 ),
                 "rule": "counted by the run's environment wrapper when a step "
                 "or reset returns",
@@ -1845,10 +1863,14 @@ def run_job(
                 "collection": {
                     "env_steps": steps,
                     "episodes": episodes,
-                    "expert_predict_calls": steps,
-                    "expert_action_entries": steps,
+                    "expert_predict_calls": train_queries,
+                    "expert_action_entries": train_queries,
                     "learner_predict_calls": steps,
-                    "rule": COLLECTION_RULE,
+                    "rule": (
+                        "FTL queries one expert label per learner episode; BC "
+                        "methods use the shared expert pool."
+                        if spec.statewise_followup else COLLECTION_RULE
+                    ),
                 },
                 "evaluation": {
                     "evaluations": len(evals),
@@ -1890,7 +1912,7 @@ def run_job(
                 "env_steps": counted,
                 "expert_predict_calls": queries,
                 "expert_action_entries": queries,
-                "learner_predict_calls": queries,
+                "learner_predict_calls": steps + eval_steps if exact else None,
             },
             "reconciled": None if counted is None else unattributed == 0,
             "shared_acquisition": (
@@ -1930,9 +1952,9 @@ def run_job(
                     "pool_pairs_sha256": data_record["datasets"]["pool"][
                         "pairs_sha256"
                     ],
-                    "stream_pairs_sha256": data_record["datasets"]["stream"][
-                        "pairs_sha256"
-                    ],
+                    "stream_pairs_sha256": data_record["datasets"].get("stream", {}).get(
+                        "pairs_sha256",
+                    ),
                     "baselines": data_record["baselines"],
                     "acceptance": acceptance,
                 },
@@ -2083,10 +2105,16 @@ def run_job(
         live["venv"] = venv
         try:
             _check_cap(venv, spec)
+            evaluation_venv = None
+            if spec.statewise_followup:
+                evaluation_venv = CountingVecEnv(
+                    env_utils.make_env(spec.env_name, 1, _seed_stream(seed, _EVAL_ENV)),
+                )
+                live["evaluation_venv"] = evaluation_venv
             th.manual_seed(seed)
             live["setup_seconds"] = time.monotonic() - start
             if method == "bc":
-                run_fixed_bc(venv)
+                run_fixed_bc(venv if evaluation_venv is None else evaluation_venv)
             else:
                 state["in_flight"] = "round 0 evaluation"
                 run_experiment._run_dagger_variant(
@@ -2106,6 +2134,8 @@ def run_job(
                         else None
                     ),
                     round_callback=on_round,
+                    evaluation_venv=evaluation_venv,
+                    deferred_expert_label=spec.statewise_followup and method == "ftl",
                 )
                 obs, acts = trained_pairs(output_dir / demos_rel)
                 live["trained_pairs_sha256"] = pairs_sha256(obs, acts)
@@ -2118,6 +2148,8 @@ def run_job(
                     )
         finally:
             venv.close()
+            if live["evaluation_venv"] is not None:
+                live["evaluation_venv"].close()
             live["total_seconds"] = time.monotonic() - start
 
     return classical._run_lifecycle(state, writer, body, guard)

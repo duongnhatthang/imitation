@@ -80,3 +80,20 @@ def test_cli_separates_dataset_seeds(tmp_path):
             assert saved["dataset_seed"] == seed
             assert len(saved["features"]) == 2 * count
             assert saved["embedding_seed"] in (0, 1)
+
+
+
+def test_bc_growing_overlap_uses_only_selected_methods(tmp_path):
+    for method in ("ftl", "bc_prefix", "bc_iid"):
+        _demo(tmp_path, method, 0, 0, 40)
+    out = tmp_path / "plots" / "CartPole-v1.png"
+    metrics = plot_tsne_coverage.build_and_plot(
+        tmp_path,
+        "CartPole-v1",
+        0,
+        out,
+        perplexities=(15,),
+        algos=("ftl", "bc_prefix"),
+    )
+    assert set(metrics["training_counts"]) == {"ftl", "bc_prefix"}
+    assert out.with_name("CartPole-v1_coverage_diff.png").is_file()

@@ -19,6 +19,11 @@ RUNTIME_DIR="$PLOT_ROOT/runtime"
 CACHE_DIR="$RESULTS_DIR/dqn_cache"
 DATASET_SEEDS="${COVERAGE_SEEDS:-$(seq 0 $((${SEEDS:-5} - 1)))}"
 TSNE_SEEDS="${TSNE_SEEDS:-0 1 2}"
+ALGO_ARGS=()
+if [ -n "${ALGOS:-}" ]; then
+  # Word splitting matches the sweep's ALGOS convention.
+  ALGO_ARGS=(--algos $ALGOS)
+fi
 # Where cached PPO experts live (Atari CNN features + toy-text exact-mu expert).
 EXPERT_CACHE="${EXPERT_CACHE:-${EXP_EXPERT_CACHE:-experiments/expert_cache}}"
 mkdir -p "$COV_DIR" "$CACHE_DIR" "$RUNTIME_DIR"
@@ -29,7 +34,8 @@ for env in "$@"; do
     echo "[gen_coverage_viz] $env dataset seed $seed"
     python -m imitation.experiments.ftrl.plot_tsne_coverage \
         --results-dir "$RESULTS_DIR" --env "$env" --seed "$seed" --output-dir "$ENV_COV_DIR" \
-        --tsne-seed $TSNE_SEEDS --expert-cache "$EXPERT_CACHE"
+        --tsne-seed $TSNE_SEEDS --expert-cache "$EXPERT_CACHE" \
+        "${ALGO_ARGS[@]}"
     if [ "${RUN_RECOVERABILITY:-0}" = "1" ]; then
       python -m imitation.experiments.ftrl.plot_recoverability \
           --results-dir "$RESULTS_DIR" --env "$env" --seed "$seed" \

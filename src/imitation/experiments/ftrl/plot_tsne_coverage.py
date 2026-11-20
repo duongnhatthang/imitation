@@ -257,6 +257,7 @@ def build_and_plot(
     cap=8000,
     point_size=None,
     expert_cache="experiments/expert_cache",
+    algos: Sequence[str] = tuple(coverage_data.ALL_ALGOS),
 ) -> dict:
     """Load states, fit the shared t-SNE, render, and cache the embedding.
 
@@ -271,6 +272,7 @@ def build_and_plot(
         point_size: Fixed marker size; if None, sized per panel by point count.
         expert_cache: Directory containing cached PPO expert policies (used for
             Atari CNN feature extraction).
+        algos: Methods to load from the selected results directory.
 
     Returns:
         Dict with keys ``coverage_2d``, ``coverage_highdim``, ``trustworthiness``.
@@ -280,14 +282,13 @@ def build_and_plot(
     """
     from imitation.experiments.ftrl import coverage_features
 
-    states = coverage_data.load_env_states(results_dir, env_name, seed)
+    states = coverage_data.load_env_states(results_dir, env_name, seed, algos)
     if not states:
         raise FileNotFoundError(
             f"No scratch demos for {env_name} seed {seed} under {results_dir}"
         )
     found = sorted(s.algo for s in states)
-    expected = list(coverage_data.ALL_ALGOS)
-    missing = [a for a in expected if a not in found]
+    missing = [a for a in algos if a not in found]
     if missing:
         print(
             f"WARNING: no scratch demos for {missing} in {env_name}; "
@@ -338,7 +339,10 @@ def build_and_plot(
         search_perplexities=np.asarray(perplexities),
     )
     diff_path = out_path.parent / f"{out_path.stem}_coverage_diff.png"
-    render_coverage_diff(result.embedding, algo, diff_path, env_name)
+    offline_method = "bc_prefix" if "bc_prefix" in found else "bc_iid"
+    render_coverage_diff(
+        result.embedding, algo, diff_path, env_name, right_algos=(offline_method,),
+    )
     return {
         "dataset_seed": seed,
         "embedding_seed": result.seed,
@@ -379,6 +383,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default="experiments/expert_cache",
         help="Directory containing cached PPO expert policies for Atari CNN features.",
     )
+    parser.add_argument(
+        "--algos",
+        nargs="+",
+        choices=coverage_data.ALL_ALGOS,
+        default=coverage_data.ALL_ALGOS,
+        help="Only load demos for these methods",
+    )
     args = parser.parse_args(argv)
     out = (
         pathlib.Path(args.output_dir)
@@ -394,6 +405,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         args.cap,
         point_size=args.point_size,
         expert_cache=args.expert_cache,
+        algos=args.algos,
     )
     print(f"Wrote {out}; trustworthiness={metrics['trustworthiness']:.3f}")
     out.with_suffix(".json").write_text(json.dumps(metrics, indent=2))

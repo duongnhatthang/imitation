@@ -15,6 +15,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -135,7 +137,7 @@ def publish(source, destination, policy=None):
     return mapping
 
 
-def refresh(source, destination, policy=None):
+def refresh(source, destination, policy=None, results_pdf=False):
     """Refresh under an exclusive lock shared by all publishers of this view."""
     destination = Path(destination).absolute()
     check_path(destination)
@@ -151,10 +153,10 @@ def refresh(source, destination, policy=None):
             raise ValueError("publication view is busy: " + str(destination)) from exc
         # Keep the lock inode after unlocking. Unlinking it lets a later writer
         # open a different inode while another process still holds the old one.
-        return _refresh_locked(source, destination, policy)
+        return _refresh_locked(source, destination, policy, results_pdf)
 
 
-def _refresh_locked(source, destination, policy=None):
+def _refresh_locked(source, destination, policy=None, results_pdf=False):
     """Replace a complete view while archiving superseded figure bytes.
 
     Existing archive figures keep their paths. Removed or changed active
@@ -177,6 +179,19 @@ def _refresh_locked(source, destination, policy=None):
     backup = None
     try:
         mapping = publish(source, staging, policy)
+        if results_pdf:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("compile_results_pdf.py")),
+                    "--plots-dir", str(staging),
+                    "--run-id", destination.name,
+                ],
+                check=True,
+            )
+            mapping["imitation_learning_experiment_results.pdf"] = (
+                "imitation_learning_experiment_results.pdf"
+            )
         before = {}
         if destination.exists():
             for old in sorted(destination.rglob("*")):
@@ -246,10 +261,20 @@ def main():
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--policy", type=Path)
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--results-pdf",
+        action="store_true",
+        help="Compile a combined results PDF in the refreshed publication",
+    )
     args = parser.parse_args()
+    if args.results_pdf and not args.refresh:
+        parser.error("--results-pdf requires --refresh")
     policy = json.loads(args.policy.read_text()) if args.policy else None
     exporter = refresh if args.refresh else publish
-    mapping = exporter(args.source, args.destination, policy)
+    if args.results_pdf:
+        mapping = exporter(args.source, args.destination, policy, results_pdf=True)
+    else:
+        mapping = exporter(args.source, args.destination, policy)
     print(json.dumps({"figures": len(mapping), "destination": str(args.destination)}))
 
 

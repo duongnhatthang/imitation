@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full coverage run: an FTRL sweep (which now persists per-round demos for ALL
-# four algos -- ftl, ftrl, bc, bc_iid) followed by the three post-hoc
+# four algos -- ftl, ftrl, bc, bc_prefix) followed by the three post-hoc
 # visualizations (t-SNE state coverage, recoverability mu(s), runtime) plus the
 # standard learning-curve plots. One command produces the whole deliverable.
 #
@@ -63,7 +63,7 @@ echo "[coverage_full] output dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.run_experiment \
     --envs "${ENV_ARR[@]}" \
-    --algos ftl ftrl bc bc_iid \
+    --algos ftl ftrl bc bc_prefix \
     --seeds "$SEEDS" \
     --samples-per-round 1 \
     --n-rounds "$N_ROUNDS" \
@@ -81,7 +81,7 @@ echo "[coverage_full] sweep done: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG
 echo "[coverage_full] learning-curve plots ..." | tee -a "$LOG_FILE"
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir "$RESULTS_DIR" \
-    --output-dir "$PLOTS_DIR" --flat-output \
+    --output-dir "$PLOTS_DIR" --flat-output --zoom-classical-return \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[coverage_full] t-SNE coverage + recoverability per env ..." | tee -a "$LOG_FILE"
@@ -89,7 +89,7 @@ for env in "${ENV_ARR[@]}"; do
     echo "[coverage_full]   $env" | tee -a "$LOG_FILE"
     python -m imitation.experiments.ftrl.plot_tsne_coverage \
         --results-dir "$RESULTS_DIR" --env "$env" --seed "$COVERAGE_SEED" \
-        --output-dir "$COV_DIR" \
+        --output-dir "$COV_DIR" --algos ftl ftrl bc bc_prefix \
         2>&1 | tee -a "$LOG_FILE"
     python -m imitation.experiments.ftrl.plot_recoverability \
         --results-dir "$RESULTS_DIR" --env "$env" --seed "$COVERAGE_SEED" \

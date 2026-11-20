@@ -31,6 +31,11 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
+from imitation.experiments.ftrl.plot_return_range import (
+    RANGE_RULE,
+    automatic_return_limits,
+)
+
 logger = logging.getLogger(__name__)
 
 # Use non-interactive backend for server/CI
@@ -73,10 +78,12 @@ LOSS_SUBPLOT_ALGOS = {"ftl", "ftrl", "bc_iid", "bc_pool", "bc_prefix", "bc"}
 NORMALIZED_RETURN_YLIM: Tuple[float, float] = (-0.5, 1.5)
 
 
-def set_normalized_return_axis(ax: plt.Axes) -> None:
+def set_normalized_return_axis(
+    ax: plt.Axes, limits: Tuple[float, float] = NORMALIZED_RETURN_YLIM,
+) -> None:
     """Show a normalized-return panel on the shared linear fixed view."""
     ax.set_yscale("linear")
-    ax.set_ylim(*NORMALIZED_RETURN_YLIM)
+    ax.set_ylim(*limits)
 
 
 def _draw_bc_hlines(
@@ -481,8 +488,8 @@ def _plot_metric(
         )
         ax.fill_between(x_vals, band_lows, band_highs, color=color, alpha=0.12)
         drawn[algo] = [
-            {"mean": c, "low": lo, "high": hi, "values": v}
-            for c, lo, hi, v in zip(center_vals, band_lows, band_highs, seed_vals)
+            {"mean": c, "low": lo, "high": hi, "values": v, "budget": x}
+            for c, lo, hi, v, x in zip(center_vals, band_lows, band_highs, seed_vals, x_vals)
         ]
 
     if log_scale:
@@ -508,6 +515,7 @@ def plot_env(
     show_expert_on_loss: bool = True,
     calibration: Optional[Dict[str, Any]] = None,
     band: str = "ci",
+    return_limits: Optional[Tuple[float, float]] = NORMALIZED_RETURN_YLIM,
 ) -> None:
     """Generate a 4-subplot figure for one environment.
 
@@ -658,7 +666,22 @@ def plot_env(
             "cum_regret",
         ],
     )
-    set_normalized_return_axis(ax2)
+    if return_limits is None:
+        series = []
+        for points in return_points.values():
+            series.append((
+                [p["budget"] for p in points],
+                [p["low"] for p in points],
+                [p["high"] for p in points],
+            ))
+        if "normalized_return" in bc_drawn:
+            values = env_df.loc[env_df["algo"] == "bc", "normalized_return"].dropna()
+            _, low, high = _compute_center_and_band(values.to_numpy(), band)
+            series.append(([1], [min(low, bc_drawn["normalized_return"])],
+                           [max(high, bc_drawn["normalized_return"])]))
+        return_limits = automatic_return_limits(series)
+        ax2.set_title("Automatic return view (" + RANGE_RULE + ")", fontsize=9)
+    set_normalized_return_axis(ax2, return_limits)
     # Audit the drawn centers, band edges and the BC line (with the stored BC
     # values); the expert line at 1 and the axis ticks are not data.
     if "normalized_return" in bc_drawn:
@@ -672,7 +695,7 @@ def plot_env(
                 "values": [float(v) for v in bc_values.dropna()],
             },
         ]
-    scale_notes = _normalized_scale_notes(return_points)
+    scale_notes = _normalized_scale_notes(return_points, return_limits)
     if scale_notes:
         fig.text(
             0.5,
@@ -701,6 +724,7 @@ def plot_all(
     calibration_data: Optional[Dict[str, Any]] = None,
     band: str = "ci",
     flat_output: bool = False,
+    zoom_classical_return: bool = False,
 ) -> List[pathlib.Path]:
     """Generate plots for all environments.
 
@@ -714,6 +738,7 @@ def plot_all(
             ``"sem"``.
 
         flat_output: Save directly in output_dir, without another environment-family folder.
+        zoom_classical_return: Show the near-expert return range for classical environments.
 
     Returns:
         List of saved plot file paths.
@@ -744,6 +769,9 @@ def plot_all(
             show_expert_on_loss=show_expert_on_loss,
             calibration=cal,
             band=band,
+            return_limits=None
+            if zoom_classical_return and _env_category(env_name) == "classical"
+            else NORMALIZED_RETURN_YLIM,
         )
         saved_paths.append(out_path)
 
@@ -1388,13 +1416,14 @@ def _restriction_observation(runs: Sequence[Mapping[str, Any]]) -> Dict[str, Any
 
 def _normalized_view_audit(
     points: Mapping[str, Sequence[Mapping[str, Any]]],
+    limits: Tuple[float, float] = NORMALIZED_RETURN_YLIM,
 ) -> Dict[str, Any]:
     """What lies outside the fixed normalized-return view; data are unchanged."""
-    lo, hi = NORMALIZED_RETURN_YLIM
+    lo, hi = limits
     pts = [p for series in points.values() for p in series]
     drawn = [p[k] for p in pts for k in ("low", "high", "mean") if k in p]
     return {
-        "y_limits": list(NORMALIZED_RETURN_YLIM),
+        "y_limits": list(limits),
         "fixed": True,
         "data_modified": False,
         "outside": {
@@ -1411,6 +1440,7 @@ def _normalized_view_audit(
 
 def _normalized_scale_notes(
     points: Mapping[str, Sequence[Mapping[str, Any]]],
+    limits: Tuple[float, float] = NORMALIZED_RETURN_YLIM,
 ) -> List[str]:
     """Scale note if any drawn or source value leaves [0,1]; off-scale if hidden."""
     pts = [p for series in points.values() for p in series]
@@ -1418,7 +1448,7 @@ def _normalized_scale_notes(
     drawn = [p[k] for p in pts for k in ("low", "high", "mean") if k in p]
     if any(not 0 <= v <= 1 for v in drawn + [v for p in pts for v in p["values"]]):
         notes.append(RETURN_SCALE_FOOTNOTE)
-    outside = _normalized_view_audit(points)["outside"]
+    outside = _normalized_view_audit(points, limits)["outside"]
     if outside["means"] or outside["band_edges"]:
         notes.append(OFFSCALE_FOOTNOTE)
     return notes
@@ -2093,6 +2123,11 @@ def main():
         action="store_true",
         help="Save directly in output-dir without a family subfolder",
     )
+    parser.add_argument(
+        "--zoom-classical-return",
+        action="store_true",
+        help="Choose each classical return range from its later curve bands",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2113,6 +2148,7 @@ def main():
         calibration_data=calibration_data,
         band=args.band,
         flat_output=args.flat_output,
+        zoom_classical_return=args.zoom_classical_return,
     )
     if paths:
         logger.info(f"Generated {len(paths)} plots in {args.output_dir}")

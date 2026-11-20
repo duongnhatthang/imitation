@@ -5,7 +5,7 @@
 # (these MDPs ignore GPU per run_experiment.py device selection).
 #
 # Settings: samples_per_round=1, n_rounds=1000, bc_n_epochs=20,
-# inner-ES on, outer-ES OFF (every run goes to the full 1000 rounds so
+# training-loss plateau fits, outer stopping off (every run reaches its cap so
 # the learning curves are directly comparable).
 #
 # Output paths come from experiments/paths.sh (override EXP_LC_CLASSICAL to
@@ -82,7 +82,7 @@ echo "[learning_curves] generating plots ..." | tee -a "$LOG_FILE"
 
 python -m imitation.experiments.ftrl.plot_results \
     --results-dir "$RESULTS_DIR" \
-    --output-dir "$PLOTS_DIR" --flat-output \
+    --output-dir "$PLOTS_DIR" --flat-output --zoom-classical-return \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "[learning_curves] complete. JSONs:"

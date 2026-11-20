@@ -36,7 +36,7 @@ from imitation.util import logger as imit_logger
 logger = logging.getLogger(__name__)
 
 ALL_ALGOS = ["ftl", "ftrl", "bc", "bc_iid", "bc_prefix", "bc_pool"]
-DEFAULT_ALGOS = ["ftl", "ftrl", "bc", "bc_iid"]
+DEFAULT_ALGOS = ["ftl", "ftrl", "bc", "bc_prefix"]
 
 # Algorithms that collect fresh expert-labeled rollouts each round.
 INTERACTIVE_ALGOS = ("ftl", "ftrl", "bc_iid")
@@ -1736,6 +1736,8 @@ def _run_dagger_variant(
     offline_data=None,
     offline_source: Optional[Dict[str, Any]] = None,
     round_callback: Optional[Callable[[Dict[str, Any], Dict[str, float]], None]] = None,
+    evaluation_venv=None,
+    deferred_expert_label: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run FTL, FTRL, BC-iid, BC-prefix or BC-pool on shared mechanics.
 
@@ -1757,8 +1759,35 @@ def _run_dagger_variant(
     acquisition. ``round_callback(record, timing)`` is called after every
     appended record (round 0 included) with wall-clock seconds spent on
     collection plus training and on evaluation; an exception it raises stops
-    the run.
+    the run. A separate evaluation environment enables explicitly seeded
+    evaluations without changing the training environment. Deferred labeling
+    is the one-episode, one-label, learner-only FTL protocol.
     """
+    if deferred_expert_label and (
+        config.algo != "ftl"
+        or config.beta_rampdown != 0
+        or config.samples_per_round != 1
+        or config.trajectories_per_round != 1
+        or venv.num_envs != 1
+        or offline_data is not None
+    ):
+        raise ValueError("Deferred labeling requires learner-only FTL with one label per episode")
+
+    def evaluate_policy(budget: int, final: bool) -> Dict[str, Any]:
+        eval_kwargs = (
+            {"eval_seed": paired_eval_seed(config.seed, budget)}
+            if evaluation_venv is not None
+            else _paired_eval_kwargs(config, budget)
+        )
+        return _compute_round_eval(
+            bc_trainer.policy,
+            expert_policy,
+            venv if evaluation_venv is None else evaluation_venv,
+            baselines,
+            n_episodes=_eval_episodes(config, final=final),
+            **eval_kwargs,
+        )
+
     from imitation.algorithms.dagger import ExponentialBetaSchedule, LinearBetaSchedule
 
     # Create policy
@@ -1855,14 +1884,7 @@ def _run_dagger_variant(
 
     # Round 0: evaluate the fresh (untrained) policy.
     eval_start = time.monotonic()
-    round0_eval = _compute_round_eval(
-        bc_trainer.policy,
-        expert_policy,
-        venv,
-        baselines,
-        n_episodes=_eval_episodes(config, final=config.n_rounds == 0),
-        **_paired_eval_kwargs(config, 0),
-    )
+    round0_eval = evaluate_policy(0, final=config.n_rounds == 0)
     round0_eval.update(_checkpoint_fields(config, policy, 0))
     disagreement_history.append(round0_eval["disagreement_rate"])
     per_round.append(
@@ -1922,6 +1944,29 @@ def _run_dagger_variant(
             # The whole dataset was collected up front, so the expert-interaction
             # cost is a constant, not something that grows with the round.
             collection_steps = offline_collection_steps
+        elif deferred_expert_label:
+            collected = rollout.generate_trajectories(
+                policy=bc_trainer.policy,
+                venv=venv,
+                sample_until=rollout.make_sample_until(min_timesteps=None, min_episodes=1),
+                rng=rng,
+            )
+            (episode,) = collected
+            collection_steps += len(episode)
+            index = int(rng.integers(len(episode)))
+            label, _ = expert_policy.predict(
+                episode.obs[index : index + 1],
+                deterministic=True,
+            )
+            demo = types.Trajectory(
+                obs=episode.obs[index : index + 2],
+                acts=np.asarray(label),
+                infos=None,
+                terminal=False,
+            )
+            round_dir = trainer._demo_dir_path_for_round()
+            round_dir.mkdir(parents=True, exist_ok=True)
+            _save_dagger_demo(demo, 0, round_dir, rng, prefix="uniform")
         else:
             # --- Collect expert-labeled rollouts for this round ---
             collector = trainer.create_trajectory_collector()
@@ -1986,14 +2031,7 @@ def _run_dagger_variant(
         eval_data: Optional[Dict[str, Any]] = None
         eval_start = time.monotonic()
         if should_eval:
-            eval_data = _compute_round_eval(
-                bc_trainer.policy,
-                expert_policy,
-                venv,
-                baselines,
-                n_episodes=_eval_episodes(config, final=is_final),
-                **_paired_eval_kwargs(config, cum_obs),
-            )
+            eval_data = evaluate_policy(cum_obs, final=is_final)
             disagreement_history.append(eval_data["disagreement_rate"])
             logger.info(
                 "%s/%s/seed%s round %d: %d labels, %d-episode eval, "
@@ -2028,7 +2066,7 @@ def _run_dagger_variant(
             "round": round_num,
             "n_observations": cum_obs,
             "collection_steps": collection_steps,
-            "collection_expert_queries": collection_steps,
+            "collection_expert_queries": cum_obs if deferred_expert_label else collection_steps,
             "trajectories_collected_this_round": len(collected),
             "train_cross_entropy": None if m is None else round(m.cross_entropy, 6),
             "l2_norm": None if m is None else round(m.l2_norm, 6),

@@ -2277,3 +2277,14 @@ def test_restriction_footer_text_lengths_quantified(tmp_path):
         lengths[name] = (len(notes), sum(len(n) for n in notes))
     assert lengths["acrobot"][0] == 3 and lengths["acrobot"][1] < 260
     assert lengths["cliff_pairs"][0] <= 5 and lengths["cliff_pairs"][1] < 480
+
+
+def test_plot_env_automatic_range_follows_suboptimal_plateau(tmp_path, saved_figures):
+    df = _legacy_df([[0.1] * 3, [0.73] * 3, [0.74] * 3], 0.735)
+    plot_env(df, "CartPole-v1", tmp_path / "automatic.png", band="sem", return_limits=None)
+    ax = saved_figures[-1].axes[1]
+    lo, hi = ax.get_ylim()
+    assert 0.65 < lo < 0.73
+    assert 0.74 < hi < 0.85
+    assert ax.get_yscale() == "linear"
+    assert np.isclose(min(ax.lines[0].get_ydata()), 0.1)
