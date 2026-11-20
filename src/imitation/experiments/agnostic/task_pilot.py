@@ -63,6 +63,7 @@ exist for this family only; a reduced budget is recorded as such.
 """
 
 import argparse
+import dataclasses
 import datetime
 import json
 import logging
@@ -111,6 +112,20 @@ CAPACITY_SOURCE_FILES = SOURCE_FILES + (
 )
 # Capacity evaluations run at round 0, every 50 labels, and the last round.
 CAPACITY_EVAL_INTERVAL = 50
+FOLLOWUP_EVAL_INTERVAL = 20
+FOLLOWUP_METHODS = ("ftl", "bc", rp.PREFIX_METHOD)
+
+
+def _followup_spec(spec: rp.RunnerSpec) -> rp.RunnerSpec:
+    """Use the same acquisition and fit protocol in both study modes."""
+    return dataclasses.replace(
+        spec,
+        protocol=spec.protocol + "+statewise/1",
+        data_protocol=spec.data_protocol + "+statewise/1",
+        methods=FOLLOWUP_METHODS,
+        paired_cold_fits=True,
+        statewise_followup=True,
+    )
 
 
 def calibration_candidates_of(env_name: str) -> Tuple[str, ...]:
@@ -356,6 +371,7 @@ def prepare_data(
     env_name: str,
     learner_family: str = LEGACY_FAMILY,
     teacher_width: Optional[int] = None,
+    statewise_followup: bool = False,
     **kwargs,
 ) -> int:
     """`restriction_pilot.prepare_data` under the spec of ``env_name``.
@@ -368,6 +384,8 @@ def prepare_data(
         return rp._refused(classical.Refused(str(exc)))
     except classical.Refused as exc:
         return rp._refused(exc)
+    if statewise_followup:
+        spec = _followup_spec(spec)
     return rp.prepare_data(output_dir, expert_dir, spec=spec, **kwargs)
 
 
@@ -382,6 +400,7 @@ def run_job(
     learner_family: str = LEGACY_FAMILY,
     student_width: Optional[int] = None,
     teacher_width: Optional[int] = None,
+    statewise_followup: bool = False,
     **kwargs,
 ) -> int:
     """`restriction_pilot.run_job` under the generic spec of ``env_name``.
@@ -398,7 +417,9 @@ def run_job(
             spec = runner_spec(
                 env_name,
                 bc_prefix=(
-                    not paired_cold_fits and kwargs.get("method") == rp.PREFIX_METHOD
+                    not paired_cold_fits
+                    and not statewise_followup
+                    and kwargs.get("method") == rp.PREFIX_METHOD
                 ),
                 paired_cold_fits=paired_cold_fits,
                 calibration_candidates=calibration_candidates,
@@ -411,6 +432,13 @@ def run_job(
         return rp._refused(classical.Refused(str(exc)))
     except classical.Refused as exc:
         return rp._refused(exc)
+    if statewise_followup:
+        if paired_cold_fits or kwargs.get("bc_n_epochs") is not None:
+            return rp._refused(
+                classical.Refused("statewise follow-up fixes the cold-fit protocol"),
+            )
+        spec = _followup_spec(spec)
+        kwargs.setdefault("eval_interval", FOLLOWUP_EVAL_INTERVAL)
     if spec.learner is not None:
         if student_width is None:
             return rp._refused(
@@ -496,6 +524,8 @@ def build_parser() -> argparse.ArgumentParser:
     common(data)
     data.add_argument("--seed", type=int, required=True)
     data.add_argument("--allow-relaxed-expert", action="store_true")
+    data.add_argument("--budget", type=_positive_int, default=rp.DEFAULT_BUDGET)
+    data.add_argument("--statewise-followup", action="store_true")
     family(data)
     run = sub.add_parser("run", help="one (method, restriction) run")
     common(run)
@@ -514,6 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"epoch cap of a fixed-epoch BC fit (default {rp.BC_EPOCHS})",
     )
     opt_in(run)
+    run.add_argument("--statewise-followup", action="store_true")
     family(run)
     run.add_argument(
         "--student-width",
@@ -524,9 +555,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--n-rounds",
-        type=int,
+        type=_positive_int,
         default=None,
-        help=f"capacity family only (default {rp.DEFAULT_BUDGET}, the benchmark)",
+        help=f"label budget (default {rp.DEFAULT_BUDGET})",
     )
     run.add_argument(
         "--eval-episodes",
@@ -542,16 +573,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--eval-interval",
-        type=int,
+        type=_positive_int,
         default=None,
-        help=f"capacity family only (default {CAPACITY_EVAL_INTERVAL})",
+        help="rounds between evaluations",
     )
     return parser
 
 
 def _family_arguments(parser, args) -> Dict[str, Any]:
     """Keyword arguments of the selected learner family; legacy adds none."""
-    names = ("teacher_width", "student_width", "n_rounds", "eval_interval")
+    names = ("teacher_width", "student_width")
+    if args.learner_family == LEGACY_FAMILY and not getattr(
+        args, "statewise_followup", False,
+    ):
+        names += ("n_rounds", "eval_interval")
     given = {n: getattr(args, n, None) for n in names}
     given = {n: v for n, v in given.items() if v is not None}
     if args.learner_family == LEGACY_FAMILY:
@@ -610,6 +645,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.expert_dir,
                 env_name=args.env,
                 seed=args.seed,
+                budget=args.budget,
+                statewise_followup=args.statewise_followup,
                 allow_relaxed_expert=args.allow_relaxed_expert,
                 **common,
             )
@@ -631,6 +668,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 bc_n_epochs=args.bc_epochs,
                 eval_episodes=args.eval_episodes,
                 final_eval_episodes=args.final_eval_episodes,
+                statewise_followup=args.statewise_followup,
+                **{
+                    name: getattr(args, name)
+                    for name in ("n_rounds", "eval_interval")
+                    if getattr(args, name) is not None
+                },
                 **common,
             )
         record_file = rp.RESULT_FILE

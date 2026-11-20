@@ -51,6 +51,7 @@ TESTS_REQUIRE = (
         "pytest-notebook==0.8.0",
         "pytest-timeout~=2.1.0",
         "pytest-xdist~=2.5.0",
+        "reportlab>=4,<5",
         "scipy~=1.9.0",
         "wandb==0.12.21",
         "setuptools_scm~=7.0.5",
@@ -226,6 +227,7 @@ setup(
         + PYTYPE,
         "test": TESTS_REQUIRE,
         "docs": DOCS_REQUIRE,
+        "reports": ["reportlab>=4,<5"],
         "parallel": PARALLEL_REQUIRE,
         "mujoco": [
             "gymnasium[classic-control,mujoco]~=0.29",

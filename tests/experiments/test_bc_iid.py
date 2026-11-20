@@ -1,5 +1,6 @@
 """BC-iid collection and training contracts on a small deterministic MDP."""
 
+import contextlib
 import dataclasses
 import os
 import sys
@@ -246,7 +247,7 @@ def test_cli_defaults_and_trajectory_option(
         "ftl": "uniform",
         "ftrl": "uniform",
         "bc": "prefix",
-        "bc_iid": "uniform",
+        "bc_prefix": "prefix",
     }
     if optional_algos:
         expected = {"bc_prefix": "prefix", "bc_pool": "uniform"}
@@ -450,3 +451,49 @@ def test_bc_iid_outer_stop_preserves_final_trained_budget(tiny_experiment):
         config.output_dir, config.env_name, "bc_iid", 7
     )
     assert len(states.obs) == 9
+
+
+def test_statewise_ftl_queries_only_the_sampled_training_state(
+    tiny_experiment, monkeypatch,
+):
+    config = dataclasses.replace(
+        tiny_experiment,
+        algo="ftl",
+        beta_rampdown=0,
+        n_rounds=2,
+        samples_per_round=1,
+        trajectories_per_round=1,
+        eval_interval=2,
+        eval_episodes=1,
+        evaluate_first_round=False,
+    )
+    expert = run_experiment.experts.get_or_train_expert()
+    calls = []
+    predict = expert.predict
+
+    def count_predict(obs, *args, **kwargs):
+        calls.append(len(obs))
+        return predict(obs, *args, **kwargs)
+
+    monkeypatch.setattr(expert, "predict", count_predict)
+    with contextlib.ExitStack() as stack:
+        train = stack.enter_context(contextlib.closing(DummyVecEnv([ActionHistoryEnv])))
+        evaluate = stack.enter_context(
+            contextlib.closing(DummyVecEnv([ActionHistoryEnv])),
+        )
+        rows = run_experiment._run_dagger_variant(
+            config,
+            train,
+            expert,
+            np.random.default_rng(config.seed),
+            {"expert_return": 7.0, "random_return": 0.0},
+            evaluation_venv=evaluate,
+            deferred_expert_label=True,
+        )
+    assert [r["round"] for r in rows if r["d_eval_size"] is not None] == [0, 2]
+    assert rows[-1]["collection_steps"] == 14
+    assert rows[-1]["collection_expert_queries"] == 2
+    assert sum(calls) == 2 + sum(row["d_eval_size"] or 0 for row in rows)
+    assert rows[-1]["evaluation_episode_seeds"] == [
+        run_experiment.paired_eval_seed(config.seed, 2),
+    ]

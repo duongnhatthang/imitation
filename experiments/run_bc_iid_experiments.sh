@@ -94,4 +94,7 @@ ATARI_PLOT_ENVS="${ATARI_ENVS:-$(python -c 'from imitation.experiments.ftrl.env_
 PLOT_ROOT="$EXP_PLOTS_ATARI" bash experiments/gen_coverage_viz.sh "$EXP_LC_ATARI" $ATARI_PLOT_ENVS \
     > "$EXP_LOG_DIR/atari-coverage.log" 2>&1
 fi
+status results_pdf
+python experiments/compile_results_pdf.py \
+    --plots-dir "$EXP_RUN_ROOT/plots" --run-id "$EXP_RUN_ID"
 status complete

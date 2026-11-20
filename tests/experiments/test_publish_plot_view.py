@@ -246,11 +246,16 @@ def test_sync_wrapper_exports_and_repeats_without_revision_or_raw_leaks(tmp_path
     project, remote = tmp_path / "project", tmp_path / "remote"
     for root in [project, remote]:
         (root / "experiments").mkdir(parents=True)
-        shutil.copy2(ROOT / "experiments/publish_plot_view.py", root / "experiments")
+        for helper in ("publish_plot_view.py", "compile_results_pdf.py"):
+            shutil.copy2(ROOT / "experiments" / helper, root / "experiments")
     shutil.copy2(ROOT / "experiments/sync_results.sh", project / "experiments")
     subprocess.run(["git", "init", "-q", str(project)], check=True)
     source = remote / "experiments/runs/trial/plots"
-    put(source, "classical/learning_curves/concise-v2/a.png")
+    from PIL import Image
+
+    current = source / "classical/learning_curves/concise-v2/a.png"
+    current.parent.mkdir(parents=True)
+    Image.new("RGB", (200, 100), "blue").save(current)
     put(source, "classical/learning_curves/old/a.png", b"old")
     put(source, "classical/learning_curves/concise-v2/result.json", b"raw")
     policy = remote / "experiments/.local/plot-layouts/trial.json"
@@ -297,7 +302,9 @@ def test_sync_wrapper_exports_and_repeats_without_revision_or_raw_leaks(tmp_path
         )
         assert result.returncode == 0, result.stdout + result.stderr
     view = project / "experiments/plots/trial"
-    assert (view / "classical/learning_curves/a.png").read_bytes() == b"figure"
+    assert (view / "classical/learning_curves/a.png").read_bytes() == current.read_bytes()
+    assert (view / "imitation_learning_experiment_results.pdf").read_bytes().startswith(b"%PDF")
+    assert not list((view / "archive").rglob("imitation_learning_experiment_results.pdf"))
     assert (view / "archive/classical/learning_curves/old/a.png").read_bytes() == b"old"
     assert not list(view.rglob("*.json"))
     assert not (view / "classical/learning_curves/concise-v2").exists()

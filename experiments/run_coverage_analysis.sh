@@ -18,10 +18,10 @@ PLOTS_DIR="$EXP_PLOTS_COVERAGE/coverage"
 CACHE_DIR="${COVERAGE_CACHE_DIR:-$RESULTS_DIR/dqn_cache}"
 mkdir -p "$PLOTS_DIR" "$CACHE_DIR"
 
-# Require every algo's demos (not just ftrl): bc/bc_iid persist demos too, and a
+# Require every algo's demos (not just ftrl): both offline BC methods persist demos too, and a
 # stale ftl/ftrl-only dir would otherwise skip the sweep and drop the offline panels.
 NEED_SWEEP=0
-for algo in ftl ftrl bc bc_iid; do
+for algo in ftl ftrl bc bc_prefix; do
   if [ ! -d "$RESULTS_DIR/scratch/${algo}_${ENV}_seed0/demos" ]; then
     NEED_SWEEP=1
   fi
@@ -30,7 +30,7 @@ if [ "$NEED_SWEEP" -eq 1 ]; then
   echo "[coverage] missing scratch demos for one or more algos; running short CartPole sweep ..."
   python -m imitation.experiments.ftrl.run_experiment \
       --envs "$ENV" \
-      --algos ftl ftrl bc bc_iid \
+      --algos ftl ftrl bc bc_prefix \
       --seeds 1 \
       --samples-per-round 1 \
       --n-rounds 30 \
@@ -48,7 +48,8 @@ fi
 
 echo "[coverage] t-SNE coverage ..."
 python -m imitation.experiments.ftrl.plot_tsne_coverage \
-    --results-dir "$RESULTS_DIR" --env "$ENV" --seed 0 --output-dir "$PLOTS_DIR"
+    --results-dir "$RESULTS_DIR" --env "$ENV" --seed 0 --output-dir "$PLOTS_DIR" \
+    --algos ftl ftrl bc bc_prefix
 
 echo "[coverage] recoverability ..."
 python -m imitation.experiments.ftrl.plot_recoverability \
