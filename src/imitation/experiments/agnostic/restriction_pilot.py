@@ -1491,6 +1491,9 @@ def _experiment_config(
     eval_episodes=None,
     final_eval_episodes=None,
     capacity=False,
+    eval_initial_rounds=None,
+    save_every_round=True,
+    compact_checkpoints=True,
 ):
     return run_experiment.ExperimentConfig(
         algo=method,
@@ -1508,6 +1511,10 @@ def _experiment_config(
         eval_episodes=(run_experiment.EVAL_EPISODES if capacity else 100)
         if eval_episodes is None else eval_episodes,
         final_eval_episodes=final_eval_episodes,
+        eval_initial_rounds=(run_experiment.EVAL_INITIAL_ROUNDS if capacity else 0)
+        if eval_initial_rounds is None else eval_initial_rounds,
+        save_every_round=save_every_round,
+        compact_checkpoints=compact_checkpoints,
         evaluate_first_round=not capacity,
         fit_rule=(
             run_experiment.FIT_RULE_PLATEAU if capacity
@@ -1544,6 +1551,9 @@ def run_job(
     bc_n_epochs: Optional[int] = None,
     eval_episodes: Optional[int] = None,
     final_eval_episodes: Optional[int] = None,
+    eval_initial_rounds: Optional[int] = None,
+    save_every_round: bool = True,
+    compact_checkpoints: bool = True,
 ) -> int:
     """Run one (method, restriction) pilot job into a fresh directory.
 
@@ -1572,6 +1582,8 @@ def run_job(
             )
         if int(n_rounds) <= 0 or int(eval_interval) <= 0:
             raise classical.Refused("n_rounds and eval_interval must be positive")
+        if eval_initial_rounds is not None and eval_initial_rounds < 0:
+            raise classical.Refused("eval_initial_rounds must be non-negative")
         for name, value in (("eval_episodes", eval_episodes),
                             ("final_eval_episodes", final_eval_episodes)):
             if value is not None and int(value) <= 0:
@@ -1710,6 +1722,9 @@ def run_job(
         eval_episodes=eval_episodes,
         final_eval_episodes=final_eval_episodes,
         capacity=capacity is not None or spec.statewise_followup,
+        eval_initial_rounds=eval_initial_rounds,
+        save_every_round=save_every_round,
+        compact_checkpoints=compact_checkpoints,
     )
     experiment = {
         k: v
@@ -1740,11 +1755,10 @@ def run_job(
         "eval_episodes": int(config.eval_episodes),
         "eval_deterministic": True,
         "eval_budgets": (
-            [n_rounds]
-            if method == "bc"
-            else [0] + eval_budgets(n_rounds, eval_interval)
-            if config.evaluate_first_round
-            else run_experiment.eval_rounds(n_rounds, eval_interval)
+            [n_rounds] if method == "bc" else sorted(set(
+                run_experiment.eval_rounds(n_rounds, eval_interval, config.eval_initial_rounds)
+                + ([1] if config.evaluate_first_round else [])
+            ))
         ),
         "fixed_bc": FIXED_BC_RULE if method == "bc" else None,
         "batch_rule": BATCH_RULE,

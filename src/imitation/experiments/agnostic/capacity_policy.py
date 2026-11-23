@@ -606,7 +606,7 @@ class CapacityActorCriticPolicy(ActorCriticPolicy):
         )
         return data
 
-    def save_bound(self, path) -> Dict[str, Any]:
+    def save_bound(self, path, *, compact=False) -> Dict[str, Any]:
         """Write the ``policy.save`` checkpoint and bind the bytes written.
 
         The checkpoint is serialized once in memory, hashed and written
@@ -619,14 +619,9 @@ class CapacityActorCriticPolicy(ActorCriticPolicy):
             size, full state digest and spec digest.
         """
         state = self.state_dict()
-        buffer = io.BytesIO()
-        th.save(
-            {"state_dict": state, "data": self._get_constructor_parameters()},
-            buffer,
-        )
-        blob = buffer.getvalue()
-        with open(path, "wb") as f:
-            f.write(blob)
+        from imitation.experiments.ftrl import policy_utils
+
+        blob = policy_utils.save_policy_checkpoint(path, self, compact=compact)
         return {
             "schema": CHECKPOINT_BINDING_SCHEMA,
             "path": str(path),
@@ -843,6 +838,9 @@ def load_checkpoint(
             f"{expected_file_sha256}",
         )
     saved = th.load(io.BytesIO(blob), map_location=device, weights_only=False)
+    from imitation.experiments.ftrl import policy_utils
+
+    saved = policy_utils.read_policy_checkpoint(path, device, saved=saved)
     if not isinstance(saved, dict) or "capacity_spec" not in (saved.get("data") or {}):
         raise ValueError(f"{path} is not a capacity policy checkpoint")
     policy = policy_from_saved(saved, device)

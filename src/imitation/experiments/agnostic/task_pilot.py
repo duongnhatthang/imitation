@@ -110,8 +110,8 @@ CAPACITY_SOURCE_FILES = SOURCE_FILES + (
     "experiments/agnostic/campaign.py",
     "experiments/agnostic/resource_budget.py",
 )
-# Capacity evaluations run at round 0, every 50 labels, and the last round.
-CAPACITY_EVAL_INTERVAL = 50
+# Capacity evaluations are dense initially, then periodic and at the cap.
+CAPACITY_EVAL_INTERVAL = 20
 FOLLOWUP_EVAL_INTERVAL = 20
 FOLLOWUP_METHODS = ("ftl", "bc", rp.PREFIX_METHOD)
 
@@ -563,7 +563,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-episodes",
         type=int,
         default=None,
-        help="deterministic episodes per evaluation (capacity: 1, legacy: 100)",
+        help="deterministic episodes per evaluation (capacity and statewise: 10, legacy: 100)",
     )
     run.add_argument(
         "--final-eval-episodes",
@@ -577,6 +577,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="rounds between evaluations",
     )
+    run.add_argument(
+        "--eval-initial-rounds", type=int, default=None,
+        help="evaluate every round through this cutoff (capacity and statewise default 60)",
+    )
+    run.add_argument("--eval-only-checkpoints", dest="save_every_round", action="store_false")
+    run.add_argument("--full-checkpoints", dest="compact_checkpoints", action="store_false")
     return parser
 
 
@@ -668,6 +674,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 bc_n_epochs=args.bc_epochs,
                 eval_episodes=args.eval_episodes,
                 final_eval_episodes=args.final_eval_episodes,
+                eval_initial_rounds=args.eval_initial_rounds,
+                save_every_round=args.save_every_round,
+                compact_checkpoints=args.compact_checkpoints,
                 statewise_followup=args.statewise_followup,
                 **{
                     name: getattr(args, name)

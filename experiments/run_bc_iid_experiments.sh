@@ -30,6 +30,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+from imitation.experiments.ftrl.run_experiment import EVAL_INTERVAL, EVAL_INITIAL_ROUNDS, EVAL_EPISODES
 root = Path(os.environ['EXP_RUN_ROOT'])
 manifest = {
     'run_id': os.environ['EXP_RUN_ID'],
@@ -54,8 +55,11 @@ manifest = {
     'bc_pool_sampling': 'uniform',
     'outer_early_stop': False,
     'fit_rule': 'train-loss-plateau/1',
-    'eval_interval': 50,
-    'eval_episodes': 1,
+    'eval_interval': int(os.environ.get('EVAL_INTERVAL', EVAL_INTERVAL)),
+    'eval_initial_rounds': int(os.environ.get('EVAL_INITIAL_ROUNDS', EVAL_INITIAL_ROUNDS)),
+    'eval_episodes': int(os.environ.get('EVAL_EPISODES', EVAL_EPISODES)),
+    'save_every_round': True,
+    'compact_checkpoints': True,
 }
 (root / 'manifest.json').write_text(json.dumps(manifest, indent=2))
 PY
@@ -76,11 +80,15 @@ python -m imitation.experiments.ftrl.run_experiment \
     --expert-cache-dir "$EXP_EXPERT_CACHE" --output-dir "$EXP_SMOKE_DIR" \
     > "$EXP_LOG_DIR/smoke.log" 2>&1
 status classical_training
+EVAL_ARGS=()
+if [ -n "${EVAL_INTERVAL:-}" ]; then EVAL_ARGS+=(--eval-interval "$EVAL_INTERVAL"); fi
+if [ -n "${EVAL_INITIAL_ROUNDS:-}" ]; then EVAL_ARGS+=(--eval-initial-rounds "$EVAL_INITIAL_ROUNDS"); fi
+if [ -n "${EVAL_EPISODES:-}" ]; then EVAL_ARGS+=(--eval-episodes "$EVAL_EPISODES"); fi
 # No hardcoded 8: let run_learning_curves.sh size itself to the node (cores - 2,
 # capped) unless CLASSICAL_WORKERS or an exported N_WORKERS says otherwise.
 env ${CLASSICAL_WORKERS:+N_WORKERS="$CLASSICAL_WORKERS"} bash experiments/run_learning_curves.sh \
     --seeds "$SEEDS" --n-rounds "$CLASSICAL_ROUNDS" \
-    --samples-per-round "$SAMPLES_PER_ROUND" --traj-per-round "$TRAJECTORIES_PER_ROUND"
+    --samples-per-round "$SAMPLES_PER_ROUND" --traj-per-round "$TRAJECTORIES_PER_ROUND" ${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}
 status classical_plots
 CLASSICAL_PLOT_ENVS="${ENVS:-$(python -c 'from imitation.experiments.ftrl.env_utils import ENV_GROUPS; print(" ".join(ENV_GROUPS["classical"]))')}"
 PLOT_ROOT="$EXP_PLOTS_CLASSICAL" bash experiments/gen_coverage_viz.sh "$EXP_LC_CLASSICAL" $CLASSICAL_PLOT_ENVS \
@@ -88,7 +96,7 @@ PLOT_ROOT="$EXP_PLOTS_CLASSICAL" bash experiments/gen_coverage_viz.sh "$EXP_LC_C
 if [ "$RUN_ATARI" = 1 ]; then
 status atari_training
 ENVS="${ATARI_ENVS:-}" N_WORKERS="${ATARI_WORKERS:-${N_WORKERS:-4}}" N_ROUNDS="$ATARI_ROUNDS" bash experiments/run_atari_curves.sh \
-    --seeds "$SEEDS" --samples-per-round "$SAMPLES_PER_ROUND" --traj-per-round "$TRAJECTORIES_PER_ROUND"
+    --seeds "$SEEDS" --samples-per-round "$SAMPLES_PER_ROUND" --traj-per-round "$TRAJECTORIES_PER_ROUND" ${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}
 status atari_plots
 ATARI_PLOT_ENVS="${ATARI_ENVS:-$(python -c 'from imitation.experiments.ftrl.env_utils import ENV_GROUPS; print(" ".join(ENV_GROUPS["atari-zoo"]))')}"
 PLOT_ROOT="$EXP_PLOTS_ATARI" bash experiments/gen_coverage_viz.sh "$EXP_LC_ATARI" $ATARI_PLOT_ENVS \

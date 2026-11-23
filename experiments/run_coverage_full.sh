@@ -67,7 +67,6 @@ python -m imitation.experiments.ftrl.run_experiment \
     --seeds "$SEEDS" \
     --samples-per-round 1 \
     --n-rounds "$N_ROUNDS" \
-    --eval-interval 50 \
     --output-dir "$RESULTS_DIR" \
     --fit-rule train-loss-plateau/1 \
     --no-outer-early-stop \

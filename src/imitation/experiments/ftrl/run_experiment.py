@@ -55,17 +55,12 @@ ROUND_LOOP_ALGOS = INTERACTIVE_ALGOS + OFFLINE_BC_ALGOS
 # keeps a fresh expert_cache reproducible; an existing cache is unaffected.
 EXPERT_TRAINING_SEED = 0
 
-# Learning-curve evaluation for classical and Atari runs: a round-loop run
-# evaluates its policy at round 0, at every multiple of
-# `EVAL_INTERVAL` rounds and at its final round (`eval_rounds`), each time
-# with `EVAL_EPISODES` deterministic episodes. A run may request more
-# episodes at its final budget only (``final_eval_episodes``), which gates
-# that read only final rows (mask calibration) still need. Expert
-# qualification and normalization baselines are separate procedures with
-# their own episode counts and are not affected.
-EVAL_PROTOCOL = "eval-every-50-rounds-1-episode/1"
-EVAL_INTERVAL = 50
-EVAL_EPISODES = 1
+# Learning curves use dense early evaluations followed by periodic reporting.
+# Expert qualification and normalization retain their separate episode counts.
+EVAL_PROTOCOL = "dense-early-periodic-evaluation/2"
+EVAL_INTERVAL = 20
+EVAL_INITIAL_ROUNDS = 60
+EVAL_EPISODES = 10
 
 # BC fit rule shared by fixed BC and each round of FTL/FTRL/BC-iid/DAgger. `FIT_RULE_PLATEAU` trains on all retained labels (no
 # held-out split) until the exact training NLL stops improving: after at
@@ -200,7 +195,7 @@ def _config_metadata(config):
     if settings.pop("paired_cold_fits"):
         settings["paired_cold_fits"] = True
         settings["paired_cold_fits_protocol"] = PAIRED_COLD_FITS_PROTOCOL
-    settings["protocol_version"] = 6
+    settings["protocol_version"] = 7
     digest = hashlib.sha256()
     for name in (
         "run_experiment.py",
@@ -328,6 +323,9 @@ class ExperimentConfig:
     # final-budget evaluation only.
     eval_episodes: int = EVAL_EPISODES
     final_eval_episodes: Optional[int] = None
+    eval_initial_rounds: int = EVAL_INITIAL_ROUNDS
+    save_every_round: bool = True
+    compact_checkpoints: bool = True
     # Historical CartPole pilot also reports the first fitted policy.
     evaluate_first_round: bool = False
     # BC fit rule (`FIT_RULE_PLATEAU` by default) and its parameters.
@@ -339,7 +337,7 @@ class ExperimentConfig:
     fit_nll_floor: float = FIT_NLL_FLOOR_RULE
     fit_max_epochs: int = FIT_MAX_EPOCHS
     fit_max_steps: int = FIT_MAX_STEPS
-    # Skip fits of `DATA_INDEPENDENT_ALGOS` at rounds that are not evaluated.
+    # Legacy evaluation-only retention can skip unreported data-independent fits.
     skip_unreported_fits: bool = False
     # Opt-in `PAIRED_COLD_FITS_PROTOCOL`: cold fits only, keyed by (seed, N).
     paired_cold_fits: bool = False
@@ -349,6 +347,8 @@ class ExperimentConfig:
             raise ValueError("eval_episodes must be positive")
         if self.final_eval_episodes is not None and self.final_eval_episodes < 1:
             raise ValueError("final_eval_episodes must be positive")
+        if self.eval_initial_rounds < 0:
+            raise ValueError("eval_initial_rounds must be non-negative")
         if self.eval_interval < 1:
             raise ValueError("eval_interval must be positive")
         if self.fit_rule not in (FIT_RULE_PLATEAU, FIT_RULE_EPOCHS):
@@ -496,16 +496,18 @@ def _episode_evidence(eval_utils, eval_res) -> Dict[str, Any]:
     return evidence(eval_res)
 
 
-def eval_rounds(n_rounds: int, eval_interval: int = EVAL_INTERVAL) -> List[int]:
-    """Rounds a round-loop run evaluates under `EVAL_PROTOCOL`.
-
-    Round 0 (the untrained policy), every multiple of ``eval_interval`` and the
-    final round.
-    """
+def eval_rounds(
+    n_rounds: int,
+    eval_interval: int = EVAL_INTERVAL,
+    eval_initial_rounds: int = EVAL_INITIAL_ROUNDS,
+) -> List[int]:
+    """Round zero, dense initial rounds, later interval multiples and final."""
     n_rounds, eval_interval = int(n_rounds), int(eval_interval)
-    if n_rounds < 0 or eval_interval <= 0:
-        raise ValueError("n_rounds must be >= 0 and eval_interval positive")
+    eval_initial_rounds = int(eval_initial_rounds)
+    if n_rounds < 0 or eval_interval <= 0 or eval_initial_rounds < 0:
+        raise ValueError("n_rounds and eval_initial_rounds must be >= 0 and eval_interval positive")
     points = {0, n_rounds}
+    points.update(range(1, min(n_rounds, eval_initial_rounds) + 1))
     points.update(range(eval_interval, n_rounds + 1, eval_interval))
     return sorted(points)
 
@@ -1927,7 +1929,7 @@ def _run_dagger_variant(
     cum_obs = 0
     collection_steps = 0
     stopped_early = False
-    evaluated_rounds = set(eval_rounds(config.n_rounds, config.eval_interval))
+    evaluated_rounds = set(eval_rounds(config.n_rounds, config.eval_interval, config.eval_initial_rounds))
     if config.evaluate_first_round:
         evaluated_rounds.add(1)
     for round_num in range(1, config.n_rounds + 1):
@@ -2000,6 +2002,7 @@ def _run_dagger_variant(
             )
         if (
             config.skip_unreported_fits
+            and not config.save_every_round
             and config.algo in DATA_INDEPENDENT_ALGOS
             and round_num not in evaluated_rounds
         ):
@@ -2023,8 +2026,7 @@ def _run_dagger_variant(
         cum_obs += config.samples_per_round
 
         # --- Evaluate the policy at the reported training budget ---
-        # `EVAL_PROTOCOL`: every `eval_interval` rounds and the final round
-        # (round 0 was evaluated above), as `eval_rounds` lists them.
+        # Dense initial rounds, then interval multiples and the final round.
         is_final = round_num == config.n_rounds
         should_eval = round_num in evaluated_rounds
 
@@ -2081,6 +2083,7 @@ def _run_dagger_variant(
 
         if eval_data is not None:
             round_data.update(eval_data)
+        if config.save_every_round or eval_data is not None:
             round_data.update(
                 _checkpoint_fields(config, bc_trainer.policy, round_num),
             )
@@ -2137,7 +2140,7 @@ def _collect_and_subsample_transitions(
 
 
 def _policy_path(config, round_num) -> pathlib.Path:
-    """Where `_save_policy` keeps the policy evaluated at ``round_num``."""
+    """Where `_save_policy` keeps the policy from ``round_num``."""
     name = config.result_name_override or config.algo
     return (
         config.output_dir
@@ -2148,10 +2151,12 @@ def _policy_path(config, round_num) -> pathlib.Path:
 
 
 def _save_policy(config, policy, round_num):
-    """Retain evaluated policies so recovery tests do not require retraining."""
+    """Retain policy weights, sharing frozen state for linear policies."""
     path = _policy_path(config, round_num)
     path.parent.mkdir(parents=True, exist_ok=True)
-    policy.save(path)
+    policy_utils.save_policy_checkpoint(
+        path, policy, compact=config.compact_checkpoints and config.policy_mode == "linear",
+    )
     return str(path)
 
 
@@ -2168,7 +2173,10 @@ def _checkpoint_fields(config, policy, round_num) -> Dict[str, Any]:
         return {"checkpoint": _save_policy(config, policy, round_num)}
     path = _policy_path(config, round_num)
     path.parent.mkdir(parents=True, exist_ok=True)
-    return {"checkpoint": str(path), "checkpoint_binding": save_bound(path)}
+    return {
+        "checkpoint": str(path),
+        "checkpoint_binding": save_bound(path, compact=config.compact_checkpoints),
+    }
 
 
 def _shared_expert_data(config, venv, expert_policy):
@@ -2483,6 +2491,9 @@ def build_configs(args: argparse.Namespace) -> List[ExperimentConfig]:
                         beta_rampdown=args.beta_rampdown,
                         bc_n_epochs=args.bc_n_epochs,
                         eval_interval=args.eval_interval,
+                        eval_initial_rounds=getattr(args, "eval_initial_rounds", EVAL_INITIAL_ROUNDS),
+                        save_every_round=getattr(args, "save_every_round", True),
+                        compact_checkpoints=getattr(args, "compact_checkpoints", True),
                         eval_episodes=getattr(args, "eval_episodes", EVAL_EPISODES),
                         final_eval_episodes=getattr(args, "final_eval_episodes", None),
                         fit_rule=getattr(args, "fit_rule", FIT_RULE_PLATEAU),
@@ -2675,7 +2686,19 @@ def main():
         "--eval-interval",
         type=int,
         default=EVAL_INTERVAL,
-        help=f"Evaluate every N rounds, plus round 0 and the last (default {EVAL_INTERVAL})",
+        help=f"Evaluate every N rounds after the dense initial phase, plus round 0 and the last (default {EVAL_INTERVAL})",
+    )
+    parser.add_argument(
+        "--eval-initial-rounds", type=int, default=EVAL_INITIAL_ROUNDS,
+        help=f"Evaluate each round through this cutoff (default {EVAL_INITIAL_ROUNDS}; 0 disables)",
+    )
+    parser.add_argument(
+        "--eval-only-checkpoints", dest="save_every_round", action="store_false",
+        help="Legacy mode: save checkpoints only at evaluation rounds",
+    )
+    parser.add_argument(
+        "--full-checkpoints", dest="compact_checkpoints", action="store_false",
+        help="Store full policies instead of sharing frozen weights",
     )
     parser.add_argument(
         "--eval-episodes",

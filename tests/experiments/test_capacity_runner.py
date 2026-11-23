@@ -182,9 +182,9 @@ def test_every_width_and_method_runs_on_shared_data(capacity_data, capacity_runs
             assert fits == 1 and [r["reference"] for r in evals] == ["flat"]
             assert config["eval_budgets"] == [BUDGET]
         else:
-            # FTL refits every round; BC-iid fits only evaluated budgets.
-            assert fits == (BUDGET if method == "ftl" else 2)
-            assert config["eval_budgets"] == [0, 3, 6]
+            # Per-round checkpoint retention requires a fresh fit each round.
+            assert fits == BUDGET
+            assert config["eval_budgets"] == list(range(BUDGET + 1))
         for row in evals:
             policy = cp.load_checkpoint(
                 out / row["checkpoint"],
@@ -213,8 +213,8 @@ def test_every_checkpoint_row_carries_its_writer_binding(capacity_runs):
             assert [r["round"] for r in rows] == [0]
             names = [f"round-{BUDGET:05d}.pt"]
         else:
-            assert [r["round"] for r in rows] == [0, 3, 6]
-            names = [f"round-{r:05d}.pt" for r in (0, 3, 6)]
+            assert [r["round"] for r in rows] == list(range(BUDGET + 1))
+            names = [f"round-{r:05d}.pt" for r in range(BUDGET + 1)]
         assert [pathlib.Path(r["checkpoint"]).name for r in rows] == names
         for row in rows:
             binding = row["checkpoint_binding"]
@@ -357,7 +357,7 @@ def test_legacy_specs_and_defaults_are_unchanged():
     assert spec.learner is None and rp.CARTPOLE_V2.learner is None
     assert rp.CARTPOLE_V2.protocol == "agnostic-cartpole-restriction-pilot/2"
     assert rp.EVAL_INTERVAL == 10 and rp.DEFAULT_BUDGET == 1000
-    assert task_pilot.CAPACITY_EVAL_INTERVAL == 50
+    assert task_pilot.CAPACITY_EVAL_INTERVAL == 20
     config = rp._experiment_config("ftl", 300, 1000, 10, "/tmp/x", "CartPole-v1")
     assert config.policy_mode == "linear" and config.bc_n_epochs == 20
     args = task_pilot.build_parser().parse_args(

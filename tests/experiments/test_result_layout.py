@@ -147,7 +147,11 @@ def test_driver_runs_classical_before_atari_and_stops_on_failure(
     assert manifest["run_atari"] is run_atari
     assert manifest["warm_start"] is False
     assert manifest["dagger_beta"] == 0
-    assert manifest["algorithms"] == ["ftl", "ftrl", "bc", "bc_iid"]
+    assert manifest["algorithms"] == ["ftl", "ftrl", "bc", "bc_prefix"]
+    assert manifest["eval_interval"] == 20
+    assert manifest["eval_initial_rounds"] == 60
+    assert manifest["eval_episodes"] == 10
+    assert manifest["save_every_round"] and manifest["compact_checkpoints"]
 
 
 def test_coverage_uses_run_plots_seed_count_and_shared_cache(tmp_path):

@@ -661,7 +661,7 @@ def load_policy_checkpoint(path, device: str = "cpu") -> RestrictedActorCriticPo
     Raises:
         ValueError: If the checkpoint has no restriction metadata.
     """
-    saved = th.load(path, map_location=device, weights_only=False)
+    saved = policy_utils.read_policy_checkpoint(path, device)
     if "restriction_id" not in saved["data"]:
         raise ValueError(f"{path} is not a restricted policy checkpoint")
     policy = RestrictedActorCriticPolicy(**saved["data"])

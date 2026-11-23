@@ -83,6 +83,8 @@ def _config(tmp_path, algo, n_rounds, **overrides):
         beta_rampdown=0,
         bc_n_epochs=6,
         eval_interval=SYNTH_EVAL_INTERVAL,
+        eval_initial_rounds=0,
+        save_every_round=False,
         output_dir=pathlib.Path(tmp_path),
         expert_cache_dir=pathlib.Path(tmp_path) / "unused",
         outer_early_stop=False,
@@ -173,7 +175,7 @@ def test_flag_defaults_off_and_legacy_metadata_has_no_paired_keys(tmp_path):
         meta = rex._config_metadata(config)
         assert "paired_cold_fits" not in meta
         assert "paired_cold_fits_protocol" not in meta
-        assert meta["protocol_version"] == 6
+        assert meta["protocol_version"] == 7
 
     paired = rex._config_metadata(_config(tmp_path, "bc", 4))
     assert paired["paired_cold_fits"] is True
@@ -396,7 +398,7 @@ def test_prefix_checkpoints_and_evaluation_match_offline(
         assert r["eval_seed"] == rex.paired_eval_seed(SEED, r["n_observations"])
     final = evals[-1]
     trainer, _ = _fixed_fit(cartpole, tmp_path, N_SYNTH, "offline-final")
-    saved = th.load(final["checkpoint"], map_location="cpu")
+    saved = policy_utils.read_policy_checkpoint(final["checkpoint"])
     _assert_same_state(saved["state_dict"], trainer.policy.state_dict())
     # Same policy and same budget seed: the same evaluation episodes.
     _burn_rng(77)
@@ -452,7 +454,7 @@ def test_eval_seed_fixes_episodes_and_default_is_unchanged(cartpole):
     )
     assert "eval_seed" not in legacy
     assert "evaluation_episode_seeds" not in legacy
-    assert len(legacy["episode_returns"]) == rex.EVAL_EPISODES == 1
+    assert len(legacy["episode_returns"]) == rex.EVAL_EPISODES == 10
 
 
 def test_paired_episode_seeds_are_distinct_and_wrap_modulo_2_32():
@@ -586,7 +588,7 @@ def test_round_eval_declares_the_deterministic_rollout_it_ran(
     )
     (call,) = calls
     assert call["deterministic"] is True
-    assert call["n_episodes"] == rex.EVAL_EPISODES == 1
+    assert call["n_episodes"] == rex.EVAL_EPISODES == 10
     assert record["evaluation_deterministic"] is call["deterministic"]
     assert len(record["episode_returns"]) == rex.EVAL_EPISODES
     if eval_seed is None:

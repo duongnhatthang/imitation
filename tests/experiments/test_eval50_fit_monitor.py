@@ -48,6 +48,9 @@ def _config(algo, tmp_path, **overrides):
         beta_rampdown=0,
         bc_n_epochs=3,
         eval_interval=2,
+        eval_initial_rounds=0,
+        eval_episodes=1,
+        save_every_round=False,
         output_dir=tmp_path / "results",
         expert_cache_dir=tmp_path / "experts",
         inner_early_stop=False,
@@ -64,16 +67,16 @@ def _config(algo, tmp_path, **overrides):
 
 
 def test_protocol_constants():
-    assert run_experiment.EVAL_INTERVAL == 50
-    assert run_experiment.EVAL_EPISODES == 1
-    assert run_experiment.EVAL_PROTOCOL == "eval-every-50-rounds-1-episode/1"
+    assert run_experiment.EVAL_INTERVAL == 20
+    assert run_experiment.EVAL_EPISODES == 10
+    assert run_experiment.EVAL_PROTOCOL == "dense-early-periodic-evaluation/2"
 
 
 def test_eval_rounds_grid():
-    assert run_experiment.eval_rounds(1000) == list(range(0, 1001, 50))
-    assert run_experiment.eval_rounds(73, 50) == [0, 50, 73]
-    assert run_experiment.eval_rounds(50, 50) == [0, 50]
-    assert 1 not in run_experiment.eval_rounds(1000)
+    assert run_experiment.eval_rounds(1000) == list(range(61)) + list(range(80, 1001, 20))
+    assert run_experiment.eval_rounds(73, 50, 0) == [0, 50, 73]
+    assert run_experiment.eval_rounds(50, 50, 0) == [0, 50]
+    assert 1 in run_experiment.eval_rounds(1000)
 
 
 def test_config_defaults_and_validation(tmp_path):
@@ -107,11 +110,12 @@ def test_cli_defaults():
         run_experiment.build_configs = original
         sys.argv = old
     args = parsed["args"]
-    assert args.eval_interval == 50
-    assert args.eval_episodes == 1
+    assert args.eval_interval == 20
+    assert args.eval_initial_rounds == 60
+    assert args.eval_episodes == 10
     assert args.final_eval_episodes is None
     configs = original(args)
-    assert configs and all(c.eval_episodes == 1 for c in configs)
+    assert configs and all(c.eval_episodes == 10 for c in configs)
 
 
 @pytest.mark.parametrize("algo", ["ftl", "bc_iid"])
@@ -120,7 +124,7 @@ def test_round_loop_evaluates_grid_with_one_episode(tmp_path, untrained_expert, 
     result = run_single(config)
     rows = result["per_round"]
     evaluated = [r["round"] for r in rows if r.get("d_eval_size") is not None]
-    assert evaluated == [0, 2, 4, 5] == run_experiment.eval_rounds(5, 2)
+    assert evaluated == [0, 2, 4, 5] == run_experiment.eval_rounds(5, 2, 0)
     for r in rows:
         if r.get("d_eval_size") is not None:
             assert len(r["episode_returns"]) == 1

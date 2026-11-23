@@ -20,6 +20,26 @@ override. All round-loop baselines default to cold refits of weights and
 optimizer state. FTL/FTRL use beta zero from the first rollout; BC-iid uses
 beta one for expert-only collection.
 
+Classical and Atari round-loop runs retain a checkpoint at round 0 and after
+**every training round**, independently of evaluation. Linear policies save only
+the trainable head in each `round-*.pt`, plus one shared `frozen-*.pt` sibling
+containing the frozen weights and constructor metadata. Keep the shared file
+with the round files when moving a run. `policy_utils.load_policy_checkpoint`
+loads compact and older full checkpoints; restricted and capacity policies also
+retain their dedicated loaders and capacity bindings. End-to-end policies save
+full weights. These snapshots do not include optimizer or full resumption state.
+Fixed offline BC still fits, saves and evaluates once at its budget.
+
+Learning-curve defaults are 10 deterministic episodes at round 0, each round
+through round 60, then rounds 80, 100, and so on, including the final round.
+Configure these with `--eval-episodes`, `--eval-initial-rounds`, and
+`--eval-interval`. Interval points remain multiples of the interval when the
+early cutoff changes. `--eval-initial-rounds 0` disables the dense phase.
+`--full-checkpoints` disables compact storage, and `--eval-only-checkpoints`
+restores saving only evaluated rounds. Per-round retention fits data-independent
+growing baselines every round, even when `skip_unreported_fits` was requested.
+Expert qualification and normalization keep their separate evaluation budgets.
+
 Every invocation gets one UTC timestamp as its run ID. Set `EXP_RUN_ID` to a
 recognizable name or an existing ID to resume that run. All child launchers
 inherit it. `EXP_RUNS_DIR` can relocate the entire run collection.

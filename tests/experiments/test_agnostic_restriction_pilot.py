@@ -357,7 +357,7 @@ def test_fixed_bc_is_one_full_pool_fit_of_the_original_routine(
     assert record["config"]["fixed_bc"] == rp.FIXED_BC_RULE
     done = record["accounting"]["completed_records"]
     assert done["training"]["fits"] == 1 and done["evaluation"]["evaluations"] == 1
-    checkpoints = sorted((out / "checkpoints").rglob("*.pt"))
+    checkpoints = sorted((out / "checkpoints").rglob("round-*.pt"))
     assert [p.relative_to(out).as_posix() for p in checkpoints] == [row["checkpoint"]]
 
     # The saved policy is exactly the standalone fixed-BC fit on the pool.
